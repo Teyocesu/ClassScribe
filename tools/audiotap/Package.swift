@@ -1,9 +1,9 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 import PackageDescription
 
 let package = Package(
     name: "AudioTapLib",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("14.2")],
     products: [
         .library(name: "AudioTapLib", targets: ["AudioTapLib"]),
     ],
@@ -25,5 +25,6 @@ let package = Package(
             dependencies: ["AudioTapLib", "CExceptionCatcher"],
             path: "Tests"
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )

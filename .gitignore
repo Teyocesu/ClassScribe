@@ -1,12 +1,40 @@
 protocols/
 recordings/
 .env
+.env.*
+!.env.example
+*.pem
+*.key
 speakers.json
 .DS_Store
 
+# ClassScribe private/local data
+Classes/
+Models/
+ProfessorVoices/
+*.wav
+*.aiff
+*.m4a
+*.mp3
+*.srt
+live-transcript.json
+all-speakers.json
+review.json
+professor-voice-reference.json
+metadata.json
+*.log
+*.secret
+Secrets.plist
+
 # Swift build artifacts
+.dependencies/
+.toolchain/
+.test-fixtures/
 app/MeetingTranscriber/.build/
 tools/audiotap/.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
 
 # Release build artifacts
 .build/
