@@ -1,315 +1,176 @@
-# Meeting Transcriber
+# ClassScribe
 
-> **The local-first meeting transcriber for macOS.** Records Teams, Zoom, and Webex calls, transcribes them on-device with Whisper / Parakeet, separates speakers, and turns the result into a Markdown protocol using your own Claude CLI or any local LLM. **No cloud. No subscription. No audio ever leaves your Mac.**
+ClassScribe es una aplicación nativa para macOS que graba y transcribe clases universitarias en español, completamente en el dispositivo. Captura **una aplicación elegida** o **un micrófono elegido**, nunca ambos automáticamente. El audio, las transcripciones y las referencias de voz permanecen en la Mac.
 
-<p align="center">
-  <img src="docs/hero.gif" alt="Meeting Transcriber turning a Teams call into a Markdown protocol on-device" width="860">
-</p>
+> Obtén permiso del profesor y de las demás personas antes de grabar. Cumple las normas de tu universidad y la legislación aplicable.
 
-<p align="center">
-  <a href="https://github.com/pasrom/meeting-transcriber/actions?query=branch%3Amain"><img src="https://img.shields.io/github/checks-status/pasrom/meeting-transcriber/main?label=build" alt="Build status"></a>
-  <a href="https://github.com/pasrom/meeting-transcriber/releases"><img src="https://img.shields.io/github/v/release/pasrom/meeting-transcriber?include_prereleases&label=release" alt="Latest release"></a>
-  <img src="https://img.shields.io/badge/macOS-14.2%2B-blue" alt="macOS 14.2+">
-  <img src="https://img.shields.io/badge/Swift-6.2-orange" alt="Swift 6.2">
-  <a href="https://github.com/pasrom/meeting-transcriber/blob/main/LICENSE"><img src="https://img.shields.io/github/license/pasrom/meeting-transcriber" alt="MIT License"></a>
-  <a href="https://github.com/pasrom/meeting-transcriber/stargazers"><img src="https://img.shields.io/github/stars/pasrom/meeting-transcriber?style=social" alt="GitHub stars"></a>
-</p>
+## Privacidad
 
-## Why this exists
+- No hay cuentas, telemetría, servidores ni base de datos remota.
+- No usa OpenAI, Claude, Ollama, LM Studio ni ninguna API externa.
+- Solo se accede a Internet durante la primera descarga de FluidAudio y de los modelos Core ML.
+- Audio, texto, etiquetas y embeddings se guardan con permisos de propietario bajo `~/Library/Application Support/ClassScribe/`.
+- “Copiar para ChatGPT” solo copia texto al portapapeles; no abre ni automatiza ChatGPT.
 
-Cloud meeting recorders (Otter, Fireflies, Granola, tl;dv) work great, until you remember that every word from every meeting goes to a third-party server. For a lot of teams (legal, healthcare, M&A, anything under NDA, or just folks who'd rather not) that's a non-starter.
+## Origen y licencia
 
-Meeting Transcriber runs the entire pipeline (recording, transcription, speaker diarization, summarization) on your Mac. No account, no upload, no monthly bill.
+ClassScribe adapta [Meeting Transcriber](https://github.com/pasrom/meeting-transcriber), copyright 2025 pasrom, bajo licencia MIT. Se conserva [LICENSE](LICENSE), la atribución y el historial Git. Se reutiliza su biblioteca `AudioTapLib`; los generadores de protocolos, proveedores Claude/OpenAI, resúmenes, RPC y detección automática del producto original están fuera del target ClassScribe y no se compilan.
 
-|                                | Cloud transcribers | **Meeting Transcriber** |
-|--------------------------------|:------------------:|:-----------------------:|
-| Audio leaves your machine      | Yes                | **No**                  |
-| Recurring cost                 | $10–30 / month     | **Free**                |
-| Works offline                  | No                 | **Yes**                 |
-| Choice of summarization LLM    | Vendor-locked      | **Claude · Ollama · LM Studio · any OpenAI API** |
-| Per-source speaker separation  | Mixed track        | **Dual-track diarization** |
-| Source available               | No                 | **MIT licensed**        |
+## Requisitos
 
-## Install
+- Apple Silicon (probado para M1).
+- macOS 14.2 o posterior; la máquina de desarrollo usa macOS 15.3.2.
+- Xcode completo 16.x recomendado, o Command Line Tools con Swift 6.1.
+- Aproximadamente 1–2 GB libres para build, cachés y modelos.
+- Conexión a Internet para la primera descarga de modelos; luego funciona localmente.
 
-```bash
-brew tap pasrom/meeting-transcriber
-brew install --cask meeting-transcriber
-```
+Dependencias:
 
-> Homebrew 6.0+ may flag the third-party tap as untrusted. If so, run `brew trust --tap pasrom/meeting-transcriber` before installing.
+- SwiftUI, AVFoundation, AppKit y Core Audio.
+- `AudioTapLib`/`CATapDescription` para audio aislado por proceso.
+- FluidAudio 0.15.5, Parakeet TDT v3 multilingüe y OfflineDiarizer/WeSpeaker.
 
-The app lives in your menu bar — open it, grant microphone + screen-recording permission, and the first detected Teams/Zoom/Webex call records automatically.
+## Compilar y ejecutar
 
----
-
-## How it works
-
-```mermaid
-flowchart TD
-    A["Meeting Detected<br/>Teams · Zoom · Webex"]
-    A2["File Import<br/>WAV · MP3 · M4A · MP4 · FLAC · AMR · 3GP · OPUS · OGG<br/>MKV · WebM (ffmpeg)"]
-    B["Dual Recording<br/>App audio + Mic · 16 kHz per track"]
-    C["16 kHz Mono Convert<br/>AVAudioFile → AVAsset → ffmpeg"]
-    D{"Transcription Engine<br/>CoreML / ANE"}
-    D1["WhisperKit<br/>99 languages"]
-    D2["Parakeet TDT v3<br/>25 EU languages"]
-    E["Speaker Diarization<br/>FluidAudio · dual-track + recognition"]
-    F["Protocol Generation<br/>Claude CLI · OpenAI-compatible · none"]
-    G["Markdown Protocol<br/>Summary · Decisions · Tasks · Transcript"]
-
-    A --> B
-    A2 --> C
-    B --> D
-    C --> D
-    D --> D1
-    D --> D2
-    D1 --> E
-    D2 --> E
-    E --> F
-    F --> G
-
-    classDef input fill:#5B8DEF,stroke:#3F6FD5,color:#fff
-    classDef engine fill:#8B5CF6,stroke:#7C3AED,color:#fff
-    classDef output fill:#22C55E,stroke:#16A34A,color:#fff
-    class A,A2 input
-    class D engine
-    class G output
-```
-
----
-
-## Features
-
-- **Automatic meeting detection** — Recognizes Teams, Zoom, and Webex meetings via window title polling, plus opt-in browser meeting detection (Google Meet, Whereby, web Zoom/Teams in Chrome) gated behind a recording-consent prompt
-- **Dual audio recording** — App audio ([CATapDescription](https://developer.apple.com/documentation/coreaudio/catap)) + microphone simultaneously
-- **On-device transcription** — Two engines, selectable in Settings:
-  - [WhisperKit](https://github.com/argmaxinc/WhisperKit) — 99+ languages, ~1 GB model
-  - [Parakeet TDT v3](https://github.com/FluidInference/FluidAudio) (NVIDIA) — 25 EU languages, ~50 MB model, ~10× faster, custom vocabulary support (CTC boosting)
-- **On-device speaker diarization** — [FluidAudio](https://github.com/FluidInference/FluidAudio) via CoreML/ANE — no HuggingFace token needed; two modes: standard (`OfflineDiarizer`) and overlap-aware (`Sortformer`)
-- **Dual-track diarization** — App and mic tracks diarized separately for clean speaker separation without echo interference
-- **Speaker recognition** — Voice embeddings stored across meetings, matched via cosine similarity
-- **VAD preprocessing** — Optional silence trimming via FluidAudio Silero v6 before transcription, with automatic timestamp remapping
-- **AI protocol generation** — Structured Markdown via [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), OpenAI-compatible APIs (Ollama, LM Studio, etc.), or disabled (save transcript only)
-- **Configurable protocol prompt** — Custom prompt file support (`~/Library/Application Support/MeetingTranscriber/protocol_prompt.md`)
-- **Manual recording** — Record any app via app picker, not just detected meetings
-- **Multi-format input** — Supports WAV, MP3, M4A, MP4, FLAC, plus the phone and messenger voice formats AMR, 3GP/3G2 and OPUS/OGG; MKV and WebM additionally need ffmpeg
-- **Update checker** — Notifies when a new version is available
-- **Background processing** — PipelineQueue runs transcription and protocol generation independently from recording
-- **Record-only mode** — Skip the entire post-recording pipeline and drop dual-source recordings + a metadata sidecar into the output folder, for external/fleet processing (e.g. a separate GPU host)
-- **Local automation API** (Homebrew build): drive the pipeline headlessly over localhost HTTP. POST an audio file, get a diarized transcript back. See [`docs/automation-api.md`](docs/automation-api.md)
-- **Distribution** — Install via Homebrew Cask or build from source
-
----
-
-## Prerequisites
-
-- macOS 14.2+ (required for CATapDescription audio capture)
-- **One of:**
-  - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — installed and logged in (`claude --version`)
-  - An OpenAI-compatible API endpoint (e.g. [Ollama](https://ollama.com), LM Studio, llama.cpp) — configure in Settings
-
-No HuggingFace token needed — FluidAudio and WhisperKit download their models automatically on first run.
-
-### Optional: ffmpeg for extra formats
-
-Install ffmpeg to enable MKV and WebM support:
+Desde el repositorio:
 
 ```bash
-brew install ffmpeg
-```
-
-The app detects ffmpeg automatically. Status is shown in Settings → About.
-
-### Using Ollama as provider
-
-1. Install Ollama: `brew install ollama`
-2. Pull a model: `ollama pull llama3.1` (or any model that fits your hardware)
-3. Start the server: `ollama serve` (runs on `http://localhost:11434` by default)
-4. In the app's Settings, select **OpenAI-Compatible API** as provider and set:
-   - **Endpoint:** `http://localhost:11434/v1/chat/completions`
-   - **Model:** `llama3.1` (must match the pulled model name)
-
----
-
-## Installation
-
-### Via Homebrew Cask (recommended)
-
-```bash
-brew tap pasrom/meeting-transcriber
-brew install --cask meeting-transcriber
-```
-
-> **Tap trust:** Homebrew 6.0 added [tap trust](https://docs.brew.sh/Tap-Trust) for third-party taps. During the 6.0.x transition non-official taps are still allowed by default (you may just see a warning); enforcement is opt-in via `HOMEBREW_REQUIRE_TAP_TRUST` and becomes mandatory in a later release. If your Homebrew enforces it, run `brew trust --tap pasrom/meeting-transcriber` before `brew install --cask`.
-
-### Pre-release (RC) via Homebrew
-
-```bash
-brew tap pasrom/meeting-transcriber
-brew install --cask meeting-transcriber@beta
-```
-
-> Note: The stable and beta casks conflict — uninstall one before installing the other.
-
-### Build from source
-
-```bash
-git clone https://github.com/pasrom/meeting-transcriber
-cd meeting-transcriber
 ./scripts/run_app.sh
 ```
 
----
+El script fija FluidAudio 0.15.5, prepara una solución local para la instalación inconsistente de `PackageDescription` detectada en esta Mac, compila con dos trabajos (adecuado para 8 GB), arma y firma ad hoc `app/MeetingTranscriber/.build/ClassScribe-Dev.app`, y la abre.
 
-## Permissions
+Solo compilar:
 
-| Permission | Required for | Notes |
-|------------|-------------|-------|
-| Screen Recording | Meeting detection (window titles) | System Settings → Privacy & Security |
-| Microphone | Mic recording | Prompted on first use |
-| Accessibility | Mute detection, participant reading (Teams) | System Settings → Privacy & Security |
-| App audio capture | — | No permission needed (purple dot indicator only) |
+```bash
+./scripts/run_app.sh --build-only
+```
 
----
+Abrir en Xcode: ejecuta primero `./scripts/bootstrap_dependencies.sh`, abre `app/MeetingTranscriber/Package.swift`, elige el esquema ClassScribe y Run. Si `xcode-select` apunta a Command Line Tools después de instalar Xcode:
 
-## Menu Bar Icon
+```bash
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+```
 
-The app uses an animated waveform icon in the menu bar that reflects the current pipeline stage:
+## Modelos
 
-<p>
-<img src="docs/menu-bar-idle.gif" width="80" alt="Idle">&nbsp;&nbsp;
-<img src="docs/menu-bar-recording.gif" width="80" alt="Recording">&nbsp;&nbsp;
-<img src="docs/menu-bar-transcribing.gif" width="80" alt="Transcribing">&nbsp;&nbsp;
-<img src="docs/menu-bar-diarizing.gif" width="80" alt="Diarizing">&nbsp;&nbsp;
-<img src="docs/menu-bar-protocol.gif" width="80" alt="Protocol">
-</p>
+Parakeet TDT v3 y los modelos de diarización se descargan automáticamente en la primera transcripción/diarización mediante FluidAudio. El estado “Descargando/cargando modelos” es normal. Si faltan o falla la descarga, la grabación continúa y la interfaz informa el error sin cerrar la app. Los modelos no se guardan en Git.
 
-**Idle** → **Recording** (bars bounce) → **Transcribing** (bars morph to text) → **Diarizing** (bars split into groups) → **Protocol** (lines appear sequentially)
+## Permisos
 
-### Permission problem badge
+### Clase online
 
-<p>
-<img src="docs/menu-bar-permission.gif" width="80" alt="Permission problem">
-</p>
+Selecciona Chrome, Safari, Teams, Zoom u otra aplicación en ejecución. Core Audio solicita autorización de captura de audio cuando macOS lo requiera. ClassScribe incluye el PID raíz y sus procesos auxiliares, imprescindible para Google Meet en Chrome y Teams. La lista de PIDs contiene solamente la app elegida y excluye ClassScribe, por lo que no captura el micrófono, otras apps ni su propio audio.
 
-A red exclamation mark in the bottom-right corner is overlaid on top of the current icon (idle, recording, transcribing, …) whenever one of the required permissions is missing or broken. It means at least one of the following is not in a working state:
+### Clase presencial
 
-- **Microphone** — denied, or granted but the capture engine can't open the device
-- **Screen Recording** — denied, or granted but `CGWindowListCopyWindowInfo` returns no window titles (TCC state out of sync)
-- **Accessibility** — denied, or granted but the AX API refuses to read Teams participant/mute info
+Selecciona el micrófono. macOS pedirá permiso; si se negó antes, ve a **Ajustes del Sistema → Privacidad y seguridad → Micrófono**. Este modo no crea un tap de audio interno. El medidor debe moverse al hablar.
 
-The health check distinguishes *denied* from *broken*. "Broken" usually means the permission is toggled on in System Settings but macOS hasn't actually wired it through — the fix is to toggle the permission off and on again for Meeting Transcriber under **System Settings → Privacy & Security**. Open the menu bar dropdown to see which specific permission is affected; a notification is also posted when the state changes.
+## Uso
 
-### Record-only mode badge
+1. Escribe materia y, opcionalmente, vocabulario técnico separado por comas.
+2. Elige “Clase online” o “Clase presencial” y la fuente.
+3. Pulsa “Iniciar clase”. El punto rojo, temporizador y medidor confirman la grabación.
+4. La transcripción usa ventanas de 7 s con salto de 5,5 s (1,5 s de solapamiento). El texto tenue/cursivo es provisional; una pausa de voz confirma el fragmento. La interfaz muestra demora estimada.
+5. “Pausar transcripción” detiene inferencia, no la grabación. “Reanudar” vuelve a procesar ventanas recientes.
+6. “Detener clase” valida el WAV, retranscribe el archivo completo y ejecuta diarización final. El texto vivo permanece hasta que la versión final lo reemplaza.
+7. Al terminar, la persona con más tiempo de habla se marca como profesor automático/provisional, salvo que una referencia local de voz coincida con suficiente similitud.
 
-<p>
-<img src="docs/menu-bar-record-only.gif" width="80" alt="Record-only mode">
-</p>
+## Identificar y corregir al profesor
 
-A small red dot in the bottom-right corner is overlaid on top of the current icon (idle, recording, transcribing, …) whenever **Record-only mode** is enabled (Settings → General → "Record-only mode"). In this mode the app keeps detecting meetings and producing dual-source recordings, but skips the entire post-recording pipeline (VAD, transcription, diarization, protocol generation). Recordings + a per-meeting `<timestamp>_meta.json` sidecar are dropped into your configured Output Folder for an external pipeline (e.g. a Linux GPU host via Syncthing) to pick up. The dot stays visible across all states so the mode is always clearly indicated; if a permission problem coexists, the red exclamation badge takes precedence.
+- Cada tarjeta muestra Persona N, fragmentos recientes, tiempo y confianza.
+- Pulsa “Este es el profesor” en cualquier tarjeta. La pestaña Profesor se regenera sin borrar las demás voces.
+- “Calibrar voz del profesor” toma 20 s de la fuente activa; pide que hable principalmente el profesor y guarda solo un embedding local.
+- Los fragmentos de baja confianza o con voces superpuestas van a “Revisar”. Puedes asignarlos manualmente al profesor.
+- “Todos los hablantes” siempre conserva ambos lados de la decisión.
 
-### Per-channel asymmetric-silence indicator
+## Exportar e historial
 
-<p>
-<img src="docs/menu-bar-channel-silent-app.gif" width="80" alt="App-audio channel silent — bottom half red">&nbsp;&nbsp;
-<img src="docs/menu-bar-channel-silent-mic.gif" width="80" alt="Mic channel silent — top half red">
-</p>
+La app genera automáticamente:
 
-When one capture channel goes silent while the other is still carrying audio for longer than the configured debounce window, the waveform bars are tinted red to surface the half-broken capture at a glance:
+```text
+~/Library/Application Support/ClassScribe/Classes/AAAA-MM-DD_HHMMSS_Materia/
+  source.wav
+  live-transcript.json
+  professor.txt
+  professor.md
+  professor.srt
+  all-speakers.txt
+  all-speakers.json
+  review.json
+  speakers.json
+  professor-voice-reference.json   # cuando existe una referencia
+  metadata.json
+```
 
-- **Bottom half red** — app-audio channel is dead (you're speaking but nothing from the meeting app is being captured — bad tap, broken routing, system output muted)
-- **Top half red** — mic channel is dead (the meeting is audible but your voice isn't being captured — wrong input device, mic muted at system level)
-- **Both halves red** — both channels are silent while in recording state
+“Exportar” permite elegir otro destino para TXT, Markdown o SRT. “Abrir carpeta” y las entradas del historial muestran los archivos en Finder. El audio original nunca se borra automáticamente.
 
-A "Capture Channel Silent" notification fires once per episode at the moment the tint kicks in. Configurable in **Settings → Audio → Per-Channel Indicator** (default: on, 90 s debounce, range 30–300 s). Designed to surface real routing failures without false-positiving during normal speech pauses: the detector uses dual dBFS thresholds with hysteresis so transient dips between syllables don't reset the debounce timer.
+## Pruebas
 
-If a permission problem coexists, the red exclamation badge takes precedence over the channel-silent tint.
+```bash
+./scripts/bootstrap_dependencies.sh
+export SWIFTPM_CUSTOM_LIBS_DIR="$(./scripts/prepare_local_toolchain.sh)"
+swift test --package-path app/MeetingTranscriber -j 2 \
+  -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift"
+```
 
----
+Las pruebas puras cubren deduplicación de ventanas, confirmación tras pausa, filtro reversible al cambiar profesor, revisión de superposición, TXT/Markdown/SRT, WAV legible y similitud coseno. Las pruebas físicas de micrófono y audio de aplicación requieren permisos TCC e interacción con una fuente audible; no se simulan como éxitos en CI.
 
-## Usage
+Fixtures y pruebas locales de modelos:
 
-Launch the app — it sits in your menu bar. When a supported meeting is detected, recording starts automatically. When the meeting ends, the pipeline runs in the background: transcription → diarization → protocol generation.
+```bash
+./scripts/generate_classscribe_fixtures.sh
 
-You can also batch-process existing audio and video files via the menu (⌘P) — supported formats: WAV, MP3, M4A, MP4, FLAC, AMR, 3GP/3G2 and OPUS/OGG (and MKV, WebM when ffmpeg is installed). Smartphone call recordings (AMR, 3GP) and voice messages (OPUS) need no extra tools.
+CLASSSCRIBE_RUN_MODEL_TESTS=1 \
+CLASSSCRIBE_TEST_AUDIO="$PWD/.test-fixtures/spanish-known.wav" \
+swift test --package-path app/MeetingTranscriber -j 2 \
+  -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift" \
+  --filter spanishModelFixture
 
----
+CLASSSCRIBE_RUN_DIARIZATION_TESTS=1 \
+CLASSSCRIBE_TWO_SPEAKER_AUDIO="$PWD/.test-fixtures/two-speakers.wav" \
+swift test --package-path app/MeetingTranscriber -j 2 \
+  -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift" \
+  --filter twoSpeakerFixture
+```
 
-## Configuration
+Con `SWIFTPM_CUSTOM_LIBS_DIR` exportado como en el bloque anterior, la captura aislada puede repetirse después de autorizar **Audio del sistema**:
 
-Open Settings via the menu bar item or ⌘,.
+```bash
+CLASSSCRIBE_RUN_APP_CAPTURE_TEST=1 \
+CLASSSCRIBE_TEST_AUDIO="$PWD/.test-fixtures/spanish-known.wav" \
+swift test --package-path app/MeetingTranscriber -j 2 \
+  -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift" \
+  --filter applicationCaptureFixture
+```
 
-<img src="docs/settings-overview.png" width="600" alt="Settings window">
+La prueba de micrófono dura 60 s y solo se habilita cuando el host ya está autorizado:
 
-| Tab | What's in it |
-|---|---|
-| **General** | Record-only mode, apps to watch (Teams/Zoom/Webex/Browser), detection timing, update checks |
-| **Audio** | Microphone device, voice activity detection (VAD), per-channel silence indicator |
-| **Transcribe** | ASR engine (WhisperKit / Parakeet) and per-engine options (model, language, custom vocabulary), live caption overlay (PoC) |
-| **Speakers** | Diarization, mic speaker name, known voices, recognition stats |
-| **Output** | LLM provider (Claude CLI / OpenAI-compatible / none), protocol language, output folder, custom prompt |
-| **Advanced** | Permissions status, diagnostics, version info |
+```bash
+CLASSSCRIBE_RUN_MIC_CAPTURE_TEST=1 swift test \
+  --package-path app/MeetingTranscriber -j 2 \
+  -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift" \
+  --filter microphoneCaptureFixture
+```
 
----
+Resultados observados el 6 de agosto de 2026: Parakeet aprobó el fixture español (la primera preparación completa tardó 388 s) y FluidAudio separó dos voces en el fixture representativo de 49,5 s. La prueba CATap quedó esperando autorización TCC y la de micrófono confirmó permiso denegado; por ello esas dos rutas físicas no se declaran aprobadas en esta máquina todavía.
 
-## Output
+## Limitaciones conocidas del MVP
 
-Files are saved to `~/Library/Application Support/MeetingTranscriber/protocols/`:
+- La diarización y las tarjetas de varios hablantes se actualizan al detener la clase; durante la grabación se conserva y muestra el texto vivo, pero no se promete diarización verdaderamente streaming.
+- La separación de voces, superposiciones y reconocimiento son de mejor esfuerzo. Los casos inseguros se conservan en Revisar.
+- La primera carga de modelos puede tardar varios minutos y consumir memoria significativa en una Mac de 8 GB.
+- Editar el texto visible no cambia el audio ni el JSON estructurado; la exportación TXT manual respeta la edición del profesor, mientras SRT conserva tiempos/segmentos finales.
+- En esta máquina no hay Xcode completo y `xcodebuild` no puede ejecutarse. El build por SwiftPM usa el SDK 15.5 de Command Line Tools; instala/selecciona Xcode para verificar el flujo de Xcode.
+- La suite XCTest heredada de `tools/audiotap` tampoco está disponible con estos Command Line Tools (`no such module XCTest`), aunque la biblioteca sí compila y enlaza dentro del target ClassScribe.
+- La ejecución actual de Codex no pudo operar los diálogos de privacidad de macOS: la prueba automática de audio de aplicación quedó esperando TCC y el host de pruebas de micrófono no estaba autorizado. Abre ClassScribe, inicia una grabación de cada modo y concede los permisos antes de una clase real.
 
-| File | Content |
-|------|---------|
-| `20260225_1400_meeting.txt` | Raw transcript |
-| `20260225_1400_meeting.md` | Structured protocol |
+## GitHub
 
-**Protocol structure:** Summary, Participants, Topics Discussed, Decisions, Tasks (with responsible person, deadline, priority), Open Questions, Full Transcript.
+Los modelos, grabaciones, transcripciones, embeddings, logs, secretos, DerivedData y datos Xcode de usuario están ignorados. Para subir cambios posteriores:
 
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| `claude not found` | Install Claude Code CLI, run `claude --version` — or switch to OpenAI-compatible provider in Settings |
-| No meeting detected | Grant Screen Recording permission (System Settings → Privacy & Security) |
-| No app audio | Requires macOS 14.2+ for CATapDescription audio capture |
-| Empty transcription | Check that the file contains an audio track — the app converts to 16 kHz mono automatically |
-| Models not loading | Models download on first run (WhisperKit ~1 GB, Parakeet ~50 MB); check internet connectivity |
-| OpenAI-compatible API connection failed | Verify the endpoint URL and that the local model server is running |
-
-### Diagnosing silent app-audio recordings
-
-If a recording's `_app.wav` is silent or unexpectedly quiet, enable verbose audio logging to capture forensic detail during the next attempt:
-
-1. Open **Settings → Diagnostics** and turn on **Verbose Audio Logging**.
-2. Reproduce the failing recording.
-3. Open **Console.app**, filter by subsystem `com.meetingtranscriber.audiotap`, and look for `[debug]` lines:
-   - `[debug] Tap target: pid=… exe=… bundle=… audioObjectID=…` — which process the tap targeted
-   - `[debug] Default output device: name=… uid=… transport=… rate=…` — output device at start
-   - `[debug] Tap format: rate=… Hz, tapID=…` — sample rate and tap ID after the tap is configured
-   - `[debug] App audio RMS (5s): …dBFS, samples=…, totalBytes=…` — every 5 seconds; **tells you live whether the tap is delivering real audio (-40 dBFS or higher) or near-silence (≤ -90 dBFS)**
-   - `[debug] Output device change → name=… uid=…` — emitted when the system output device changes mid-recording
-   - `[debug] Mic input device: name=… uid=… hwRate=… hwChannels=…` — mic hardware device at capture start
-   - `[debug] Mic RMS (5s): …dBFS, samples=…` — every 5 seconds during mic capture
-4. Turn the toggle off again when done — the per-5 s RMS log is moderately chatty.
-
-The toggle persists in `UserDefaults` and takes effect on the next recording without an app restart.
-
----
-
-## Testing & CI
-
-[![CI](https://github.com/pasrom/meeting-transcriber/actions/workflows/ci.yml/badge.svg)](https://github.com/pasrom/meeting-transcriber/actions/workflows/ci.yml)
-[![E2E](https://github.com/pasrom/meeting-transcriber/actions/workflows/e2e.yml/badge.svg)](https://github.com/pasrom/meeting-transcriber/actions/workflows/e2e.yml)
-[![E2E (App)](https://github.com/pasrom/meeting-transcriber/actions/workflows/e2e-app.yml/badge.svg)](https://github.com/pasrom/meeting-transcriber/actions/workflows/e2e-app.yml)
-[![Quality & Safety](https://github.com/pasrom/meeting-transcriber/actions/workflows/quality-and-safety.yml/badge.svg)](https://github.com/pasrom/meeting-transcriber/actions/workflows/quality-and-safety.yml)
-[![App Store Smoke](https://github.com/pasrom/meeting-transcriber/actions/workflows/appstore.yml/badge.svg)](https://github.com/pasrom/meeting-transcriber/actions/workflows/appstore.yml)
-[![codecov](https://codecov.io/gh/pasrom/meeting-transcriber/branch/main/graph/badge.svg)](https://codecov.io/gh/pasrom/meeting-transcriber)
-
-Pull requests run unit tests, lint, and analyzer in [`ci.yml`](.github/workflows/ci.yml). Two complementary E2E layers run on a self-hosted Apple Silicon Mac mini against the real production models (no mocks): [`e2e.yml`](.github/workflows/e2e.yml) feeds fixture audio through each ASR engine + the WatchLoop pipeline, and [`e2e-app.yml`](.github/workflows/e2e-app.yml) builds and signs the actual `.app`, drives a simulated meeting via [`tools/meeting-simulator`](tools/meeting-simulator), and asserts on the resulting transcript over the embedded debug RPC server.
-
----
-
-## License
-
-[MIT](LICENSE)
+```bash
+git add -A
+git commit -m "describe el cambio"
+git push
+```
