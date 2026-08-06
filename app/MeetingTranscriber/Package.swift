@@ -9,7 +9,9 @@ let package = Package(
         .executable(name: "ClassScribe", targets: ["ClassScribe"]),
     ],
     dependencies: [
-        .package(path: "../../.dependencies/FluidAudio"),
+        // Fixed upstream release: clones and GitHub Actions resolve this without
+        // relying on the developer-only .dependencies directory.
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.5"),
         .package(path: "../../tools/audiotap"),
     ],
     targets: [

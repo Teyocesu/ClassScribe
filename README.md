@@ -38,7 +38,7 @@ Desde el repositorio:
 ./scripts/run_app.sh
 ```
 
-El script fija FluidAudio 0.15.5, prepara una solución local para la instalación inconsistente de `PackageDescription` detectada en esta Mac, compila con dos trabajos (adecuado para 8 GB), arma y firma ad hoc `app/MeetingTranscriber/.build/ClassScribe-Dev.app`, y la abre.
+El script resuelve FluidAudio 0.15.5 desde su repositorio oficial en una versión fija, compila con dos trabajos (adecuado para 8 GB), arma y firma ad hoc `app/MeetingTranscriber/.build/ClassScribe-Dev.app`, y la abre. Con Xcode completo no requiere pasos previos; con las Command Line Tools de esta Mac aplica automáticamente una compatibilidad local, sin modificar dependencias descargadas.
 
 Solo compilar:
 
@@ -46,7 +46,7 @@ Solo compilar:
 ./scripts/run_app.sh --build-only
 ```
 
-Abrir en Xcode: ejecuta primero `./scripts/bootstrap_dependencies.sh`, abre `app/MeetingTranscriber/Package.swift`, elige el esquema ClassScribe y Run. Si `xcode-select` apunta a Command Line Tools después de instalar Xcode:
+Abrir en Xcode: abre `app/MeetingTranscriber/Package.swift`, elige el esquema ClassScribe y Run. Si `xcode-select` apunta a Command Line Tools después de instalar Xcode:
 
 ```bash
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
@@ -107,8 +107,16 @@ La app genera automáticamente:
 
 ## Pruebas
 
+Con Xcode completo:
+
 ```bash
-./scripts/bootstrap_dependencies.sh
+swift test --package-path app/MeetingTranscriber -j 2
+xcodebuild -scheme ClassScribe -destination 'platform=macOS' build
+```
+
+Con las Command Line Tools incompletas de esta Mac, usa temporalmente:
+
+```bash
 export SWIFTPM_CUSTOM_LIBS_DIR="$(./scripts/prepare_local_toolchain.sh)"
 swift test --package-path app/MeetingTranscriber -j 2 \
   -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift"
@@ -167,7 +175,9 @@ Resultados observados el 6 de agosto de 2026: Parakeet aprobó el fixture españ
 
 ## GitHub
 
-Los modelos, grabaciones, transcripciones, embeddings, logs, secretos, DerivedData y datos Xcode de usuario están ignorados. Para subir cambios posteriores:
+Los modelos, grabaciones, transcripciones, embeddings, logs, secretos, DerivedData y datos Xcode de usuario están ignorados. El CI automático de ClassScribe resuelve FluidAudio desde el repositorio oficial fijado en `Package.resolved`, hace builds SwiftPM Debug/Release, ejecuta las pruebas unitarias de ClassScribe y AudioTap, y construye el paquete con Xcode. Las pruebas que requieren TCC, micrófono, CATap, audio real o interfaz gráfica quedan solo como pruebas locales opt-in.
+
+Para subir cambios posteriores:
 
 ```bash
 git add -A

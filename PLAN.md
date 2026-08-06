@@ -49,3 +49,11 @@ El target anterior se reemplaza por `ClassScribe`. Los generadores Claude/OpenAI
 - CATap y micrófono tienen pruebas físicas repetibles, pero TCC no concedió permisos al host de tests en esta sesión. No se marcan como aprobadas; el WAV real de ambas rutas debe verificarse tras aceptar los diálogos desde ClassScribe.
 - La biblioteca AudioTap compila dentro de ClassScribe. Su suite heredada usa XCTest y no puede compilarse con esta instalación parcial de Command Line Tools (`no such module XCTest`); requiere Xcode completo.
 - `xcodebuild` queda bloqueado hasta instalar/seleccionar Xcode completo; no se afirmará lo contrario.
+
+## Seguimiento de reproducibilidad y CI (2026-08-06)
+
+- Se comprobó que el fallo de GitHub Actions era una dependencia SPM por ruta a `.dependencies/FluidAudio`, carpeta ignorada y ausente en checkout.
+- FluidAudio local estaba en `v0.15.5` (`19600a485baa4998812e4654b70d2bab8f2c9949`) y tenía únicamente un ajuste de manifest para las Command Line Tools locales; no contiene un fork funcional que deba conservarse.
+- ClassScribe pasa a usar el remoto oficial de FluidAudio fijado exactamente a 0.15.5 y el mismo commit se registra en `Package.resolved`.
+- El CI heredado de releases, App Store, Homebrew, Pages, Dependabot, calidad pesada y E2E físico se elimina del trigger automático. Queda un único workflow de ClassScribe con resolución limpia, build SwiftPM Debug/Release, unit tests, AudioTap XCTest y builds Debug/Release con Xcode.
+- La Mac sigue en Command Line Tools y su manifest de FluidAudio falla al importar Foundation por una instalación inconsistente. La validación local final de la dependencia remota queda pendiente de Xcode completo; el CI macOS y el clon aislado verificarán una vez publicado.
