@@ -3,10 +3,8 @@
 # CI's release pipeline would otherwise catch first.
 #
 # Usage:
-#   ./scripts/pre-push.sh                     # release build of the app
-#   ./scripts/pre-push.sh --with-tests        # also build the test target
-#   ./scripts/pre-push.sh --with-appstore     # also build the App Store variant
-#   ./scripts/pre-push.sh --all               # everything
+#   ./scripts/pre-push.sh                     # release bundle of ClassScribe
+#   ./scripts/pre-push.sh --with-tests        # also run ClassScribe tests
 #
 # Why this exists: `swift build` (debug) and `swift build -c release` use
 # different Sendable-inference rules. Release mode enables WMO which can
@@ -19,13 +17,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 WITH_TESTS=0
-WITH_APPSTORE=0
-
 for arg in "$@"; do
     case "$arg" in
         --with-tests) WITH_TESTS=1 ;;
-        --with-appstore) WITH_APPSTORE=1 ;;
-        --all) WITH_TESTS=1; WITH_APPSTORE=1 ;;
         -h|--help)
             sed -n '2,11p' "$0"
             exit 0
@@ -37,19 +31,23 @@ for arg in "$@"; do
     esac
 done
 
-cd app/MeetingTranscriber
-
-echo "==> swift build -c release (Homebrew variant)"
-swift build -c release
-
-if [[ "$WITH_APPSTORE" == 1 ]]; then
-    echo "==> swift build -c release -DAPPSTORE (App Store variant)"
-    swift build -c release -Xswiftc -DAPPSTORE
-fi
+echo "==> ClassScribe release bundle + isolated diarization helper"
+./scripts/run_app.sh --build-only
 
 if [[ "$WITH_TESTS" == 1 ]]; then
-    echo "==> swift build --target MeetingTranscriberTests"
-    swift build --target MeetingTranscriberTests
+    echo "==> ClassScribe tests"
+    if [[ "$(xcode-select -p)" == "/Library/Developer/CommandLineTools" ]]; then
+        TASK_SWIFTPM_CUSTOM_LIBS_DIR="$(./scripts/prepare_local_toolchain.sh)"
+        export SWIFTPM_CUSTOM_LIBS_DIR="$TASK_SWIFTPM_CUSTOM_LIBS_DIR"
+        swift test --package-path .toolchain/ClassScribePackage -j 2 \
+            -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift" \
+            -Xswiftc -strict-concurrency=complete
+    else
+        swift test --package-path app/MeetingTranscriber -j 2 \
+            -Xswiftc -strict-concurrency=complete
+        swift test --package-path tools/audiotap -j 2 \
+            -Xswiftc -strict-concurrency=complete
+    fi
 fi
 
 echo

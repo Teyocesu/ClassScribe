@@ -2,8 +2,6 @@
 import FluidAudio
 import Foundation
 
-extension OfflineDiarizerManager: @retroactive @unchecked Sendable {}
-
 actor ParakeetService {
     private var manager: AsrManager?
     private(set) var downloadProgress = 0.0
@@ -164,10 +162,11 @@ actor ParakeetService {
 
 actor FinalProcessor {
     private let parakeet: ParakeetService
-    private var diarizer: OfflineDiarizerManager?
+    private let diarizationRunner: DiarizationProcessRunner
 
-    init(parakeet: ParakeetService) {
+    init(parakeet: ParakeetService, diarizationRunner: DiarizationProcessRunner = DiarizationProcessRunner()) {
         self.parakeet = parakeet
+        self.diarizationRunner = diarizationRunner
     }
 
     func transcribe(_ audioURL: URL) async throws -> [TranscriptSegment] {
@@ -181,26 +180,17 @@ actor FinalProcessor {
 
     func diarize(_ audioURL: URL) async throws -> (spans: [DiarizationSpan], embeddings: [String: [Float]]) {
         try Task.checkCancellation()
-        let manager: OfflineDiarizerManager
-        if let existing = diarizer {
-            manager = existing
-        } else {
-            let created = OfflineDiarizerManager()
-            try await created.prepareModels()
-            diarizer = created
-            manager = created
-        }
-        let result = try await manager.process(audioURL)
-        let spans = result.segments.map {
+        let response = try await diarizationRunner.run(audioURL: audioURL)
+        let spans = response.spans.map {
             DiarizationSpan(
-                start: Double($0.startTimeSeconds),
-                end: Double($0.endTimeSeconds),
-                speakerID: Self.personName($0.speakerId),
-                quality: Double($0.qualityScore)
+                start: $0.start,
+                end: $0.end,
+                speakerID: Self.personName($0.speakerID),
+                quality: $0.quality,
             )
         }
         var embeddings: [String: [Float]] = [:]
-        for (key, value) in result.speakerDatabase ?? [:] {
+        for (key, value) in response.embeddings {
             embeddings[Self.personName(key)] = value
         }
         return (spans, embeddings)
@@ -212,6 +202,14 @@ actor FinalProcessor {
         return raw.replacingOccurrences(of: "Speaker", with: "Persona")
     }
 }
+
+protocol FinalProcessingProviding: Sendable {
+    func configureVocabulary(file: URL?) async throws
+    func transcribe(_ audioURL: URL) async throws -> [TranscriptSegment]
+    func diarize(_ audioURL: URL) async throws -> (spans: [DiarizationSpan], embeddings: [String: [Float]])
+}
+
+extension FinalProcessor: FinalProcessingProviding {}
 
 enum InferenceError: LocalizedError {
     case modelUnavailable

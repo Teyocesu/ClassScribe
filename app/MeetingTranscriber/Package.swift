@@ -7,6 +7,7 @@ let package = Package(
     platforms: [.macOS("14.2")],
     products: [
         .executable(name: "ClassScribe", targets: ["ClassScribe"]),
+        .executable(name: "ClassScribeDiarizer", targets: ["ClassScribeDiarizer"]),
     ],
     dependencies: [
         // Fixed upstream release: clones and GitHub Actions resolve this without
@@ -20,13 +21,29 @@ let package = Package(
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "AudioTapLib", package: "audiotap"),
+                "ClassScribeProcessingIPC",
             ],
             path: "ClassScribeSources",
             exclude: ["Info.plist"]
         ),
+        .target(
+            name: "ClassScribeProcessingIPC",
+            path: "ProcessingIPCSources"
+        ),
+        .executableTarget(
+            name: "ClassScribeDiarizer",
+            dependencies: [
+                .product(name: "FluidAudio", package: "FluidAudio"),
+                "ClassScribeProcessingIPC",
+            ],
+            path: "DiarizationHelperSources"
+        ),
         .testTarget(
             name: "ClassScribeTests",
-            dependencies: ["ClassScribe"],
+            dependencies: [
+                "ClassScribe",
+                .product(name: "AudioTapLib", package: "audiotap"),
+            ],
             path: "ClassScribeTests"
         ),
     ],

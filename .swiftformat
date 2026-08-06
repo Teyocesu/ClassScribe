@@ -22,6 +22,7 @@
 # and `private(set)`, so we let SwiftLint handle order validation and keep
 # SwiftFormat focused on whitespace / commas / wrapping.
 --disable modifierOrder
+--disable swiftTestingTestCaseNames
 
 # File scope
 --exclude FluidAudio,.build,app/MeetingTranscriber/.build,tools/audiotap/.build,tools/meeting-simulator/.build

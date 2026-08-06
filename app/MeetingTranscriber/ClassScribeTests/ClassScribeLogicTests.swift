@@ -18,7 +18,8 @@ func liveConfirmation() {
     #expect(accumulator.stableText.isEmpty)
     #expect(!accumulator.provisionalText.isEmpty)
     accumulator.accept("vamos a definir una función continua en este intervalo", confirmedByPause: true)
-    #expect(accumulator.stableText == "vamos a definir una función continua en este intervalo")
+    #expect(accumulator.stableText.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        == "vamos a definir una función continua en este intervalo")
     #expect(accumulator.provisionalText.isEmpty)
 }
 

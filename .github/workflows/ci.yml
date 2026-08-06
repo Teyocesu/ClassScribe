@@ -18,7 +18,7 @@ jobs:
   build-and-test:
     name: Build and test
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -32,20 +32,36 @@ jobs:
 
       - name: SwiftPM Debug and Release builds
         run: |
-          swift build --package-path app/MeetingTranscriber -c debug -j 2
-          swift build --package-path app/MeetingTranscriber -c release -j 2
+          swift build --package-path app/MeetingTranscriber -c debug -j 2 -Xswiftc -strict-concurrency=complete
+          swift build --package-path app/MeetingTranscriber -c release -j 2 -Xswiftc -strict-concurrency=complete
 
       - name: ClassScribe unit tests
-        run: swift test --package-path app/MeetingTranscriber -j 2
+        run: >-
+          swift test --package-path app/MeetingTranscriber -j 2
+          --enable-swift-testing --enable-xctest
+          -Xswiftc -strict-concurrency=complete
 
       - name: AudioTap library tests
-        run: swift test --package-path tools/audiotap -j 2
+        run: >-
+          swift test --package-path tools/audiotap -j 2
+          --disable-swift-testing --enable-xctest
+          -Xswiftc -strict-concurrency=complete
 
       - name: Xcode Debug and Release builds
         working-directory: app/MeetingTranscriber
         run: |
           xcodebuild -scheme ClassScribe -configuration Debug -destination 'platform=macOS' build
           xcodebuild -scheme ClassScribe -configuration Release -destination 'platform=macOS' build
+          xcodebuild -scheme ClassScribeDiarizer -configuration Release -destination 'platform=macOS' build
+
+      - name: Assemble and verify the development bundle
+        run: |
+          ./scripts/run_app.sh --build-only
+          test -x app/MeetingTranscriber/.build/ClassScribe-Dev.app/Contents/MacOS/ClassScribe
+          test -x app/MeetingTranscriber/.build/ClassScribe-Dev.app/Contents/Helpers/ClassScribeDiarizer
+          codesign --verify --deep --strict app/MeetingTranscriber/.build/ClassScribe-Dev.app
+          embedded_commit=$(/usr/libexec/PlistBuddy -c 'Print :ClassScribeBuildCommit' app/MeetingTranscriber/.build/ClassScribe-Dev.app/Contents/Info.plist)
+          test "$embedded_commit" = "$GITHUB_SHA"
 
       # Tests requiring TCC, audio hardware, CATap, or UI interaction remain
       # opt-in locally; no GitHub-hosted runner can authorize them reliably.

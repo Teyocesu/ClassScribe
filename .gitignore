@@ -17,18 +17,36 @@ ProfessorVoices/
 *.m4a
 *.mp3
 *.srt
+source.raw
+source-invalid-preserved-*.wav
+professor-calibration.wav
+technical-vocabulary.txt
 live-transcript.json
+live-transcript.txt
+live-transcript.md
+live-transcript-journal.jsonl
 all-speakers.json
+all-speakers.txt
+all-speakers.md
+professor.txt
+professor.md
+recovered-transcript.txt
+recovered-transcript.md
 review.json
 professor-voice-reference.json
 metadata.json
 *.log
+*.ips
+*.crash
+.diarization-*
+.classscribe-write-*
 *.secret
 Secrets.plist
 
 # Swift build artifacts
 .dependencies/
 .toolchain/
+.swiftpm/
 .test-fixtures/
 app/MeetingTranscriber/.build/
 tools/audiotap/.build/

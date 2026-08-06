@@ -8,6 +8,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PACKAGE_DIR="$PROJECT_ROOT/app/MeetingTranscriber"
 BUILD_PACKAGE_DIR="$PACKAGE_DIR"
+HEAD_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+BUILD_COMMIT="$HEAD_COMMIT"
+if ! git -C "$PROJECT_ROOT" diff --quiet --ignore-submodules -- \
+    || ! git -C "$PROJECT_ROOT" diff --cached --quiet --ignore-submodules -- \
+    || [ -n "$(git -C "$PROJECT_ROOT" ls-files --others --exclude-standard)" ]; then
+    if [ "$BUILD_ONLY" = false ]; then
+        echo "El launcher solo abre un build reproducible del HEAD. Confirma o guarda primero los cambios locales." >&2
+        exit 1
+    fi
+    BUILD_COMMIT="${HEAD_COMMIT}-dirty"
+fi
 
 echo "Compilando ClassScribe (la primera compilación de FluidAudio puede tardar)…"
 SWIFT_ARGS=(-c release -j 2)
@@ -25,6 +36,8 @@ if [ "$(xcode-select -p)" = "/Library/Developer/CommandLineTools" ]; then
     mkdir -p "$BUILD_PACKAGE_DIR"
     ln -sfn "$PACKAGE_DIR/ClassScribeSources" "$BUILD_PACKAGE_DIR/ClassScribeSources"
     ln -sfn "$PACKAGE_DIR/ClassScribeTests" "$BUILD_PACKAGE_DIR/ClassScribeTests"
+    ln -sfn "$PACKAGE_DIR/ProcessingIPCSources" "$BUILD_PACKAGE_DIR/ProcessingIPCSources"
+    ln -sfn "$PACKAGE_DIR/DiarizationHelperSources" "$BUILD_PACKAGE_DIR/DiarizationHelperSources"
     cat > "$BUILD_PACKAGE_DIR/Package.swift" <<EOF
 // swift-tools-version: 6.1
 
@@ -33,7 +46,10 @@ import PackageDescription
 let package = Package(
     name: "ClassScribe",
     platforms: [.macOS("14.2")],
-    products: [.executable(name: "ClassScribe", targets: ["ClassScribe"])],
+    products: [
+        .executable(name: "ClassScribe", targets: ["ClassScribe"]),
+        .executable(name: "ClassScribeDiarizer", targets: ["ClassScribeDiarizer"]),
+    ],
     dependencies: [
         .package(path: "$PROJECT_ROOT/.toolchain/FluidAudio"),
         .package(path: "$PROJECT_ROOT/tools/audiotap"),
@@ -44,13 +60,29 @@ let package = Package(
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "AudioTapLib", package: "audiotap"),
+                "ClassScribeProcessingIPC",
             ],
             path: "ClassScribeSources",
             exclude: ["Info.plist"]
         ),
+        .target(
+            name: "ClassScribeProcessingIPC",
+            path: "ProcessingIPCSources"
+        ),
+        .executableTarget(
+            name: "ClassScribeDiarizer",
+            dependencies: [
+                .product(name: "FluidAudio", package: "FluidAudio"),
+                "ClassScribeProcessingIPC",
+            ],
+            path: "DiarizationHelperSources"
+        ),
         .testTarget(
             name: "ClassScribeTests",
-            dependencies: ["ClassScribe"],
+            dependencies: [
+                "ClassScribe",
+                .product(name: "AudioTapLib", package: "audiotap"),
+            ],
             path: "ClassScribeTests"
         ),
     ],
@@ -62,8 +94,8 @@ swift build --package-path "$BUILD_PACKAGE_DIR" "${SWIFT_ARGS[@]}"
 
 APP="$PACKAGE_DIR/.build/ClassScribe-Dev.app"
 MACOS="$APP/Contents/MacOS"
+HELPERS="$APP/Contents/Helpers"
 INFO_PLIST="$APP/Contents/Info.plist"
-BUILD_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
 BUILD_TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 # `open "$APP"` activates an already-running app with this bundle identity.
@@ -74,18 +106,22 @@ running_app_pids() {
     ps -axo pid=,command= | awk -v executable="$MACOS/ClassScribe" '$2 == executable { print $1 }'
 }
 
-OLD_PIDS="$(running_app_pids)"
+all_classscribe_pids() {
+    pgrep -x ClassScribe || true
+}
+
+OLD_PIDS="$(all_classscribe_pids)"
 if [ -n "$OLD_PIDS" ]; then
     echo "Cerrando instancia(s) anterior(es) de ClassScribe: $OLD_PIDS"
     for PROCESS_ID in $OLD_PIDS; do
         kill "$PROCESS_ID"
     done
     for _ in $(seq 1 20); do
-        [ -z "$(running_app_pids)" ] && break
+        [ -z "$(all_classscribe_pids)" ] && break
         sleep 0.1
     done
-    if [ -n "$(running_app_pids)" ]; then
-        echo "La instancia anterior no se cerró: $(running_app_pids)" >&2
+    if [ -n "$(all_classscribe_pids)" ]; then
+        echo "Alguna instancia anterior no se cerró: $(all_classscribe_pids)" >&2
         exit 1
     fi
 fi
@@ -98,14 +134,19 @@ case "$APP" in
 esac
 rm -rf "$APP"
 mkdir -p "$MACOS"
+mkdir -p "$HELPERS"
 cp "$PACKAGE_DIR/ClassScribeSources/Info.plist" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ClassScribeBuildCommit string $BUILD_COMMIT" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ClassScribeBuildTimestamp string $BUILD_TIMESTAMP" "$INFO_PLIST"
 cp "$BUILD_PACKAGE_DIR/.build/release/ClassScribe" "$MACOS/ClassScribe"
+cp "$BUILD_PACKAGE_DIR/.build/release/ClassScribeDiarizer" "$HELPERS/ClassScribeDiarizer"
+
+codesign --force --sign - "$HELPERS/ClassScribeDiarizer" >/dev/null
 
 codesign --force --sign - \
     --entitlements "$PACKAGE_DIR/Entitlements/Homebrew.entitlements" \
     "$APP" >/dev/null
+codesign --verify --deep --strict "$APP"
 
 echo "Aplicación lista: $APP"
 echo "Build: commit=$BUILD_COMMIT builtAt=$BUILD_TIMESTAMP executable=$MACOS/ClassScribe"
@@ -123,6 +164,11 @@ if [ "$BUILD_ONLY" = false ]; then
     fi
     if [ "$(printf '%s\n' "$NEW_PIDS" | wc -l | tr -d ' ')" -ne 1 ]; then
         echo "Se esperaba una única instancia; se encontraron: $NEW_PIDS" >&2
+        exit 1
+    fi
+    ALL_NEW_PIDS="$(all_classscribe_pids)"
+    if [ "$ALL_NEW_PIDS" != "$NEW_PIDS" ]; then
+        echo "Hay otra copia de ClassScribe ejecutándose: $ALL_NEW_PIDS" >&2
         exit 1
     fi
     echo "ClassScribe iniciado: pid=$NEW_PIDS executable=$MACOS/ClassScribe"

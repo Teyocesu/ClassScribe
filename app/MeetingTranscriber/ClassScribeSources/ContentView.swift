@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Bindable var model: ClassScribeModel
+    @State private var followsLiveText = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -10,6 +11,10 @@ struct ContentView: View {
             captureConfiguration
             Divider()
             statusBar
+            if model.errorMessage != nil {
+                Divider()
+                errorBanner
+            }
             Divider()
             HSplitView {
                 speakersPanel
@@ -19,14 +24,6 @@ struct ContentView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .alert("ClassScribe", isPresented: Binding(
-            get: { model.errorMessage != nil },
-            set: { if !$0 { model.errorMessage = nil } }
-        )) {
-            Button("Aceptar") { model.errorMessage = nil }
-        } message: {
-            Text(model.errorMessage ?? "")
-        }
     }
 
     private var header: some View {
@@ -51,7 +48,7 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
             .frame(width: 310)
-            .disabled(model.isRecording)
+            .disabled(model.isSessionBusy)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
@@ -63,7 +60,7 @@ struct ContentView: View {
                 TextField("Nombre de la materia", text: $model.subject)
                     .textFieldStyle(.roundedBorder)
                     .frame(minWidth: 240)
-                    .disabled(model.isRecording)
+                    .disabled(model.isSessionBusy)
 
                 if model.mode == .online {
                     Picker("Aplicación", selection: $model.selectedApplicationID) {
@@ -73,7 +70,7 @@ struct ContentView: View {
                         }
                     }
                     .frame(minWidth: 280)
-                    .disabled(model.isRecording)
+                    .disabled(model.isSessionBusy)
                 } else {
                     Picker("Micrófono", selection: $model.selectedMicrophoneID) {
                         Text("Seleccionar micrófono…").tag(String?.none)
@@ -82,7 +79,7 @@ struct ContentView: View {
                         }
                     }
                     .frame(minWidth: 280)
-                    .disabled(model.isRecording)
+                    .disabled(model.isSessionBusy)
                 }
 
                 Button {
@@ -91,18 +88,18 @@ struct ContentView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .help("Actualizar aplicaciones y micrófonos")
-                .disabled(model.isRecording)
+                .disabled(model.isSessionBusy)
             }
 
             HStack(alignment: .top, spacing: 12) {
                 TextField(
                     "Vocabulario técnico, separado por comas (Newton-Raphson, Runge-Kutta, PMBOK…)",
                     text: $model.technicalVocabulary,
-                    axis: .vertical
+                    axis: .vertical,
                 )
                 .lineLimit(2 ... 3)
                 .textFieldStyle(.roundedBorder)
-                .disabled(model.isRecording)
+                .disabled(model.isSessionBusy)
 
                 recordingControls
             }
@@ -112,7 +109,13 @@ struct ContentView: View {
 
     private var recordingControls: some View {
         HStack(spacing: 8) {
-            if !model.isRecording {
+            if model.isStopping {
+                Button("Guardando transcripción…") {}
+                    .disabled(true)
+            } else if model.capture.isStarting {
+                Button("Esperando primer audio…") {}
+                    .disabled(true)
+            } else if !model.isRecording {
                 Button("Iniciar clase") { Task { await model.startClass() } }
                     .buttonStyle(.borderedProminent)
                     .disabled(!model.canStart)
@@ -122,7 +125,7 @@ struct ContentView: View {
                 } else {
                     Button("Pausar transcripción") { model.pauseTranscription() }
                 }
-                Button("Detener clase", role: .destructive) { model.stopClass() }
+                Button("Detener clase", role: .destructive) { Task { await model.stopClass() } }
             }
             if model.state == .finalTranscription || model.state == .diarizing {
                 Button("Cancelar procesamiento", role: .cancel) { model.cancelFinalProcessing() }
@@ -143,7 +146,7 @@ struct ContentView: View {
                 .monospacedDigit()
             HStack(spacing: 6) {
                 Image(systemName: "waveform")
-                Gauge(value: max(-60, model.capture.levelDBFS), in: -60 ... 0) { EmptyView() }
+                Gauge(value: min(0, max(-60, model.capture.levelDBFS)), in: -60 ... 0) { EmptyView() }
                     .gaugeStyle(.accessoryLinearCapacity)
                     .frame(width: 120)
                 Text(String(format: "%.0f dB", model.capture.levelDBFS))
@@ -157,6 +160,14 @@ struct ContentView: View {
                 .lineLimit(2)
             Spacer()
             if model.currentFolder != nil {
+                if model.canRetryProcessing {
+                    Button("Reintentar procesamiento") { Task { await model.retryProcessing() } }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                }
+                Button("Abrir TXT") { model.openCurrentTXT() }
+                    .controlSize(.small)
+                    .disabled(!model.canOpenTXT)
                 Button("Abrir carpeta") { model.openCurrentFolder() }
                     .controlSize(.small)
             }
@@ -169,7 +180,7 @@ struct ContentView: View {
         switch model.state {
         case .complete: .green
         case .failed: .red
-        case .cancelled: .orange
+        case .cancelled, .recoverable: .orange
         case .ready: .secondary
         default: .blue
         }
@@ -187,7 +198,7 @@ struct ContentView: View {
                 ContentUnavailableView(
                     "Aún sin voces",
                     systemImage: "person.2.wave.2",
-                    description: Text("Las etiquetas Persona 1, Persona 2… aparecerán al diarizar. Nunca se descarta el audio.")
+                    description: Text("Las etiquetas Persona 1, Persona 2… aparecerán al diarizar. Nunca se descarta el audio."),
                 )
                 .frame(maxHeight: 210)
             } else {
@@ -206,10 +217,10 @@ struct ContentView: View {
             } label: {
                 Label(
                     model.isCalibrating ? "Calibrando… \(model.calibrationSecondsRemaining) s" : "Calibrar voz del profesor",
-                    systemImage: "waveform.badge.mic"
+                    systemImage: "waveform.badge.mic",
                 )
             }
-            .disabled(!model.isRecording || model.isCalibrating)
+            .disabled(!model.isRecording || model.isCalibrating || model.isStopping)
 
             if let professor = model.professorSpeakerID {
                 VStack(alignment: .leading, spacing: 3) {
@@ -227,21 +238,29 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(model.history) { item in
-                        Button { model.openHistoryFolder(item) } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.subject).font(.subheadline.bold()).lineLimit(1)
-                                Text("\(item.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(Timecode.display(item.duration))")
-                                    .font(.caption).foregroundStyle(.secondary)
-                                Text("\(item.mode.rawValue) · \(item.source)")
-                                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                Text("\(item.professorSpeakerID ?? "Profesor pendiente") · \(item.speakerCount) hablante(s) · \(item.state.rawValue)")
-                                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                Text(item.folderPath)
-                                    .font(.caption2.monospaced()).foregroundStyle(.tertiary).lineLimit(1)
+                        HStack(spacing: 6) {
+                            Button { model.openHistory(item) } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.subject).font(.subheadline.bold()).lineLimit(1)
+                                    Text("\(item.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(Timecode.display(item.duration))")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                    Text("\(item.mode.rawValue) · \(item.source)")
+                                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                    Text("\(item.professorSpeakerID ?? "Profesor pendiente") · \(item.speakerCount) hablante(s) · \(item.state.rawValue)")
+                                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                    if let reason = item.recoveryReason {
+                                        Text(reason).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .buttonStyle(.plain)
+                            Button { model.openHistoryFolder(item) } label: {
+                                Image(systemName: "folder")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Mostrar carpeta en Finder")
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -285,9 +304,21 @@ struct ContentView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 560)
+                if model.isRecording {
+                    Toggle("Seguir texto", isOn: $followsLiveText)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                }
                 Spacer()
-                Button("Copiar todo") { model.copyAll() }
+                if model.isProcessing {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Copiar transcripción") { model.copyTranscript() }
+                    .disabled(!model.hasCopyableTranscript)
                 Button("Copiar para ChatGPT") { model.copyForChatGPT() }
+                    .disabled(!model.hasCopyableTranscript)
+                Button("Abrir TXT") { model.openCurrentTXT() }
+                    .disabled(!model.canOpenTXT)
                 Menu("Exportar") {
                     ForEach(ExportKind.allCases) { kind in
                         Button(kind.rawValue) { model.export(kind) }
@@ -298,9 +329,9 @@ struct ContentView: View {
 
             Divider()
 
-            if !model.finalReplacedLive {
+            if model.isRecording {
                 liveTranscript
-            } else if model.selectedTab == .review {
+            } else if model.finalReplacedLive && model.selectedTab == .review {
                 reviewPanel
             } else {
                 TextEditor(text: editableText)
@@ -310,7 +341,15 @@ struct ContentView: View {
                     .background(Color(nsColor: .textBackgroundColor))
             }
 
-            if model.finalReplacedLive {
+            if let warning = model.professorUnavailableWarning, model.selectedTab == .professor {
+                HStack {
+                    Image(systemName: "person.crop.circle.badge.questionmark").foregroundStyle(.orange)
+                    Text(warning).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(9)
+                .background(Color.orange.opacity(0.08))
+            } else if model.finalReplacedLive {
                 HStack {
                     Image(systemName: "checkmark.seal.fill").foregroundStyle(.green)
                     Text("La versión final reemplazó la provisional; puedes editar y exportar el texto.")
@@ -324,20 +363,29 @@ struct ContentView: View {
     }
 
     private var liveTranscript: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(model.stableLiveText.isEmpty ? "La transcripción aparecerá aquí mientras habla el profesor…" : model.stableLiveText)
-                    .foregroundStyle(model.stableLiveText.isEmpty ? .secondary : .primary)
-                    .textSelection(.enabled)
-                if !model.provisionalLiveText.isEmpty {
-                    Text(model.provisionalLiveText)
-                        .italic()
-                        .foregroundStyle(.secondary)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(model.stableLiveText.isEmpty ? "La transcripción aparecerá aquí mientras habla el profesor…" : model.stableLiveText)
+                        .foregroundStyle(model.stableLiveText.isEmpty ? .secondary : .primary)
                         .textSelection(.enabled)
+                    if !model.provisionalLiveText.isEmpty {
+                        Text(model.provisionalLiveText)
+                            .italic()
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    Color.clear.frame(height: 1).id("live-transcript-bottom")
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .padding(18)
+            }
+            .onChange(of: model.liveVisibleText) {
+                guard followsLiveText else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo("live-transcript-bottom", anchor: .bottom)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .padding(18)
         }
         .background(Color(nsColor: .textBackgroundColor))
     }
@@ -345,49 +393,70 @@ struct ContentView: View {
     private var editableText: Binding<String> {
         Binding(
             get: {
+                if !model.finalReplacedLive {
+                    return model.editedLiveText ?? model.liveVisibleText
+                }
                 switch model.selectedTab {
                 case .professor:
-                    return model.editedProfessorText.isEmpty
-                        ? TranscriptExporter.plainText(model.professorSegments)
-                        : model.editedProfessorText
+                    return model.editedProfessorText
+                        ?? (model.professorSegments.isEmpty
+                            ? (model.editedAllText ?? TranscriptExporter.plainText(model.allSegments))
+                            : TranscriptExporter.plainText(model.professorSegments))
                 case .everyone:
-                    return model.editedAllText.isEmpty
-                        ? TranscriptExporter.plainText(model.allSegments)
-                        : model.editedAllText
+                    return model.editedAllText ?? TranscriptExporter.plainText(model.allSegments)
                 case .review: return ""
                 }
             },
             set: { newValue in
-                if model.selectedTab == .professor { model.editedProfessorText = newValue }
-                if model.selectedTab == .everyone { model.editedAllText = newValue }
-            }
+                if !model.finalReplacedLive {
+                    model.updateEditedLiveText(newValue)
+                } else if model.selectedTab == .professor, !model.professorSegments.isEmpty {
+                    model.updateEditedProfessorText(newValue)
+                } else if model.selectedTab == .everyone || model.selectedTab == .professor {
+                    model.updateEditedAllText(newValue)
+                }
+            },
         )
     }
 
+    private var errorBanner: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            Text(model.errorMessage ?? "")
+                .font(.caption)
+                .textSelection(.enabled)
+            Spacer()
+            Button("Ocultar") { model.errorMessage = nil }
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.1))
+    }
+
+    @ViewBuilder
     private var reviewPanel: some View {
-        Group {
-            if model.reviewItems.isEmpty {
-                ContentUnavailableView(
-                    "Nada para revisar",
-                    systemImage: "checkmark.circle",
-                    description: Text("Los fragmentos con baja confianza o voces superpuestas aparecerán aquí.")
-                )
-            } else {
-                List(model.reviewItems) { item in
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack {
-                            Text("[\(item.segment.formattedTimestamp)] \(item.segment.speakerID)").font(.caption.bold())
-                            Text(item.reason).font(.caption).foregroundStyle(.orange)
-                            Spacer()
-                            Button(item.manuallyAssignedToProfessor ? "Asignado al profesor ✓" : "Asignar al profesor") {
-                                model.toggleReviewAssignment(item.id)
-                            }
-                            .controlSize(.small)
+        if model.reviewItems.isEmpty {
+            ContentUnavailableView(
+                "Nada para revisar",
+                systemImage: "checkmark.circle",
+                description: Text("Los fragmentos con baja confianza o voces superpuestas aparecerán aquí."),
+            )
+        } else {
+            List(model.reviewItems) { item in
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text("[\(item.segment.formattedTimestamp)] \(item.segment.speakerID)").font(.caption.bold())
+                        Text(item.reason).font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button(item.manuallyAssignedToProfessor ? "Asignado al profesor ✓" : "Asignar al profesor") {
+                            model.toggleReviewAssignment(item.id)
                         }
-                        Text(item.segment.text).textSelection(.enabled)
+                        .controlSize(.small)
                     }
-                    .padding(.vertical, 4)
+                    Text(item.segment.text).textSelection(.enabled)
                 }
+                .padding(.vertical, 4)
             }
         }
     }

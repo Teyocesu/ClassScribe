@@ -1,8 +1,124 @@
+import Darwin
 import Foundation
+
+enum SessionTextSource: Equatable {
+    case professor
+    case everyone
+    case recovered
+    case live
+    case none
+}
+
+struct SessionSummary: Identifiable, Equatable {
+    let id: String
+    let folder: URL
+    let metadata: ClassMetadata
+    let isRecoverable: Bool
+    let hasAudio: Bool
+    let audioIsValid: Bool
+    let hasRecoverableRawAudio: Bool
+    let preferredTextURL: URL?
+    let textSource: SessionTextSource
+    let recoveryReason: String?
+
+    var subject: String {
+        metadata.subject
+    }
+
+    var startedAt: Date {
+        metadata.startedAt
+    }
+
+    var duration: TimeInterval {
+        metadata.duration
+    }
+
+    var mode: CaptureMode {
+        metadata.mode
+    }
+
+    var source: String {
+        metadata.source
+    }
+
+    var professorSpeakerID: String? {
+        metadata.professorSpeakerID
+    }
+
+    var speakerCount: Int {
+        metadata.speakerCount
+    }
+
+    var state: ProcessingState {
+        isRecoverable ? .recoverable : metadata.state
+    }
+
+    var canRetryProcessing: Bool {
+        isRecoverable && ((hasAudio && audioIsValid) || hasRecoverableRawAudio)
+    }
+}
+
+struct RestoredSession {
+    var summary: SessionSummary
+    var metadata: ClassMetadata
+    var liveAccumulator: LiveTranscriptAccumulator
+    var allSegments: [TranscriptSegment]
+    var speakers: [SpeakerRecord]
+    var review: [ReviewItem]
+    var preferredText: String
+    var preferredTextSource: SessionTextSource
+    var editedLiveText: String?
+    var editedAllText: String?
+    var editedProfessorText: String?
+}
+
+struct LiveTranscriptContext: Codable, Equatable {
+    var subject: String
+    var startedAt: Date
+    var mode: CaptureMode
+    var source: String
+    var duration: TimeInterval
+}
+
+struct LiveTranscriptSnapshot: Codable, Equatable {
+    var version = 2
+    var accumulator: LiveTranscriptAccumulator
+    var stable: String
+    var provisional: String
+    var updatedAt: Date
+
+    init(accumulator: LiveTranscriptAccumulator, updatedAt: Date = Date()) {
+        self.accumulator = accumulator
+        stable = accumulator.stableText
+        provisional = accumulator.provisionalText
+        self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version, accumulator, stable, provisional, updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        stable = try container.decodeIfPresent(String.self, forKey: .stable) ?? ""
+        provisional = try container.decodeIfPresent(String.self, forKey: .provisional) ?? ""
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? .distantPast
+        accumulator = try container.decodeIfPresent(LiveTranscriptAccumulator.self, forKey: .accumulator)
+            ?? LiveTranscriptAccumulator(legacyStable: stable, provisional: provisional)
+    }
+}
+
+private struct LiveTranscriptJournalEntry: Codable {
+    var id = UUID()
+    var checkpoint: String
+    var snapshot: LiveTranscriptSnapshot
+}
 
 struct SessionStore {
     let root: URL
     private let encoder: JSONEncoder
+    private let journalEncoder: JSONEncoder
     private let decoder = JSONDecoder()
 
     init(root: URL? = nil) {
@@ -11,24 +127,66 @@ struct SessionStore {
         encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
+        journalEncoder = JSONEncoder()
+        journalEncoder.outputFormatting = [.sortedKeys]
+        journalEncoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
     }
 
     func createFolder(subject: String, date: Date = Date()) throws -> URL {
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700],
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd_HHmmss"
         let slug = subject.filenameSlug.isEmpty ? "Clase" : subject.filenameSlug
         let folder = root.appendingPathComponent("\(formatter.string(from: date))_\(slug)", isDirectory: true)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(
+            at: folder,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700],
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
         return folder
     }
 
-    func saveLive(stable: String, provisional: String, folder: URL) throws {
-        struct Snapshot: Codable { var stable: String; var provisional: String; var updatedAt: Date }
-        try writeJSON(Snapshot(stable: stable, provisional: provisional, updatedAt: Date()), to: folder.appendingPathComponent("live-transcript.json"))
+    func saveLive(
+        accumulator: LiveTranscriptAccumulator,
+        context: LiveTranscriptContext,
+        folder: URL,
+        checkpoint: String,
+        visibleTextOverride: String? = nil,
+    ) throws {
+        let snapshot = LiveTranscriptSnapshot(accumulator: accumulator)
+        try appendJournal(
+            LiveTranscriptJournalEntry(checkpoint: checkpoint, snapshot: snapshot),
+            to: folder.appendingPathComponent("live-transcript-journal.jsonl"),
+        )
+        try writeJSON(snapshot, to: folder.appendingPathComponent("live-transcript.json"))
+        let readableText = visibleTextOverride ?? snapshot.accumulator.visibleText
+        try writeText(liveText(readableText, context: context), to: folder.appendingPathComponent("live-transcript.txt"))
+        try writeText(liveMarkdown(readableText, context: context), to: folder.appendingPathComponent("live-transcript.md"))
+    }
+
+    func loadLive(folder: URL) -> LiveTranscriptAccumulator? {
+        let url = folder.appendingPathComponent("live-transcript.json")
+        if let data = try? Data(contentsOf: url),
+           let snapshot = try? decoder.decode(LiveTranscriptSnapshot.self, from: data) {
+            return snapshot.accumulator
+        }
+        let journalURL = folder.appendingPathComponent("live-transcript-journal.jsonl")
+        guard let data = try? Data(contentsOf: journalURL) else { return nil }
+        for line in data.split(separator: 0x0A).reversed() {
+            if let entry = try? decoder.decode(LiveTranscriptJournalEntry.self, from: Data(line)) {
+                return entry.snapshot.accumulator
+            }
+        }
+        return nil
     }
 
     func saveFinal(
@@ -37,23 +195,91 @@ struct SessionStore {
         professor: [TranscriptSegment],
         review: [ReviewItem],
         speakers: [SpeakerRecord],
-        folder: URL
+        folder: URL,
+        editedAllText: String? = nil,
+        editedProfessorText: String? = nil,
     ) throws {
-        try writeJSON(metadata, to: folder.appendingPathComponent("metadata.json"))
         try writeJSON(all, to: folder.appendingPathComponent("all-speakers.json"))
         try writeJSON(review, to: folder.appendingPathComponent("review.json"))
         try writeJSON(speakers, to: folder.appendingPathComponent("speakers.json"))
-        try TranscriptExporter.plainText(all).write(to: folder.appendingPathComponent("all-speakers.txt"), atomically: true, encoding: .utf8)
-        try TranscriptExporter.plainText(professor).write(to: folder.appendingPathComponent("professor.txt"), atomically: true, encoding: .utf8)
-        try TranscriptExporter.markdown(subject: metadata.subject, date: metadata.startedAt, segments: professor)
-            .write(to: folder.appendingPathComponent("professor.md"), atomically: true, encoding: .utf8)
-        try TranscriptExporter.srt(professor).write(to: folder.appendingPathComponent("professor.srt"), atomically: true, encoding: .utf8)
+        let readableAll = editedAllText ?? TranscriptExporter.plainText(all)
+        let readableProfessor = editedProfessorText ?? TranscriptExporter.plainText(professor)
+        try writeText(readableAll, to: folder.appendingPathComponent("all-speakers.txt"))
+        try writeText(
+            TranscriptExporter.markdown(subject: metadata.subject, date: metadata.startedAt, text: readableAll),
+            to: folder.appendingPathComponent("all-speakers.md"),
+        )
+        try writeText(readableProfessor, to: folder.appendingPathComponent("professor.txt"))
+        try writeText(
+            TranscriptExporter.markdown(subject: metadata.subject, date: metadata.startedAt, text: readableProfessor),
+            to: folder.appendingPathComponent("professor.md"),
+        )
+        try writeText(TranscriptExporter.srt(professor), to: folder.appendingPathComponent("professor.srt"))
+        // Commit the successful state last. If any output above fails or the
+        // process is interrupted, the prior metadata remains non-complete and
+        // the scanner truthfully offers recovery/retry on the next launch.
+        try writeJSON(metadata, to: folder.appendingPathComponent("metadata.json"))
+    }
+
+    func saveMetadata(_ metadata: ClassMetadata, folder: URL) throws {
+        try writeJSON(metadata, to: folder.appendingPathComponent("metadata.json"))
+    }
+
+    func saveFullTranscript(metadata: ClassMetadata, segments: [TranscriptSegment], folder: URL) throws {
+        guard !segments.isEmpty else { throw SessionStoreError.emptyTranscript }
+        try writeJSON(metadata, to: folder.appendingPathComponent("metadata.json"))
+        try writeJSON(segments, to: folder.appendingPathComponent("all-speakers.json"))
+        try writeText(TranscriptExporter.plainText(segments), to: folder.appendingPathComponent("all-speakers.txt"))
+        try writeText(
+            TranscriptExporter.markdown(subject: metadata.subject, date: metadata.startedAt, segments: segments),
+            to: folder.appendingPathComponent("all-speakers.md"),
+        )
+    }
+
+    func saveReadableLiveText(text: String, context: LiveTranscriptContext, folder: URL) throws {
+        try writeText(liveText(text, context: context), to: folder.appendingPathComponent("live-transcript.txt"))
+        try writeText(liveMarkdown(text, context: context), to: folder.appendingPathComponent("live-transcript.md"))
+    }
+
+    func materializeLegacyLiveText(
+        accumulator: LiveTranscriptAccumulator,
+        context: LiveTranscriptContext,
+        folder: URL,
+    ) throws {
+        try saveReadableLiveText(text: accumulator.visibleText, context: context, folder: folder)
+    }
+
+    func saveTextOverrides(
+        metadata: ClassMetadata,
+        allText: String?,
+        professorText: String?,
+        folder: URL,
+    ) throws {
+        if let allText {
+            try writeText(allText, to: folder.appendingPathComponent("all-speakers.txt"))
+            try writeText(
+                TranscriptExporter.markdown(subject: metadata.subject, date: metadata.startedAt, text: allText),
+                to: folder.appendingPathComponent("all-speakers.md"),
+            )
+        }
+        if let professorText {
+            try writeText(professorText, to: folder.appendingPathComponent("professor.txt"))
+            try writeText(
+                TranscriptExporter.markdown(subject: metadata.subject, date: metadata.startedAt, text: professorText),
+                to: folder.appendingPathComponent("professor.md"),
+            )
+        }
     }
 
     func saveVoiceReference(_ reference: ProfessorVoiceReference, folder: URL) throws {
         try writeJSON(reference, to: folder.appendingPathComponent("professor-voice-reference.json"))
         let voices = root.deletingLastPathComponent().appendingPathComponent("ProfessorVoices", isDirectory: true)
-        try FileManager.default.createDirectory(at: voices, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: voices,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700],
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: voices.path)
         let name = reference.subject.filenameSlug.isEmpty ? "Profesor" : reference.subject.filenameSlug
         try writeJSON(reference, to: voices.appendingPathComponent("\(name).json"))
     }
@@ -65,22 +291,317 @@ struct SessionStore {
         return try? decoder.decode(ProfessorVoiceReference.self, from: data)
     }
 
-    func history() -> [ClassMetadata] {
+    func scanSessions(materializeLegacyText: Bool = true) -> [SessionSummary] {
         guard let folders = try? FileManager.default.contentsOfDirectory(
             at: root,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles],
         ) else { return [] }
         return folders.compactMap { folder in
-            let url = folder.appendingPathComponent("metadata.json")
-            guard let data = try? Data(contentsOf: url) else { return nil }
-            return try? decoder.decode(ClassMetadata.self, from: data)
+            let values = try? folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values?.isDirectory == true, values?.isSymbolicLink != true else { return nil }
+            return inspectSession(folder: folder, materializeLegacyText: materializeLegacyText)
         }.sorted { $0.startedAt > $1.startedAt }
     }
 
-    private func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
+    func history() -> [SessionSummary] {
+        scanSessions()
+    }
+
+    func restore(_ summary: SessionSummary) -> RestoredSession {
+        let folder = summary.folder.standardizedFileURL
+        let allSegments: [TranscriptSegment] = decodeFile("all-speakers.json", in: folder) ?? []
+        let speakers: [SpeakerRecord] = decodeFile("speakers.json", in: folder) ?? []
+        let review: [ReviewItem] = decodeFile("review.json", in: folder) ?? []
+        let accumulator = loadLive(folder: folder) ?? LiveTranscriptAccumulator()
+        let allBase = TranscriptExporter.plainText(allSegments)
+        let professorSegments = SpeakerAssignment.professorSegments(
+            from: allSegments,
+            professorID: summary.metadata.professorSpeakerID,
+            review: review,
+        )
+        let professorBase = TranscriptExporter.plainText(professorSegments)
+        let allReadable = readNonemptyText(folder.appendingPathComponent("all-speakers.txt"))
+        let professorReadable = readNonemptyText(folder.appendingPathComponent("professor.txt"))
+        let preferred = preferredText(in: folder, accumulator: accumulator)
+        let liveBody = readLiveTranscript(folder.appendingPathComponent("live-transcript.txt"))
+
+        return RestoredSession(
+            summary: summary,
+            metadata: summary.metadata,
+            liveAccumulator: accumulator,
+            allSegments: allSegments,
+            speakers: speakers,
+            review: review,
+            preferredText: preferred.text,
+            preferredTextSource: preferred.source,
+            editedLiveText: liveBody.flatMap { $0 == accumulator.visibleText ? nil : $0 },
+            editedAllText: allReadable.flatMap { $0 == allBase ? nil : $0 },
+            editedProfessorText: professorReadable.flatMap { $0 == professorBase ? nil : $0 },
+        )
+    }
+
+    private func inspectSession(folder: URL, materializeLegacyText: Bool) -> SessionSummary? {
+        let fileManager = FileManager.default
+        let metadataURL = folder.appendingPathComponent("metadata.json")
+        let metadataData = try? Data(contentsOf: metadataURL)
+        let decodedMetadata = metadataData.flatMap { try? decoder.decode(ClassMetadata.self, from: $0) }
+        let audioURL = folder.appendingPathComponent("source.wav")
+        let hasAudio = fileManager.fileExists(atPath: audioURL.path)
+        let audioDuration = hasAudio ? try? WavFile.validate(audioURL) : nil
+        let audioIsValid = audioDuration != nil
+        let rawURL = folder.appendingPathComponent("source.raw")
+        let hasRecoverableRawAudio = (try? WavFile.validateFloat32Raw(rawURL)) != nil
+        var metadata = decodedMetadata ?? inferredMetadata(for: folder, duration: audioDuration ?? 0)
+        metadata.folderPath = folder.standardizedFileURL.path
+        if let audioDuration, audioDuration > metadata.duration {
+            metadata.duration = audioDuration
+        }
+
+        let accumulator = loadLive(folder: folder)
+        let hasLegacyText = !(accumulator?.visibleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let knownNames = [
+            "live-transcript.txt", "live-transcript.json", "live-transcript-journal.jsonl",
+            "recovered-transcript.txt", "all-speakers.txt", "all-speakers.json", "professor.txt", "source.raw",
+        ]
+        let hasKnownContent = hasAudio || metadataData != nil || knownNames.contains {
+            fileManager.fileExists(atPath: folder.appendingPathComponent($0).path)
+        }
+        guard hasKnownContent else { return nil }
+
+        let liveURL = folder.appendingPathComponent("live-transcript.txt")
+        if materializeLegacyText,
+           !fileManager.fileExists(atPath: liveURL.path),
+           hasLegacyText,
+           let accumulator {
+            let context = LiveTranscriptContext(
+                subject: metadata.subject,
+                startedAt: metadata.startedAt,
+                mode: metadata.mode,
+                source: metadata.source,
+                duration: metadata.duration,
+            )
+            try? materializeLegacyLiveText(accumulator: accumulator, context: context, folder: folder)
+        }
+
+        let preferred = preferredText(in: folder, accumulator: accumulator ?? LiveTranscriptAccumulator())
+        let allSegments: [TranscriptSegment] = decodeFile("all-speakers.json", in: folder) ?? []
+        let hasFullTranscript = readNonemptyText(folder.appendingPathComponent("all-speakers.txt")) != nil
+            || !allSegments.isEmpty
+        let missingMetadata = decodedMetadata == nil
+        let incompleteState = metadata.state != .complete
+        let missingAudio = !hasAudio
+        let invalidAudio = hasAudio && !audioIsValid
+        let needsAudioRecovery = !audioIsValid && hasRecoverableRawAudio
+        let missingFinal = !hasFullTranscript
+        let isRecoverable = missingMetadata || incompleteState || missingAudio || invalidAudio || needsAudioRecovery || missingFinal
+        let reason: String? = if needsAudioRecovery {
+            "El WAV quedó incompleto, pero el audio crudo se conservó y puede recuperarse."
+        } else if invalidAudio {
+            "El audio no es válido; el texto disponible se conserva."
+        } else if missingMetadata {
+            "Faltaba metadata; la sesión se reconstruyó desde sus archivos."
+        } else if missingFinal {
+            "El procesamiento final quedó incompleto."
+        } else if incompleteState {
+            "La sesión terminó en estado \(metadata.state.rawValue.lowercased())."
+        } else if missingAudio {
+            "Falta el WAV original; el texto disponible se conserva."
+        } else {
+            nil
+        }
+
+        return SessionSummary(
+            id: folder.standardizedFileURL.path,
+            folder: folder.standardizedFileURL,
+            metadata: metadata,
+            isRecoverable: isRecoverable,
+            hasAudio: hasAudio,
+            audioIsValid: audioIsValid,
+            hasRecoverableRawAudio: hasRecoverableRawAudio,
+            preferredTextURL: preferred.url,
+            textSource: preferred.source,
+            recoveryReason: reason,
+        )
+    }
+
+    private func preferredText(
+        in folder: URL,
+        accumulator: LiveTranscriptAccumulator,
+    ) -> (text: String, source: SessionTextSource, url: URL?) {
+        let professorURL = folder.appendingPathComponent("professor.txt")
+        if let text = readNonemptyText(professorURL) {
+            return (text, .professor, professorURL)
+        }
+        let everyoneURL = folder.appendingPathComponent("all-speakers.txt")
+        if let text = readNonemptyText(everyoneURL) {
+            return (text, .everyone, everyoneURL)
+        }
+        let recoveredURL = folder.appendingPathComponent("recovered-transcript.txt")
+        if let text = readNonemptyText(recoveredURL) {
+            return (text, .recovered, recoveredURL)
+        }
+        let liveURL = folder.appendingPathComponent("live-transcript.txt")
+        if let text = readLiveTranscript(liveURL), !text.isEmpty {
+            return (text, .live, liveURL)
+        }
+        let allSegments: [TranscriptSegment] = decodeFile("all-speakers.json", in: folder) ?? []
+        let reconstructed = TranscriptExporter.plainText(allSegments)
+        if !reconstructed.isEmpty {
+            return (reconstructed, .everyone, nil)
+        }
+        if !accumulator.visibleText.isEmpty {
+            return (accumulator.visibleText, .live, nil)
+        }
+        return ("", .none, nil)
+    }
+
+    private func readNonemptyText(_ url: URL) -> String? {
+        guard let value = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func readLiveTranscript(_ url: URL) -> String? {
+        guard let raw = readNonemptyText(url) else { return nil }
+        guard let marker = raw.range(of: "Transcripción:") else { return raw }
+        let body = raw[marker.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? nil : body
+    }
+
+    private func decodeFile<T: Decodable>(_ name: String, in folder: URL) -> T? {
+        let url = folder.appendingPathComponent(name)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? decoder.decode(T.self, from: data)
+    }
+
+    private func inferredMetadata(for folder: URL, duration: TimeInterval) -> ClassMetadata {
+        let name = folder.lastPathComponent
+        let prefix = String(name.prefix(17))
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd_HHmmss"
+        let date = formatter.date(from: prefix) ?? (try? folder.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+        let subjectStart = name.index(name.startIndex, offsetBy: min(18, name.count))
+        let inferredSubject = String(name[subjectStart...]).replacingOccurrences(of: "-", with: " ")
+        return ClassMetadata(
+            id: stableUUID(for: folder.standardizedFileURL.path),
+            subject: inferredSubject.isEmpty ? "Clase recuperada" : inferredSubject.capitalized,
+            startedAt: date,
+            duration: duration,
+            mode: .inPerson,
+            source: "Fuente no registrada",
+            professorSpeakerID: nil,
+            professorSelectionIsAutomatic: true,
+            speakerCount: 0,
+            state: .recoverable,
+            folderPath: folder.standardizedFileURL.path,
+            technicalVocabulary: "",
+        )
+    }
+
+    private func stableUUID(for value: String) -> UUID {
+        var first: UInt64 = 14_695_981_039_346_656_037
+        var second: UInt64 = 10_995_116_282_111
+        for byte in value.utf8 {
+            first = (first ^ UInt64(byte)) &* 1_099_511_628_211
+            second = (second &* 1_099_511_628_211) ^ UInt64(byte)
+        }
+        let hex = String(format: "%016llx%016llx", first, second)
+        let parts = [
+            String(hex.prefix(8)),
+            String(hex.dropFirst(8).prefix(4)),
+            String(hex.dropFirst(12).prefix(4)),
+            String(hex.dropFirst(16).prefix(4)),
+            String(hex.dropFirst(20).prefix(12)),
+        ]
+        return UUID(uuidString: parts.joined(separator: "-")) ?? UUID()
+    }
+
+    private func writeJSON(_ value: some Encodable, to url: URL) throws {
         let data = try encoder.encode(value)
-        try data.write(to: url, options: [.atomic])
+        try writePrivateData(data, to: url)
+    }
+
+    private func appendJournal(_ value: some Encodable, to url: URL) throws {
+        var data = try journalEncoder.encode(value)
+        data.append(0x0A)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+        try handle.synchronize()
+        try handle.close()
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private func writeText(_ value: String, to url: URL) throws {
+        try writePrivateData(Data(value.utf8), to: url)
+    }
+
+    private func writePrivateData(_ data: Data, to destination: URL) throws {
+        let temporary = destination.deletingLastPathComponent()
+            .appendingPathComponent(".classscribe-write-\(UUID().uuidString).tmp")
+        guard FileManager.default.createFile(
+            atPath: temporary.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600],
+        ) else { throw CocoaError(.fileWriteUnknown) }
+        do {
+            let handle = try FileHandle(forWritingTo: temporary)
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            try handle.close()
+            let result = temporary.path.withCString { source in
+                destination.path.withCString { target in Darwin.rename(source, target) }
+            }
+            guard result == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
+    }
+
+    private func liveText(_ transcript: String, context: LiveTranscriptContext) -> String {
+        """
+        Materia: \(context.subject)
+        Fecha: \(context.startedAt.formatted(date: .long, time: .shortened))
+        Modo: \(context.mode.rawValue)
+        Fuente: \(context.source)
+        Duración provisional: \(Timecode.display(context.duration))
+
+        Transcripción:
+
+        \(transcript)
+        """ + "\n"
+    }
+
+    private func liveMarkdown(_ transcript: String, context: LiveTranscriptContext) -> String {
+        """
+        # \(context.subject)
+
+        - Fecha: \(context.startedAt.formatted(date: .long, time: .shortened))
+        - Modo: \(context.mode.rawValue)
+        - Fuente: \(context.source)
+        - Duración provisional: \(Timecode.display(context.duration))
+
+        ## Transcripción
+
+        \(transcript)
+        """ + "\n"
+    }
+}
+
+enum SessionStoreError: LocalizedError {
+    case emptyTranscript
+
+    var errorDescription: String? {
+        "La transcripción final no produjo texto; se conserva la versión en vivo."
     }
 }

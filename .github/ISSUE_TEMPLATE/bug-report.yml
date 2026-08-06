@@ -2,30 +2,24 @@
 # Issue forms have no include mechanism, so a change to the export flow in the
 # app has to be made in both files.
 name: Bug Report
-description: Report a bug in Meeting Transcriber
+description: Report a bug in ClassScribe
 title: "[Bug] "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the report! To help diagnose the issue, please attach a diagnostic log:
-
-        1. Open Meeting Transcriber → **Settings → Advanced → Diagnostics**
-        2. Toggle **Verbose Diagnostic Logging** ON
-        3. Reproduce the problem
-        4. Click **Export Diagnostics…** — Finder will reveal a `.log` file
-        5. Drag that `.log` file into the **Diagnostic log** field below
-
-        Speaker names in the log are pseudonymised (e.g. `speaker_a3f2`) and
-        transcript text is **not** included.
+        Gracias por informar el problema. No adjuntes audio, transcripciones,
+        embeddings, logs completos ni crash reports: pueden contener datos
+        privados. Incluye solamente pasos de reproducción y, si es necesario,
+        un fragmento técnico previamente anonimizado.
 
   - type: input
     id: app-version
     attributes:
       label: App version
-      description: From Settings → Advanced → About
-      placeholder: "1.2.3 (abcdef) · Homebrew"
+      description: Copia la línea de build visible en la ventana principal.
+      placeholder: "commit abcdef · 2026-08-06T12:00:00Z"
     validations:
       required: true
 
@@ -34,10 +28,8 @@ body:
     attributes:
       label: Build variant
       options:
-        - Homebrew (stable)
-        - Homebrew (beta / RC)
-        - App Store
         - Built from source
+        - Development bundle
     validations:
       required: true
 
@@ -69,9 +61,9 @@ body:
       required: true
 
   - type: textarea
-    id: log
+    id: sanitized-details
     attributes:
-      label: Diagnostic log
-      description: Drag the exported `.log` file here. GitHub will upload it automatically.
+      label: Sanitized technical details (optional)
+      description: Never include audio, transcripts, private paths, full logs or crash reports.
     validations:
       required: false

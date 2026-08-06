@@ -20,8 +20,8 @@ body:
     id: app-version
     attributes:
       label: App version
-      description: From Settings → Advanced → About. If you have not installed it yet, write "not installed".
-      placeholder: "1.2.3 (abcdef) · Homebrew"
+      description: Copy the build line shown in ClassScribe, or write "not installed".
+      placeholder: "commit abcdef · 2026-08-06T12:00:00Z"
     validations:
       required: true
 
@@ -50,23 +50,5 @@ body:
         unusual CPU or battery load, a meeting that was not recorded, or a bad transcript.
         Numbers, timestamps and what the menu bar icon was doing at the time help far more
         than adjectives.
-    validations:
-      required: false
-
-  - type: textarea
-    id: log
-    attributes:
-      label: Diagnostic log
-      description: |
-        Only useful if you answered the question above. To produce one:
-
-        1. Open Meeting Transcriber → **Settings → Advanced → Diagnostics**
-        2. Toggle **Verbose Diagnostic Logging** ON
-        3. Reproduce what you observed
-        4. Click **Export Diagnostics…** and Finder will reveal a `.log` file
-        5. Drag that `.log` file into this field
-
-        Speaker names in the log are pseudonymised (e.g. `speaker_a3f2`) and
-        transcript text is **not** included.
     validations:
       required: false

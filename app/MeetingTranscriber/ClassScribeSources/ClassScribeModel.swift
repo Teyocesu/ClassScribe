@@ -7,7 +7,20 @@ enum TranscriptTab: String, CaseIterable, Identifiable {
     case professor = "Profesor"
     case everyone = "Todos los hablantes"
     case review = "Revisar"
-    var id: String { rawValue }
+    var id: String {
+        rawValue
+    }
+}
+
+private struct ClassSessionContext: Sendable {
+    var id: UUID
+    var folder: URL
+    var subject: String
+    var startedAt: Date
+    var mode: CaptureMode
+    var source: String
+    var technicalVocabulary: String
+    var technicalVocabularyURL: URL?
 }
 
 @MainActor
@@ -32,78 +45,178 @@ final class ClassScribeModel {
     var professorSpeakerID: String?
     var professorSelectionIsAutomatic = true
     var finalReplacedLive = false
-    var editedProfessorText = ""
-    var editedAllText = ""
-    var history: [ClassMetadata] = []
+    var editedLiveText: String?
+    var editedProfessorText: String?
+    var editedAllText: String?
+    var history: [SessionSummary] = []
     var errorMessage: String?
     var isCalibrating = false
     var calibrationSecondsRemaining = 0
+    private(set) var isStopping = false
+    private(set) var isRetrying = false
 
     let capture: CaptureController
     private let parakeet: ParakeetService
     private let store: SessionStore
-    private let finalProcessor: FinalProcessor
+    private let finalProcessor: any FinalProcessingProviding
     private var classFolder: URL?
     private var startedAt: Date?
     private var elapsedTimer: Timer?
     private var liveTask: Task<Void, Never>?
     private var finalTask: Task<Void, Never>?
+    private var stopTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
+    private var calibrationTask: Task<Void, Never>?
+    private var finalJobID: UUID?
+    private var retryJobID: UUID?
     private var accumulator = LiveTranscriptAccumulator()
     private var technicalVocabularyURL: URL?
+    private var activeSession: ClassSessionContext?
 
-    init() {
-        let parakeet = ParakeetService()
+    init(
+        store: SessionStore = SessionStore(),
+        capture injectedCapture: CaptureController? = nil,
+        parakeet injectedParakeet: ParakeetService? = nil,
+        finalProcessor injectedFinalProcessor: (any FinalProcessingProviding)? = nil,
+    ) {
+        let parakeet = injectedParakeet ?? ParakeetService()
         self.parakeet = parakeet
-        store = SessionStore()
-        finalProcessor = FinalProcessor(parakeet: parakeet)
-        capture = CaptureController()
+        self.store = store
+        finalProcessor = injectedFinalProcessor ?? FinalProcessor(parakeet: parakeet)
+        capture = injectedCapture ?? CaptureController()
         capture.refreshSources()
         history = store.history()
         selectedApplicationID = capture.applications.first?.id
         selectedMicrophoneID = capture.microphones.first?.id
     }
 
-    var isRecording: Bool { capture.isCapturing }
+    var isRecording: Bool {
+        capture.isCapturing
+    }
+
     var canStart: Bool {
-        !capture.isBusy && !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !capture.isBusy && !isStopping && !isRetrying && finalTask == nil
+            && !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && (mode == .online ? selectedApplication != nil : selectedMicrophone != nil)
     }
+
+    var isProcessing: Bool {
+        isRetrying || finalTask != nil || state == .finalTranscription || state == .diarizing
+    }
+
+    var isSessionBusy: Bool {
+        capture.isBusy || isStopping || isProcessing
+    }
+
     var selectedApplication: RunningApplication? {
         capture.applications.first { $0.id == selectedApplicationID }
     }
+
     var selectedMicrophone: MicrophoneOption? {
         capture.microphones.first { $0.id == selectedMicrophoneID }
     }
+
     var selectedSourceName: String {
         mode == .online ? (selectedApplication?.name ?? "Sin aplicación") : (selectedMicrophone?.name ?? "Sin micrófono")
     }
+
     var professorSegments: [TranscriptSegment] {
         SpeakerAssignment.professorSegments(from: allSegments, professorID: professorSpeakerID, review: reviewItems)
     }
+
     var displayedText: String {
         if !finalReplacedLive {
-            let separator = stableLiveText.isEmpty || provisionalLiveText.isEmpty ? "" : " "
-            return stableLiveText + separator + provisionalLiveText
+            return editedLiveText ?? liveVisibleText
         }
         switch selectedTab {
         case .professor:
-            return editedProfessorText.isEmpty ? TranscriptExporter.plainText(professorSegments) : editedProfessorText
+            let professor = editedProfessorText ?? TranscriptExporter.plainText(professorSegments)
+            if !professor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return professor
+            }
+            return editedAllText ?? TranscriptExporter.plainText(allSegments)
         case .everyone:
-            return editedAllText.isEmpty ? TranscriptExporter.plainText(allSegments) : editedAllText
+            return editedAllText ?? TranscriptExporter.plainText(allSegments)
         case .review:
             return reviewItems.map { "[\($0.segment.formattedTimestamp)] \($0.reason)\n\($0.segment.text)" }.joined(separator: "\n\n")
         }
     }
-    var currentFolder: URL? { classFolder }
+
+    var liveVisibleText: String {
+        let separator = stableLiveText.isEmpty || provisionalLiveText.isEmpty ? "" : "\n\n"
+        return stableLiveText + separator + provisionalLiveText
+    }
+
+    var bestAvailableText: String {
+        let selectedText: String? = if !finalReplacedLive {
+            editedLiveText ?? liveVisibleText
+        } else {
+            switch selectedTab {
+            case .professor:
+                displayedText
+            case .everyone, .review:
+                editedAllText ?? TranscriptExporter.plainText(allSegments)
+            }
+        }
+        return TranscriptActions.bestAvailable(
+            preferredEdit: selectedText,
+            professorEdit: editedProfessorText,
+            professor: TranscriptExporter.plainText(professorSegments),
+            everyoneEdit: editedAllText,
+            everyone: TranscriptExporter.plainText(allSegments),
+            liveEdit: editedLiveText,
+            live: liveVisibleText,
+        )
+    }
+
+    var hasCopyableTranscript: Bool {
+        !bestAvailableText.isEmpty
+    }
+
+    var canRetryProcessing: Bool {
+        guard !isSessionBusy,
+              let folder = classFolder,
+              let summary = history.first(where: { $0.folder.standardizedFileURL == folder.standardizedFileURL })
+        else { return false }
+        return summary.canRetryProcessing
+    }
+
+    var canOpenTXT: Bool {
+        currentReadableTextURL != nil
+    }
+
+    var professorUnavailableWarning: String? {
+        guard finalReplacedLive, professorSegments.isEmpty, !allSegments.isEmpty || editedAllText != nil else { return nil }
+        return "Aún no hay profesor seleccionado; se muestra la transcripción completa."
+    }
+
+    var currentFolder: URL? {
+        classFolder
+    }
+
+    var selectedExportSegments: [TranscriptSegment] {
+        selectedTab == .professor && !professorSegments.isEmpty ? professorSegments : allSegments
+    }
+
+    var selectedExportHasFreeformEdit: Bool {
+        selectedTab == .professor && !professorSegments.isEmpty
+            ? editedProfessorText != nil
+            : editedAllText != nil
+    }
 
     func refreshSources() {
         capture.refreshSources()
-        if selectedApplication == nil { selectedApplicationID = capture.applications.first?.id }
-        if selectedMicrophone == nil { selectedMicrophoneID = capture.microphones.first?.id }
+        if selectedApplication == nil {
+            selectedApplicationID = capture.applications.first?.id
+        }
+        if selectedMicrophone == nil {
+            selectedMicrophoneID = capture.microphones.first?.id
+        }
     }
 
     func startClass() async {
         guard canStart else { return }
+        cancelCalibration()
         errorMessage = nil
         finalReplacedLive = false
         stableLiveText = ""
@@ -113,8 +226,13 @@ final class ClassScribeModel {
         reviewItems = []
         professorSpeakerID = nil
         professorSelectionIsAutomatic = true
-        editedProfessorText = ""
-        editedAllText = ""
+        editedLiveText = nil
+        editedProfessorText = nil
+        editedAllText = nil
+        isTranscriptionPaused = false
+        transcriptionLatency = 0
+        elapsed = 0
+        selectedTab = .professor
         accumulator = LiveTranscriptAccumulator()
         let now = Date()
         do {
@@ -122,28 +240,49 @@ final class ClassScribeModel {
             classFolder = folder
             startedAt = now
             technicalVocabularyURL = try makeVocabularyFile(in: folder)
+            let session = ClassSessionContext(
+                id: UUID(),
+                folder: folder,
+                subject: subject,
+                startedAt: now,
+                mode: mode,
+                source: selectedSourceName,
+                technicalVocabulary: technicalVocabulary,
+                technicalVocabularyURL: technicalVocabularyURL,
+            )
+            activeSession = session
+            state = .startingCapture
+            statusDetail = mode == .inPerson
+                ? "Esperando el primer buffer escrito antes de iniciar el contador."
+                : "Iniciando la captura de audio de la aplicación seleccionada."
+            try checkpointLive("session-created", session: session)
+            try store.saveMetadata(metadata(session: session, state: .startingCapture), folder: folder)
             _ = try await capture.start(
                 mode: mode,
                 application: selectedApplication,
                 microphone: selectedMicrophone,
-                folder: folder
+                folder: folder,
             )
             state = .recording
             statusDetail = "El audio se guarda aunque pauses la transcripción."
             startElapsedTimer()
-            startLiveTranscription()
+            startLiveTranscription(session: session)
         } catch {
             state = .failed
             errorMessage = error.localizedDescription
             statusDetail = error.localizedDescription
+            persistCurrentState(checkpoint: "start-failed")
         }
     }
 
     func pauseTranscription() {
         guard isRecording, !isTranscriptionPaused else { return }
         isTranscriptionPaused = true
+        accumulator.confirmProvisional()
+        syncLiveTextFromAccumulator()
         state = .transcriptionPaused
         statusDetail = "La grabación continúa; solo se pausó la inferencia."
+        persistCurrentState(checkpoint: "paused")
     }
 
     func resumeTranscription() {
@@ -151,45 +290,74 @@ final class ClassScribeModel {
         isTranscriptionPaused = false
         state = .recording
         statusDetail = "Transcripción reanudada; el WAV nunca se interrumpió."
+        persistCurrentState(checkpoint: "resumed")
     }
 
-    func stopClass() {
-        guard isRecording else { return }
+    func stopClass() async {
+        if let stopTask {
+            await stopTask.value
+            return
+        }
+        guard isRecording, let session = activeSession else { return }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performStop(session: session)
+        }
+        stopTask = task
+        await task.value
+        stopTask = nil
+    }
+
+    private func performStop(session: ClassSessionContext) async {
+        guard !isStopping else { return }
+        isStopping = true
+        cancelCalibration()
         errorMessage = nil
-        state = .finalizingAudio
-        liveTask?.cancel()
+        state = .stopping
+        statusDetail = "Guardando transcripción antes de cerrar el audio."
+        let task = liveTask
+        task?.cancel()
+        await task?.value
         liveTask = nil
         elapsedTimer?.invalidate()
         elapsedTimer = nil
         accumulator.confirmProvisional()
-        stableLiveText = accumulator.stableText
-        provisionalLiveText = ""
+        syncLiveTextFromAccumulator()
+        do {
+            try checkpointLive("before-audio-stop", session: session)
+            try store.saveMetadata(metadata(session: session, state: .stopping), folder: session.folder)
+        } catch {
+            errorMessage = "No se pudo completar el checkpoint previo: \(error.localizedDescription)"
+        }
 
         do {
-            let stopped = try capture.stop()
+            state = .finalizingAudio
+            statusDetail = "Cerrando y validando el WAV."
+            let stopped = try await capture.stop()
             elapsed = stopped.duration
-            runFinalProcessing(audioURL: stopped.url)
+            try checkpointLive("audio-stopped", session: session)
+            isStopping = false
+            runFinalProcessing(audioURL: stopped.url, session: session)
         } catch {
+            isStopping = false
             state = .failed
             errorMessage = error.localizedDescription
             statusDetail = "El audio se conservó, pero no se pudo validar: \(error.localizedDescription)"
-            persistCurrentState()
+            persistCurrentState(checkpoint: "audio-stop-failed")
         }
     }
 
     func cancelFinalProcessing() {
         finalTask?.cancel()
-        finalTask = nil
-        state = .cancelled
-        statusDetail = "Se canceló el procesamiento; el WAV y la transcripción en vivo se conservaron."
-        persistCurrentState()
+        statusDetail = "Cancelando procesamiento; el texto y el WAV permanecen disponibles."
     }
 
     func selectProfessor(_ id: String) {
         professorSpeakerID = id
         professorSelectionIsAutomatic = false
         statusDetail = "Profesor cambiado a \(id); vista filtrada regenerada."
-        editedProfessorText = ""
+        editedProfessorText = nil
+        selectedTab = .professor
         persistFinalOutputs()
         saveProfessorReference(for: id)
     }
@@ -197,32 +365,38 @@ final class ClassScribeModel {
     func toggleReviewAssignment(_ id: UUID) {
         guard let index = reviewItems.firstIndex(where: { $0.id == id }) else { return }
         reviewItems[index].manuallyAssignedToProfessor.toggle()
-        editedProfessorText = ""
+        editedProfessorText = nil
         persistFinalOutputs()
     }
 
     func calibrateProfessorVoice() {
-        guard isRecording, !isCalibrating else { return }
+        guard isRecording, !isCalibrating, let session = activeSession else { return }
         isCalibrating = true
         calibrationSecondsRemaining = 20
         statusDetail = "Calibración: procura que hable principalmente el profesor durante 20 segundos."
-        Task { [weak self] in
+        calibrationTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                self.calibrationTask = nil
+                self.isCalibrating = false
+                self.calibrationSecondsRemaining = 0
+            }
             for remaining in stride(from: 20, through: 1, by: -1) {
-                guard !Task.isCancelled, self.isRecording else { break }
+                guard !Task.isCancelled,
+                      self.isRecording,
+                      self.activeSession?.id == session.id else { return }
                 self.calibrationSecondsRemaining = remaining
                 try? await Task.sleep(for: .seconds(1))
             }
             guard self.isRecording,
-                  let window = await self.capture.liveStore.window(seconds: 20),
-                  let folder = self.classFolder else {
-                self.isCalibrating = false
-                return
-            }
+                  self.activeSession?.id == session.id,
+                  let window = await self.capture.liveStore.window(seconds: 20)
+            else { return }
             do {
-                let url = folder.appendingPathComponent("professor-calibration.wav")
+                let url = session.folder.appendingPathComponent("professor-calibration.wav")
                 try WavFile.writeFloat32(window.samples, to: url)
                 let result = try await self.finalProcessor.diarize(url)
+                guard self.activeSession?.id == session.id else { return }
                 let durations = Dictionary(grouping: result.spans, by: \.speakerID)
                     .mapValues { $0.reduce(0) { $0 + $1.end - $1.start } }
                 guard let dominant = durations.max(by: { $0.value < $1.value })?.key,
@@ -230,61 +404,245 @@ final class ClassScribeModel {
                     throw InferenceError.modelUnavailable
                 }
                 let reference = ProfessorVoiceReference(
-                    subject: self.subject,
+                    subject: session.subject,
                     createdAt: Date(),
                     sourceSpeakerID: dominant,
-                    embedding: embedding
+                    embedding: embedding,
                 )
-                try self.store.saveVoiceReference(reference, folder: folder)
+                try self.store.saveVoiceReference(reference, folder: session.folder)
                 self.statusDetail = "Referencia local de voz calibrada. No se subió ningún dato."
+            } catch is CancellationError {
+                return
             } catch {
-                self.errorMessage = "No se pudo calibrar la voz: \(error.localizedDescription)"
+                if self.activeSession?.id == session.id {
+                    self.errorMessage = "No se pudo calibrar la voz: \(error.localizedDescription)"
+                }
             }
-            self.isCalibrating = false
-            self.calibrationSecondsRemaining = 0
         }
     }
 
-    func copyAll() {
+    func copyTranscript() {
+        let text = bestAvailableText
+        guard !text.isEmpty else {
+            errorMessage = "Todavía no hay una transcripción para copiar."
+            return
+        }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(displayedText, forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     func copyForChatGPT() {
-        let date = (startedAt ?? Date()).formatted(date: .long, time: .shortened)
-        let text = """
-        Materia: \(subject)
-        Fecha: \(date)
-        Duración: \(Timecode.display(elapsed))
-
-        Transcripción del profesor:
-        \(editedProfessorText.isEmpty ? TranscriptExporter.plainText(professorSegments) : editedProfessorText)
-        """
+        let transcript = bestAvailableText
+        guard !transcript.isEmpty else {
+            errorMessage = "Todavía no hay una transcripción para copiar."
+            return
+        }
+        let context = activeSession
+        let text = TranscriptActions.chatEnvelope(
+            subject: context?.subject ?? subject,
+            date: context?.startedAt ?? startedAt ?? Date(),
+            duration: elapsed,
+            mode: context?.mode ?? mode,
+            source: context?.source ?? selectedSourceName,
+            transcript: transcript,
+        )
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
 
     func export(_ kind: ExportKind) {
+        let transcript = bestAvailableText
+        let sessionSubject = activeSession?.subject ?? subject
+        let sessionDate = activeSession?.startedAt ?? startedAt ?? Date()
+        let timedSegments = selectedExportSegments
+        let hasFreeformEdit = selectedExportHasFreeformEdit
+        let format: TranscriptExportFormat = switch kind {
+        case .txt: .txt
+        case .markdown: .markdown
+        case .srt: .srt
+        }
+        let plan: TranscriptExportPlan
+        do {
+            plan = try TranscriptExportPolicy.make(
+                format: format,
+                subject: sessionSubject,
+                date: sessionDate,
+                text: transcript,
+                timedSegments: timedSegments,
+                hasFreeformEdit: hasFreeformEdit,
+            )
+            if let warning = plan.warning {
+                let alert = NSAlert()
+                alert.messageText = "El SRT usa la versión segmentada"
+                alert.informativeText = warning
+                alert.addButton(withTitle: "Exportar SRT segmentado")
+                alert.addButton(withTitle: "Cancelar")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            return
+        }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "\(subject.filenameSlug.isEmpty ? "Clase" : subject.filenameSlug)-profesor.\(kind.extensionName)"
+        panel.nameFieldStringValue = "\(sessionSubject.filenameSlug.isEmpty ? "clase" : sessionSubject.filenameSlug)-transcripcion.\(kind.extensionName)"
         panel.allowedContentTypes = [kind.contentType]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let content: String
-        switch kind {
-        case .txt: content = editedProfessorText.isEmpty ? TranscriptExporter.plainText(professorSegments) : editedProfessorText
-        case .markdown: content = TranscriptExporter.markdown(subject: subject, date: startedAt ?? Date(), segments: professorSegments)
-        case .srt: content = TranscriptExporter.srt(professorSegments)
-        }
-        do { try content.write(to: url, atomically: true, encoding: .utf8) }
-        catch { errorMessage = error.localizedDescription }
+        do {
+            try plan.content.write(to: url, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func updateEditedLiveText(_ text: String) {
+        editedLiveText = text
+        guard let session = activeSession else { return }
+        do {
+            try store.saveReadableLiveText(
+                text: text,
+                context: liveContext(session: session),
+                folder: session.folder,
+            )
+        } catch { errorMessage = "No se pudo guardar la edición: \(error.localizedDescription)" }
+    }
+
+    func updateEditedProfessorText(_ text: String) {
+        editedProfessorText = text
+        persistTextEdits()
+    }
+
+    func updateEditedAllText(_ text: String) {
+        editedAllText = text
+        persistTextEdits()
     }
 
     func openCurrentFolder() {
-        if let classFolder { NSWorkspace.shared.activateFileViewerSelecting([classFolder]) }
+        if let classFolder {
+            NSWorkspace.shared.activateFileViewerSelecting([classFolder])
+        }
     }
 
-    func openHistoryFolder(_ metadata: ClassMetadata) {
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: metadata.folderPath)])
+    func openCurrentTXT() {
+        guard let url = currentReadableTextURL else {
+            errorMessage = "Todavía no existe un TXT legible para esta sesión."
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    func openHistoryFolder(_ summary: SessionSummary) {
+        NSWorkspace.shared.activateFileViewerSelecting([summary.folder])
+    }
+
+    func openHistory(_ summary: SessionSummary) {
+        guard !isSessionBusy else { return }
+        cancelCalibration()
+        let restored = store.restore(summary)
+        let metadata = restored.metadata
+        classFolder = summary.folder
+        startedAt = metadata.startedAt
+        subject = metadata.subject
+        mode = metadata.mode
+        technicalVocabulary = metadata.technicalVocabulary
+        elapsed = metadata.duration
+        professorSpeakerID = metadata.professorSpeakerID
+        professorSelectionIsAutomatic = metadata.professorSelectionIsAutomatic
+        accumulator = restored.liveAccumulator
+        syncLiveTextFromAccumulator()
+        allSegments = restored.allSegments
+        speakers = restored.speakers
+        reviewItems = restored.review
+        editedAllText = restored.editedAllText
+        editedProfessorText = restored.editedProfessorText
+        editedLiveText = restored.preferredTextSource == .recovered
+            ? restored.preferredText
+            : restored.editedLiveText
+        isTranscriptionPaused = false
+        finalReplacedLive = restored.preferredTextSource == .professor
+            || restored.preferredTextSource == .everyone
+            || !allSegments.isEmpty
+        selectedTab = restored.preferredTextSource == .professor ? .professor : .everyone
+        state = summary.state
+        statusDetail = summary.isRecoverable
+            ? "Sesión recuperable cargada. El audio y el mejor texto disponible permanecen intactos."
+            : "Sesión del historial cargada."
+        errorMessage = summary.recoveryReason
+        let vocabularyURL = summary.folder.appendingPathComponent("technical-vocabulary.txt")
+        activeSession = ClassSessionContext(
+            id: metadata.id,
+            folder: summary.folder,
+            subject: metadata.subject,
+            startedAt: metadata.startedAt,
+            mode: metadata.mode,
+            source: metadata.source,
+            technicalVocabulary: metadata.technicalVocabulary,
+            technicalVocabularyURL: FileManager.default.fileExists(atPath: vocabularyURL.path) ? vocabularyURL : nil,
+        )
+    }
+
+    func retryProcessing() async {
+        if let retryTask {
+            await retryTask.value
+            return
+        }
+        guard canRetryProcessing, let session = activeSession else { return }
+        let jobID = UUID()
+        retryJobID = jobID
+        isRetrying = true
+        state = .finalizingAudio
+        statusDetail = "Validando el audio conservado antes de reintentar."
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performRetry(session: session, jobID: jobID)
+        }
+        retryTask = task
+        await task.value
+        if retryJobID == jobID {
+            retryJobID = nil
+            retryTask = nil
+            isRetrying = false
+        }
+    }
+
+    private func performRetry(session: ClassSessionContext, jobID: UUID) async {
+        let audioURL = session.folder.appendingPathComponent("source.wav")
+        let rawURL = session.folder.appendingPathComponent("source.raw")
+        do {
+            let preparation = try await Task.detached(priority: .userInitiated) {
+                do {
+                    return try (duration: WavFile.validate(audioURL), recoveredRaw: false)
+                } catch let wavError {
+                    guard FileManager.default.fileExists(atPath: rawURL.path) else { throw wavError }
+                    return try (
+                        duration: WavFile.recoverFloat32Raw(rawURL, destination: audioURL),
+                        recoveredRaw: true,
+                    )
+                }
+            }.value
+            try ensureCurrentRetry(jobID: jobID, session: session)
+            elapsed = preparation.duration
+            errorMessage = nil
+            statusDetail = preparation.recoveredRaw
+                ? "WAV reconstruido sin borrar el audio crudo; reintentando el procesamiento."
+                : "Audio validado; reintentando el procesamiento sin modificar el WAV."
+            try store.saveMetadata(metadata(session: session, state: .finalizingAudio), folder: session.folder)
+            runFinalProcessing(audioURL: audioURL, session: session, reusePersistedTranscript: !allSegments.isEmpty)
+        } catch is CancellationError {
+            return
+        } catch {
+            guard retryJobID == jobID, activeSession?.id == session.id else { return }
+            state = .recoverable
+            errorMessage = "No se puede reprocesar el WAV: \(error.localizedDescription)"
+            statusDetail = "El texto recuperado sigue disponible."
+            persistCurrentState(checkpoint: "audio-recovery-failed", session: session)
+        }
+    }
+
+    private func ensureCurrentRetry(jobID: UUID, session: ClassSessionContext) throws {
+        guard retryJobID == jobID, activeSession?.id == session.id else { throw CancellationError() }
+    }
+
+    func waitForFinalProcessingForTesting() async {
+        await finalTask?.value
     }
 
     private func startElapsedTimer() {
@@ -294,7 +652,7 @@ final class ClassScribeModel {
             Task { @MainActor [weak self] in
                 guard let self, let startedAt = self.startedAt else { return }
                 if let failure = self.capture.takeTerminalFailure() {
-                    self.failActiveCapture(failure)
+                    await self.failActiveCapture(failure)
                     return
                 }
                 self.elapsed = Date().timeIntervalSince(startedAt)
@@ -302,26 +660,54 @@ final class ClassScribeModel {
         }
     }
 
-    private func failActiveCapture(_ message: String) {
+    private func failActiveCapture(_ message: String) async {
+        guard !isStopping, let session = activeSession else { return }
+        isStopping = true
+        cancelCalibration()
+        state = .stopping
+        statusDetail = "Cerrando y validando el audio después del error del micrófono."
         elapsedTimer?.invalidate()
         elapsedTimer = nil
-        liveTask?.cancel()
+        let task = liveTask
+        task?.cancel()
+        await task?.value
         liveTask = nil
-        state = .failed
-        errorMessage = message
-        statusDetail = "La captura se detuvo: \(message)"
-        persistCurrentState()
+        accumulator.confirmProvisional()
+        syncLiveTextFromAccumulator()
+        let audioURL = session.folder.appendingPathComponent("source.wav")
+        let validation = await Task.detached(priority: .userInitiated) {
+            Result { try WavFile.validate(audioURL) }
+        }.value
+        guard activeSession?.id == session.id else {
+            isStopping = false
+            return
+        }
+        switch validation {
+        case let .success(duration):
+            elapsed = duration
+            state = .recoverable
+            errorMessage = message
+            statusDetail = "La captura se detuvo, pero el WAV fue validado y puede reprocesarse."
+        case let .failure(validationError):
+            state = .failed
+            errorMessage = "\(message) El WAV no pudo validarse: \(validationError.localizedDescription)"
+            statusDetail = "La captura se detuvo y el audio quedó conservado para diagnóstico."
+        }
+        persistCurrentState(checkpoint: "capture-failed", session: session)
+        isStopping = false
     }
 
-    private func startLiveTranscription() {
+    private func startLiveTranscription(session: ClassSessionContext) {
         liveTask?.cancel()
         liveTask = Task { [weak self] in
             guard let self else { return }
             var lastProcessedEnd: Int64 = 0
-            let minimumSamples: Int64 = 5 * 16_000
-            let hopSamples: Int64 = 88_000 // 5.5 seconds; 1.5 second overlap in a 7 second window
+            let minimumSamples: Int64 = 5 * 16000
+            let hopSamples: Int64 = 88000 // 5.5 seconds; 1.5 second overlap in a 7 second window
             while !Task.isCancelled, self.isRecording {
-                try? await Task.sleep(for: .milliseconds(400))
+                do { try await Task.sleep(for: .milliseconds(400)) }
+                catch { break }
+                guard !Task.isCancelled, self.activeSession?.id == session.id else { break }
                 guard !self.isTranscriptionPaused else { continue }
                 let total = await self.capture.liveStore.totalSamples()
                 guard total >= minimumSamples,
@@ -333,19 +719,27 @@ final class ClassScribeModel {
                     self.state = .loadingModel
                     self.statusDetail = "Parakeet TDT v3 procesa una ventana local de 7 segundos."
                     let text = try await self.parakeet.transcribe(samples: window.samples)
+                    try Task.checkCancellation()
+                    guard self.activeSession?.id == session.id, self.isRecording else { break }
                     let pause = await self.capture.liveStore.hasRecentPause()
-                    self.accumulator.accept(text, confirmedByPause: pause)
-                    self.stableLiveText = self.accumulator.stableText
-                    self.provisionalLiveText = self.accumulator.provisionalText
+                    self.accumulator.accept(
+                        text,
+                        start: window.start,
+                        end: Double(total) / 16000,
+                        confirmedByPause: pause,
+                    )
+                    self.syncLiveTextFromAccumulator()
                     self.transcriptionLatency = Date().timeIntervalSince(began) + 1.5
                     self.state = .recording
                     self.statusDetail = pause
                         ? "Fragmento confirmado tras una pausa de voz."
                         : "Texto tenue = hipótesis provisional pendiente de confirmar."
-                    if let folder = self.classFolder {
-                        try? self.store.saveLive(stable: self.stableLiveText, provisional: self.provisionalLiveText, folder: folder)
-                    }
+                    do { try self.checkpointLive("asr-window", session: session) }
+                    catch { self.errorMessage = "No se pudo actualizar live-transcript.txt: \(error.localizedDescription)" }
+                } catch is CancellationError {
+                    break
                 } catch {
+                    guard !Task.isCancelled, self.activeSession?.id == session.id, self.isRecording else { break }
                     self.state = .recording
                     self.errorMessage = "Transcripción en vivo no disponible: \(error.localizedDescription). La grabación continúa."
                     self.statusDetail = "La grabación continúa; se reintentará y habrá retranscripción final."
@@ -354,41 +748,99 @@ final class ClassScribeModel {
         }
     }
 
-    private func runFinalProcessing(audioURL: URL) {
-        finalTask?.cancel()
+    private func runFinalProcessing(
+        audioURL: URL,
+        session: ClassSessionContext,
+        reusePersistedTranscript: Bool = false,
+    ) {
+        guard finalTask == nil else {
+            errorMessage = "Ya hay un procesamiento final en curso."
+            return
+        }
+        let jobID = UUID()
+        finalJobID = jobID
         finalTask = Task { [weak self] in
             guard let self else { return }
             do {
-                self.state = .finalTranscription
-                self.statusDetail = "La versión en vivo permanece visible mientras se procesa el WAV completo."
-                try await self.finalProcessor.configureVocabulary(file: self.technicalVocabularyURL)
-                let transcript = try await self.finalProcessor.transcribe(audioURL)
-                try Task.checkCancellation()
+                try self.ensureCurrentFinalJob(jobID: jobID, session: session)
+                let transcript: [TranscriptSegment]
+                if reusePersistedTranscript, !self.allSegments.isEmpty {
+                    transcript = self.allSegments
+                    self.statusDetail = "La transcripción completa ya estaba guardada; se reintenta la identificación de voces."
+                    try self.store.saveMetadata(
+                        self.metadata(session: session, state: .diarizing),
+                        folder: session.folder,
+                    )
+                } else {
+                    self.state = .finalTranscription
+                    self.statusDetail = "La versión en vivo permanece visible mientras se procesa el WAV completo."
+                    try await self.finalProcessor.configureVocabulary(file: session.technicalVocabularyURL)
+                    try self.ensureCurrentFinalJob(jobID: jobID, session: session)
+                    transcript = try await self.finalProcessor.transcribe(audioURL)
+                    try Task.checkCancellation()
+                    try self.ensureCurrentFinalJob(jobID: jobID, session: session)
+                    guard !transcript.isEmpty else { throw SessionStoreError.emptyTranscript }
+                    self.allSegments = transcript
+                    self.editedAllText = nil
+                    self.editedProfessorText = nil
+                    try self.store.saveFullTranscript(
+                        metadata: self.metadata(session: session, state: .diarizing),
+                        segments: transcript,
+                        folder: session.folder,
+                    )
+                }
+                self.finalReplacedLive = true
+                if self.professorSegments.isEmpty {
+                    self.selectedTab = .everyone
+                }
                 self.state = .diarizing
                 self.statusDetail = "FluidAudio identifica voces y genera embeddings locales."
                 let diarization = try await self.finalProcessor.diarize(audioURL)
                 try Task.checkCancellation()
+                try self.ensureCurrentFinalJob(jobID: jobID, session: session)
                 let assignment = SpeakerAssignment.assign(transcript: transcript, diarization: diarization.spans)
                 self.allSegments = assignment.segments
                 self.reviewItems = assignment.review
                 self.speakers = self.makeSpeakers(spans: diarization.spans, embeddings: diarization.embeddings)
-                self.chooseProfessorAutomatically(embeddings: diarization.embeddings)
+                self.editedProfessorText = nil
+                self.chooseProfessorAutomatically(subject: session.subject, embeddings: diarization.embeddings)
                 self.finalReplacedLive = true
                 self.state = .complete
                 self.statusDetail = "La transcripción final reemplazó a la versión provisional."
-                self.persistFinalOutputs()
+                if !self.persistFinalOutputs(session: session) {
+                    self.state = .recoverable
+                    self.statusDetail = "El texto sigue disponible, pero no se pudieron confirmar todas las salidas finales."
+                }
             } catch is CancellationError {
-                self.state = .cancelled
-                self.statusDetail = "Procesamiento cancelado; se conservaron el audio y el texto en vivo."
-                self.persistCurrentState()
+                if self.isCurrentFinalJob(jobID: jobID, session: session) {
+                    self.state = .cancelled
+                    self.statusDetail = "Procesamiento cancelado; se conservaron el audio y el texto en vivo."
+                    self.persistCurrentState(checkpoint: "processing-cancelled", session: session)
+                }
             } catch {
-                self.state = .failed
-                self.errorMessage = error.localizedDescription
-                self.statusDetail = "Falló el procesamiento final; se conservaron el audio y el texto en vivo."
-                self.persistCurrentState()
+                if self.isCurrentFinalJob(jobID: jobID, session: session) {
+                    self.state = .failed
+                    self.errorMessage = error.localizedDescription
+                    self.statusDetail = self.allSegments.isEmpty
+                        ? "Falló la transcripción final; se conserva el texto en vivo."
+                        : "La transcripción completa está guardada; falló la identificación de hablantes y puede reintentarse."
+                    self.persistCurrentState(checkpoint: "processing-failed", session: session)
+                }
             }
-            self.finalTask = nil
+            if self.finalJobID == jobID {
+                self.finalJobID = nil
+                self.finalTask = nil
+            }
+            self.refreshHistory()
         }
+    }
+
+    private func ensureCurrentFinalJob(jobID: UUID, session: ClassSessionContext) throws {
+        guard isCurrentFinalJob(jobID: jobID, session: session) else { throw CancellationError() }
+    }
+
+    private func isCurrentFinalJob(jobID: UUID, session: ClassSessionContext) -> Bool {
+        finalJobID == jobID && activeSession?.id == session.id
     }
 
     private func makeSpeakers(spans: [DiarizationSpan], embeddings: [String: [Float]]) -> [SpeakerRecord] {
@@ -402,7 +854,7 @@ final class ClassScribeModel {
                 totalSpeakingTime: values.reduce(0) { $0 + $1.end - $1.start },
                 recentFragments: fragments,
                 confidence: weightedQuality,
-                embedding: embeddings[id]
+                embedding: embeddings[id],
             )
         }.sorted { $0.totalSpeakingTime > $1.totalSpeakingTime }
     }
@@ -418,7 +870,7 @@ final class ClassScribeModel {
         return url
     }
 
-    private func chooseProfessorAutomatically(embeddings: [String: [Float]]) {
+    private func chooseProfessorAutomatically(subject: String, embeddings: [String: [Float]]) {
         professorSelectionIsAutomatic = true
         if let reference = store.loadVoiceReference(subject: subject) {
             let matches = embeddings.compactMap { id, embedding -> (String, Double)? in
@@ -435,50 +887,140 @@ final class ClassScribeModel {
     }
 
     private func saveProfessorReference(for id: String) {
-        guard let folder = classFolder,
+        guard let session = activeSession,
               let embedding = speakers.first(where: { $0.id == id })?.embedding else { return }
-        let reference = ProfessorVoiceReference(subject: subject, createdAt: Date(), sourceSpeakerID: id, embedding: embedding)
-        try? store.saveVoiceReference(reference, folder: folder)
+        let reference = ProfessorVoiceReference(
+            subject: session.subject,
+            createdAt: Date(),
+            sourceSpeakerID: id,
+            embedding: embedding,
+        )
+        try? store.saveVoiceReference(reference, folder: session.folder)
     }
 
-    private func metadata(state override: ProcessingState? = nil) -> ClassMetadata? {
-        guard let folder = classFolder, let startedAt else { return nil }
-        return ClassMetadata(
-            id: UUID(),
-            subject: subject,
-            startedAt: startedAt,
+    private func metadata(session: ClassSessionContext, state override: ProcessingState? = nil) -> ClassMetadata {
+        ClassMetadata(
+            id: session.id,
+            subject: session.subject,
+            startedAt: session.startedAt,
             duration: elapsed,
-            mode: mode,
-            source: selectedSourceName,
+            mode: session.mode,
+            source: session.source,
             professorSpeakerID: professorSpeakerID,
             professorSelectionIsAutomatic: professorSelectionIsAutomatic,
             speakerCount: speakers.count,
             state: override ?? state,
-            folderPath: folder.path,
-            technicalVocabulary: technicalVocabulary
+            folderPath: session.folder.path,
+            technicalVocabulary: session.technicalVocabulary,
         )
     }
 
-    private func persistFinalOutputs() {
-        guard let folder = classFolder, let metadata = metadata() else { return }
+    @discardableResult
+    private func persistFinalOutputs(session: ClassSessionContext? = nil) -> Bool {
+        guard let session = session ?? activeSession else { return false }
         do {
             try store.saveFinal(
-                metadata: metadata,
+                metadata: metadata(session: session),
                 all: allSegments,
                 professor: professorSegments,
                 review: reviewItems,
                 speakers: speakers,
-                folder: folder
+                folder: session.folder,
+                editedAllText: editedAllText,
+                editedProfessorText: editedProfessorText,
             )
-            history = store.history()
-        } catch { errorMessage = "No se pudo guardar una exportación: \(error.localizedDescription)" }
+            refreshHistory()
+            return true
+        } catch {
+            errorMessage = "No se pudo guardar una exportación: \(error.localizedDescription)"
+            refreshHistory()
+            return false
+        }
     }
 
-    private func persistCurrentState() {
-        guard let folder = classFolder, let metadata = metadata() else { return }
-        try? store.saveFinal(metadata: metadata, all: allSegments, professor: professorSegments, review: reviewItems, speakers: speakers, folder: folder)
-        try? store.saveLive(stable: stableLiveText, provisional: provisionalLiveText, folder: folder)
-        history = store.history()
+    private func persistCurrentState(checkpoint: String, session: ClassSessionContext? = nil) {
+        guard let session = session ?? activeSession else { return }
+        do {
+            try store.saveMetadata(metadata(session: session), folder: session.folder)
+            try checkpointLive(checkpoint, session: session)
+            if !allSegments.isEmpty {
+                try store.saveFinal(
+                    metadata: metadata(session: session),
+                    all: allSegments,
+                    professor: professorSegments,
+                    review: reviewItems,
+                    speakers: speakers,
+                    folder: session.folder,
+                    editedAllText: editedAllText,
+                    editedProfessorText: editedProfessorText,
+                )
+            }
+        } catch {
+            errorMessage = "No se pudo guardar el estado de recuperación: \(error.localizedDescription)"
+        }
+        refreshHistory()
+    }
+
+    private func checkpointLive(_ checkpoint: String, session: ClassSessionContext) throws {
+        try store.saveLive(
+            accumulator: accumulator,
+            context: LiveTranscriptContext(
+                subject: session.subject,
+                startedAt: session.startedAt,
+                mode: session.mode,
+                source: session.source,
+                duration: elapsed,
+            ),
+            folder: session.folder,
+            checkpoint: checkpoint,
+            visibleTextOverride: editedLiveText,
+        )
+    }
+
+    private func persistTextEdits() {
+        guard let session = activeSession else { return }
+        do {
+            try store.saveTextOverrides(
+                metadata: metadata(session: session),
+                allText: editedAllText,
+                professorText: editedProfessorText,
+                folder: session.folder,
+            )
+        } catch { errorMessage = "No se pudo guardar la edición: \(error.localizedDescription)" }
+    }
+
+    private func liveContext(session: ClassSessionContext) -> LiveTranscriptContext {
+        LiveTranscriptContext(
+            subject: session.subject,
+            startedAt: session.startedAt,
+            mode: session.mode,
+            source: session.source,
+            duration: elapsed,
+        )
+    }
+
+    private func refreshHistory() {
+        history = store.scanSessions()
+    }
+
+    private var currentReadableTextURL: URL? {
+        guard let folder = classFolder else { return nil }
+        if let summary = history.first(where: { $0.folder.standardizedFileURL == folder.standardizedFileURL }),
+           let url = summary.preferredTextURL {
+            return url
+        }
+        let candidates = ["professor.txt", "all-speakers.txt", "recovered-transcript.txt", "live-transcript.txt"]
+        return candidates.map { folder.appendingPathComponent($0) }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    private func syncLiveTextFromAccumulator() {
+        stableLiveText = accumulator.stableText
+        provisionalLiveText = accumulator.provisionalText
+    }
+
+    private func cancelCalibration() {
+        calibrationTask?.cancel()
     }
 }
 
@@ -486,8 +1028,14 @@ enum ExportKind: String, CaseIterable, Identifiable {
     case txt = "TXT"
     case markdown = "Markdown"
     case srt = "SRT"
-    var id: String { rawValue }
-    var extensionName: String { self == .markdown ? "md" : rawValue.lowercased() }
+    var id: String {
+        rawValue
+    }
+
+    var extensionName: String {
+        self == .markdown ? "md" : rawValue.lowercased()
+    }
+
     var contentType: UTType {
         switch self {
         case .txt: .plainText

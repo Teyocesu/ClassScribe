@@ -16,6 +16,8 @@ import XCTest
 /// the CI runner has no input device, so a bare `MicCaptureHandler()` + drop
 /// crashed the whole test process on `deinit`.
 final class MicCaptureHandlerStopTests: XCTestCase {
+    private final class Box: @unchecked Sendable { var calls = 0 }
+
     private func tempURL() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("mic-stop-\(UUID().uuidString).wav")
@@ -25,7 +27,6 @@ final class MicCaptureHandlerStopTests: XCTestCase {
         // Inject a spy for the tap removal so the guard is observable on ANY
         // host: a dev Mac HAS an input device, so the real `inputNode` access
         // would not crash here — only the spy makes the skip assertable.
-        final class Box: @unchecked Sendable { var calls = 0 }
         let box = Box()
         // Typed local (not a trailing closure) so SwiftFormat can't restyle the
         // labelled argument into a trailing closure.
@@ -48,5 +49,31 @@ final class MicCaptureHandlerStopTests: XCTestCase {
             _ = handler // keep alive to the end of the scope, then deinit → stop()
         }
         // Reaching here without crashing is the assertion.
+    }
+
+    func testStopRemovesInstalledTapExactlyOnce() {
+        let box = Box()
+        let spyRemove: (AVAudioEngine) -> Void = { _ in box.calls += 1 }
+        let handler = MicCaptureHandler(outputURL: tempURL(), removeInputTap: spyRemove)
+        handler.markTapInstalledForTesting()
+
+        handler.stop()
+        handler.stop()
+
+        XCTAssertEqual(box.calls, 1, "Repeated stop/deinit must not remove the same tap twice")
+    }
+
+    func testTwentyFiveStopCyclesRemoveEachTapExactlyOnce() {
+        let box = Box()
+        let spyRemove: (AVAudioEngine) -> Void = { _ in box.calls += 1 }
+        for _ in 0 ..< 25 {
+            autoreleasepool {
+                let handler = MicCaptureHandler(outputURL: tempURL(), removeInputTap: spyRemove)
+                handler.markTapInstalledForTesting()
+                handler.stop()
+                handler.stop()
+            }
+        }
+        XCTAssertEqual(box.calls, 25)
     }
 }

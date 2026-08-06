@@ -9,15 +9,18 @@ enum CaptureMode: String, Codable, CaseIterable, Identifiable {
 
 enum ProcessingState: String, Codable {
     case ready = "Lista"
+    case startingCapture = "Esperando audio de la fuente"
     case loadingModel = "Descargando/cargando modelos"
     case recording = "Grabando"
     case transcriptionPaused = "Grabando · transcripción pausada"
+    case stopping = "Guardando transcripción"
     case finalizingAudio = "Validando audio"
     case finalTranscription = "Retranscribiendo con máxima calidad"
     case diarizing = "Identificando hablantes"
     case complete = "Transcripción final lista"
     case cancelled = "Procesamiento cancelado"
     case failed = "Error"
+    case recoverable = "Sesión recuperable"
 }
 
 struct RunningApplication: Identifiable, Hashable {
@@ -114,8 +117,18 @@ enum Timecode {
 
 extension String {
     var filenameSlug: String {
-        folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "es"))
-            .replacingOccurrences(of: "[^A-Za-z0-9]+", with: "-", options: .regularExpression)
+        let normalized = precomposedStringWithCanonicalMapping
+            .lowercased(with: Locale(identifier: "es"))
+            .replacingOccurrences(of: "[^\\p{L}\\p{N}]+", with: "-", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        var result = ""
+        for character in normalized {
+            let candidate = result + String(character)
+            if candidate.utf8.count > 120 {
+                break
+            }
+            result = candidate
+        }
+        return result.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
     }
 }

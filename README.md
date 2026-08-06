@@ -20,7 +20,7 @@ ClassScribe adapta [Meeting Transcriber](https://github.com/pasrom/meeting-trans
 
 - Apple Silicon (probado para M1).
 - macOS 14.2 o posterior; la máquina de desarrollo usa macOS 15.3.2.
-- Xcode completo 16.x recomendado, o Command Line Tools con Swift 6.1.
+- Command Line Tools con Swift 6.1 para el flujo local. GitHub Actions usa Xcode 16.x para las comprobaciones que lo requieren; no hace falta instalar Xcode completo en la Mac de uso.
 - Aproximadamente 1–2 GB libres para build, cachés y modelos.
 - Conexión a Internet para la primera descarga de modelos; luego funciona localmente.
 
@@ -38,7 +38,7 @@ Desde el repositorio:
 ./scripts/run_app.sh
 ```
 
-El script resuelve FluidAudio 0.15.5 desde su repositorio oficial en una versión fija, compila con dos trabajos (adecuado para 8 GB), arma y firma ad hoc `app/MeetingTranscriber/.build/ClassScribe-Dev.app`, y la abre. Con Xcode completo no requiere pasos previos; con las Command Line Tools de esta Mac aplica automáticamente una compatibilidad local, sin modificar dependencias descargadas.
+El script resuelve FluidAudio 0.15.5 en una versión fija, compila con dos trabajos, arma y firma ad hoc `app/MeetingTranscriber/.build/ClassScribe-Dev.app`, cierra cualquier proceso anterior llamado ClassScribe y abre una única instancia nueva con `open -n`. La línea inferior de la ventana muestra el commit y timestamp embebidos. El bundle incluye un helper firmado para aislar la diarización.
 
 Solo compilar:
 
@@ -46,11 +46,7 @@ Solo compilar:
 ./scripts/run_app.sh --build-only
 ```
 
-Abrir en Xcode: abre `app/MeetingTranscriber/Package.swift`, elige el esquema ClassScribe y Run. Si `xcode-select` apunta a Command Line Tools después de instalar Xcode:
-
-```bash
-sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-```
+`./scripts/pre-push.sh --with-tests` repite el build Release y las pruebas disponibles con el toolchain instalado. En esta Mac, el script prepara automáticamente un mirror local ignorado para compensar el SDK incompleto de Command Line Tools.
 
 ## Modelos
 
@@ -70,11 +66,21 @@ Selecciona el micrófono. macOS pedirá permiso; si se negó antes, ve a **Ajust
 
 1. Escribe materia y, opcionalmente, vocabulario técnico separado por comas.
 2. Elige “Clase online” o “Clase presencial” y la fuente.
-3. Pulsa “Iniciar clase”. El punto rojo, temporizador y medidor confirman la grabación.
-4. La transcripción usa ventanas de 7 s con salto de 5,5 s (1,5 s de solapamiento). El texto tenue/cursivo es provisional; una pausa de voz confirma el fragmento. La interfaz muestra demora estimada.
+3. Pulsa “Iniciar clase”. En modo presencial, la app muestra “Esperando primer audio” y no activa el punto rojo ni el contador hasta que un buffer con frames haya sido escrito en el WAV.
+4. La transcripción usa ventanas de 7 s con salto de 5,5 s (1,5 s de solapamiento). Cada hipótesis anterior se confirma antes de instalar la siguiente: el contenido confirmado nunca se reemplaza ni vuelve a vacío. El texto tenue/cursivo es la única cola provisional.
 5. “Pausar transcripción” detiene inferencia, no la grabación. “Reanudar” vuelve a procesar ventanas recientes.
-6. “Detener clase” valida el WAV, retranscribe el archivo completo y ejecuta diarización final. El texto vivo permanece hasta que la versión final lo reemplaza.
-7. Al terminar, la persona con más tiempo de habla se marca como profesor automático/provisional, salvo que una referencia local de voz coincida con suficiente similitud.
+6. “Detener clase” deshabilita el botón, guarda primero el texto, drena escrituras de audio, valida el WAV y retranscribe el archivo completo. El texto sigue visible y editable mientras procesa.
+7. La transcripción completa se persiste antes de identificar voces. La diarización corre en `ClassScribeDiarizer`, un proceso CPU-only separado; si Core ML falla o aborta, la aplicación principal permanece abierta y permite reintentar.
+8. Al terminar, la persona con más tiempo de habla se marca como profesor automático/provisional, salvo que una referencia local de voz coincida con suficiente similitud.
+
+## Ver, copiar y editar
+
+- El panel derecho conserva toda la transcripción. Durante la grabación es seleccionable; después de detener se vuelve editable.
+- “Seguir texto” mantiene el scroll cerca del final. Desactívalo para revisar párrafos anteriores sin que la vista vuelva a bajar.
+- “Copiar transcripción” elige, en orden, una edición visible, la versión final del profesor, la final completa y la versión viva/recuperada. No copia vacío si existe texto útil.
+- “Copiar para ChatGPT” agrega materia, fecha, duración, modo y fuente. Solo usa el portapapeles.
+- “Abrir TXT” abre la mejor salida humana disponible; “Abrir carpeta” muestra la sesión en Finder. Ambos permanecen disponibles durante el procesamiento y después de un error.
+- Las ediciones se guardan de forma atómica. TXT y Markdown exportan la edición visible. SRT conserva la versión segmentada con tiempos y muestra una advertencia si hubo edición libre.
 
 ## Identificar y corregir al profesor
 
@@ -91,11 +97,15 @@ La app genera automáticamente:
 ```text
 ~/Library/Application Support/ClassScribe/Classes/AAAA-MM-DD_HHMMSS_Materia/
   source.wav
+  live-transcript.txt
+  live-transcript.md
   live-transcript.json
+  live-transcript-journal.jsonl
   professor.txt
   professor.md
   professor.srt
   all-speakers.txt
+  all-speakers.md
   all-speakers.json
   review.json
   speakers.json
@@ -103,7 +113,18 @@ La app genera automáticamente:
   metadata.json
 ```
 
-“Exportar” permite elegir otro destino para TXT, Markdown o SRT. “Abrir carpeta” y las entradas del historial muestran los archivos en Finder. El audio original nunca se borra automáticamente.
+`live-transcript.txt` es UTF-8, legible con TextEdit o VS Code y se actualiza después de cada resultado ASR, pausa, reanudación y stop. JSON y journal son estado interno de recuperación; el usuario no necesita abrirlos.
+
+“Exportar” permite elegir otro destino para TXT, Markdown o SRT. Al pulsar una entrada del historial se carga su texto dentro de ClassScribe; el botón de carpeta sigue abriendo Finder. El audio original nunca se borra automáticamente.
+
+## Recuperar o reintentar una sesión
+
+Al arrancar, ClassScribe escanea las carpetas aunque falte `metadata.json`. Reconoce WAV + TXT, estados interrumpidos y snapshots JSON antiguos. Una sesión incompleta aparece como **Sesión recuperable**:
+
+1. Pulsa la sesión en el historial para cargar el mejor texto disponible.
+2. Usa Copiar, Abrir TXT o Abrir carpeta aunque el procesamiento haya fallado.
+3. Pulsa “Reintentar procesamiento”. Si `source.wav` es válido se reutiliza sin modificarlo; si el cierre dejó solamente un `source.raw` Float32 válido, ClassScribe reconstruye el WAV conservando el RAW y cualquier WAV inválido previo como evidencia. Si ya existe transcripción final completa, se reintenta solamente la identificación de voces.
+4. Si solo existe JSON legacy, la app crea TXT/Markdown sin modificar ese JSON. Si el WAV es inválido, conserva el texto y deshabilita únicamente el reprocesamiento.
 
 ## Pruebas
 
@@ -118,11 +139,11 @@ Con las Command Line Tools incompletas de esta Mac, usa temporalmente:
 
 ```bash
 export SWIFTPM_CUSTOM_LIBS_DIR="$(./scripts/prepare_local_toolchain.sh)"
-swift test --package-path app/MeetingTranscriber -j 2 \
+swift test --package-path .toolchain/ClassScribePackage -j 2 \
   -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift"
 ```
 
-Las pruebas puras cubren deduplicación de ventanas, confirmación tras pausa, filtro reversible al cambiar profesor, revisión de superposición, TXT/Markdown/SRT, WAV legible y similitud coseno. Las pruebas físicas de micrófono y audio de aplicación requieren permisos TCC e interacción con una fuente audible; no se simulan como éxitos en CI.
+Las pruebas cubren acumulación monotónica (incluidas 100 ventanas), journal/TXT, recuperación legacy y desde RAW sin borrar evidencia, archivos WAV válidos e inválidos, reintento único ligado a la sesión, copia/exportación según la pestaña visible, ediciones, fallos de ASR y diarización, aislamiento ante `SIGABRT`, cancelación del helper, cambio de profesor y conservación de todos los hablantes. Las pruebas físicas de micrófono y audio de aplicación requieren permisos TCC e interacción con una fuente audible; no se simulan como éxitos en CI.
 
 Fixtures y pruebas locales de modelos:
 
@@ -161,17 +182,25 @@ CLASSSCRIBE_RUN_MIC_CAPTURE_TEST=1 swift test \
   --filter microphoneCaptureFixture
 ```
 
-Resultados observados el 6 de agosto de 2026: Parakeet aprobó el fixture español (la primera preparación completa tardó 388 s) y FluidAudio separó dos voces en el fixture representativo de 49,5 s. La prueba CATap quedó esperando autorización TCC y la de micrófono confirmó permiso denegado; por ello esas dos rutas físicas no se declaran aprobadas en esta máquina todavía.
+Resultados automatizados observados el 6 de agosto de 2026: Parakeet aprobó el fixture español; el helper aislado separó al menos dos voces tanto en el fixture representativo como en una copia privada de la sesión recuperada; y el proceso padre sobrevivió una terminación simulada por `SIGABRT`. Micrófono, Chrome y relanzamiento solo se declaran aprobados después de completar las pruebas físicas sobre el commit final.
 
 ## Limitaciones conocidas del MVP
 
 - La diarización y las tarjetas de varios hablantes se actualizan al detener la clase; durante la grabación se conserva y muestra el texto vivo, pero no se promete diarización verdaderamente streaming.
 - La separación de voces, superposiciones y reconocimiento son de mejor esfuerzo. Los casos inseguros se conservan en Revisar.
 - La primera carga de modelos puede tardar varios minutos y consumir memoria significativa en una Mac de 8 GB.
-- Editar el texto visible no cambia el audio ni el JSON estructurado; la exportación TXT manual respeta la edición del profesor, mientras SRT conserva tiempos/segmentos finales.
-- En esta máquina no hay Xcode completo y `xcodebuild` no puede ejecutarse. El build por SwiftPM usa el SDK 15.5 de Command Line Tools; instala/selecciona Xcode para verificar el flujo de Xcode.
+- Editar texto no cambia el audio ni los segmentos JSON. TXT/Markdown sí reflejan la edición; SRT conserva tiempos/segmentos finales y lo advierte.
+- En esta máquina no hay Xcode completo. SwiftPM valida localmente y GitHub Actions ejecuta XCTest y builds Xcode Debug/Release.
 - La suite XCTest heredada de `tools/audiotap` tampoco está disponible con estos Command Line Tools (`no such module XCTest`), aunque la biblioteca sí compila y enlaza dentro del target ClassScribe.
-- La ejecución actual de Codex no pudo operar los diálogos de privacidad de macOS: la prueba automática de audio de aplicación quedó esperando TCC y el host de pruebas de micrófono no estaba autorizado. Abre ClassScribe, inicia una grabación de cada modo y concede los permisos antes de una clase real.
+- Las pruebas físicas dependen de permisos macOS y de una fuente audible. Concédelos únicamente a ClassScribe cuando el sistema los solicite.
+
+## Solución de problemas
+
+- **El medidor no se mueve:** verifica la fuente seleccionada y el permiso de Micrófono o Audio del sistema. Detén; el texto ya guardado y cualquier audio parcial se conservan.
+- **La transcripción tarda:** la primera carga de modelos puede demorar varios minutos. El WAV continúa grabándose.
+- **Falló “Identificando hablantes”:** la transcripción completa ya fue guardada. Usa Copiar/Abrir TXT y luego Reintentar procesamiento.
+- **Una sesión figura recuperable:** ábrela; el banner explica si puede reprocesarse o si solo puede recuperarse el texto.
+- **Duda sobre el binario abierto:** compara la línea `Build …` de la ventana con `git rev-parse HEAD`. `scripts/run_app.sh` imprime además PID y ruta exacta.
 
 ## GitHub
 

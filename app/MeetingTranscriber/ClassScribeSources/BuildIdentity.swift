@@ -10,7 +10,8 @@ enum BuildIdentity {
 
     static let commit: String = Bundle.main.object(forInfoDictionaryKey: commitKey) as? String ?? "unknown"
     static let timestamp: String = Bundle.main.object(forInfoDictionaryKey: timestampKey) as? String ?? "unknown"
-    static let executablePath = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
+    static let executablePath = (Bundle.main.executableURL
+        ?? URL(fileURLWithPath: CommandLine.arguments[0])).standardizedFileURL.path
     static let bundlePath = Bundle.main.bundleURL.standardizedFileURL.path
 
     static var displayLabel: String {

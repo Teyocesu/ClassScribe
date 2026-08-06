@@ -12,11 +12,11 @@ private let logger = Logger(subsystem: "com.meetingtranscriber.audiotap", catego
 /// when still available or falling back to system default with a warning.
 ///
 /// Public API (`start`/`stop`/`currentLevelDBFS`) is called from the main actor.
-/// The `installTap` render-thread callback writes to per-buffer state guarded by
-/// `LevelPublisher` (lock-protected) and to `outputFile` which is only mutated
-/// between `engine.stop()` and `engine.start()` on the main thread, so concurrent
-/// IO with the render thread is impossible by lifecycle. `@unchecked Sendable`
-/// reflects that this discipline isn't expressible to the compiler.
+/// The render-thread callback acquires an `InFlightCallbackGate` lease before
+/// reading the converter or writing `outputFile`. Stop/restart closes that gate
+/// and drains existing leases before mutating those resources. Public lifecycle
+/// calls remain main-actor-owned; `@unchecked Sendable` reflects that this
+/// callback discipline is not expressible to the compiler.
 public class MicCaptureHandler: @unchecked Sendable {
     private var engine = AVAudioEngine()
     /// `internal` (not `private`) so the cross-file `+Timeline` extension can
@@ -55,6 +55,8 @@ public class MicCaptureHandler: @unchecked Sendable {
     private var selectedDeviceUID: String?
     private var fileSampleRate: Double = 0
     private var converter: AVAudioConverter?
+    private let callbackGate = InFlightCallbackGate()
+    private var hasStopped = false
     /// Pre-computed resampling ratio (fileSampleRate / tapSampleRate), avoids division in audio callback.
     private var resampleRatio: Double = 1.0
     /// Wall-clock anchoring so a device-restart gap becomes silence in the WAV
@@ -124,12 +126,15 @@ public class MicCaptureHandler: @unchecked Sendable {
     }
 
     public func start(deviceUID: String? = nil) throws {
+        hasStopped = false
         selectedDeviceUID = deviceUID
         firstFrameTime = 0
         terminalError = nil
         automaticRestartCount = 0
         firstBufferGate.reset()
-        MicCaptureDiagnostics.record("start requestedUID=\(deviceUID ?? "default") output=\(outputURL.lastPathComponent)")
+        MicCaptureDiagnostics.record(
+            "start begin handler=\(ObjectIdentifier(self)) requestedUID=\(deviceUID ?? "default") output=\(outputURL.path)",
+        )
         try startEngine(deviceUID: deviceUID)
         installDeviceChangeListener()
         installConfigChangeObserver()
@@ -140,18 +145,20 @@ public class MicCaptureHandler: @unchecked Sendable {
     public func waitForFirstBuffer(timeout: TimeInterval = 2.5) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if firstBufferGate.hasWrittenFrames { return }
+            if firstBufferGate.hasWrittenFrames {
+                return
+            }
             try await Task.sleep(for: .milliseconds(50))
         }
         let snapshot = firstBufferGate.snapshot
         let error = MicCaptureError.firstBufferTimeout(
             timeout: timeout,
             callbacks: snapshot.callbacks,
-            frames: snapshot.frames
+            frames: snapshot.frames,
         )
         MicCaptureDiagnostics.record("first-buffer timeout callbacks=\(snapshot.callbacks) frames=\(snapshot.frames)")
-        stop()
         terminalError = error
+        stop()
         throw error
     }
 
@@ -213,7 +220,7 @@ public class MicCaptureHandler: @unchecked Sendable {
         logger.info("Mic hardware format: \(hwFormat.sampleRate) Hz, \(hwFormat.channelCount)ch")
         MicCaptureDiagnostics.record("hardware format rate=\(hwFormat.sampleRate) channels=\(hwFormat.channelCount)")
         MicCaptureDiagnostics.record(
-            "system default input name=\(getDefaultInputDeviceName() ?? "unknown") uid=\(getDefaultInputDeviceUID() ?? "unknown")"
+            "system default input name=\(getDefaultInputDeviceName() ?? "unknown") uid=\(getDefaultInputDeviceUID() ?? "unknown")",
         )
 
         let tapFormat = try validatedTapFormat(for: hwFormat)
@@ -277,7 +284,8 @@ public class MicCaptureHandler: @unchecked Sendable {
         let tapBlock: AVAudioNodeTapBlock = {
             [weak self] buffer, when in
             // swiftlint:enable closure_parameter_position closure_body_length
-            guard let self, self.isRecording else { return }
+            guard let self, self.callbackGate.enter() else { return }
+            defer { self.callbackGate.leave() }
             if self.firstFrameTime == 0 {
                 self.firstFrameTime = mach_absolute_time()
             }
@@ -330,6 +338,7 @@ public class MicCaptureHandler: @unchecked Sendable {
         ignoreConfigurationChangesUntil = Date().addingTimeInterval(1.0)
         MicCaptureDiagnostics.record("engine prepare")
         engine.prepare()
+        callbackGate.open()
         try engine.start()
         isRecording = true
         restartRetryCount = 0
@@ -421,6 +430,7 @@ public class MicCaptureHandler: @unchecked Sendable {
             logger.warning("Mic: selected device '\(uid)' no longer available, falling back to system default")
         }
 
+        callbackGate.closeAndWait()
         if tapInstalled {
             removeInputTap(engine)
             tapInstalled = false
@@ -455,6 +465,7 @@ public class MicCaptureHandler: @unchecked Sendable {
             installConfigChangeObserver()
             logger.info("Mic: engine restarted on \(deviceUID != nil ? "selected" : "default") device (\(Int(hwRate)) Hz)")
         } catch {
+            callbackGate.closeAndWait()
             // A transient invalid format / installTap raise (issue #379) is
             // recoverable: the device usually settles within a few hundred ms.
             // Keep recording and retry with backoff instead of killing it.
@@ -495,9 +506,17 @@ public class MicCaptureHandler: @unchecked Sendable {
     }
 
     public func stop() {
-        // Set isRecording=false first so any in-flight tap closure short-circuits
-        // before touching the soon-released AVAudioFile.
+        guard !hasStopped else {
+            MicCaptureDiagnostics.record("stop duplicate ignored handler=\(ObjectIdentifier(self))")
+            return
+        }
+        hasStopped = true
+        MicCaptureDiagnostics.record("stop begin handler=\(ObjectIdentifier(self)) output=\(outputURL.path)")
+
+        // Reject new callback work and wait for already-entered writes before
+        // touching the tap, engine, converter or AVAudioFile.
         isRecording = false
+        retryScheduled = false
         if let listener = deviceChangeListener {
             AudioObjectRemovePropertyListenerBlock(
                 AudioObjectID(kAudioObjectSystemObject),
@@ -511,16 +530,26 @@ public class MicCaptureHandler: @unchecked Sendable {
             NotificationCenter.default.removeObserver(observer)
             configChangeObserver = nil
         }
+        callbackGate.closeAndWait()
         // Skip the inputNode teardown when no tap was installed — the getter
         // raises an uncatchable NSException on an input-less host (deinit path).
         if tapInstalled {
             removeInputTap(engine)
+            tapInstalled = false
         }
         engine.stop()
         engine.reset()
         outputFile = nil
+        converter = nil
+        if let handle = try? FileHandle(forWritingTo: outputURL) {
+            try? handle.synchronize()
+            try? handle.close()
+        }
+        let actualSize = (try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let metrics = firstBufferGate.snapshot
-        MicCaptureDiagnostics.record("stop callbacks=\(metrics.callbacks) frames=\(metrics.frames) bytes=\(metrics.frames * 2) restarts=\(automaticRestartCount) error=\(terminalError?.localizedDescription ?? "none")")
+        MicCaptureDiagnostics.record(
+            "stop complete handler=\(ObjectIdentifier(self)) callbacks=\(metrics.callbacks) frames=\(metrics.frames) bytes=\(metrics.frames * 2) fileSize=\(actualSize) restarts=\(automaticRestartCount) error=\(terminalError?.localizedDescription ?? "none")",
+        )
 
         // Mirror the retain-grace from executeRestart: if the caller drops
         // MicCaptureHandler immediately after stop() returns, the engine
@@ -596,8 +625,16 @@ extension MicCaptureHandler {
     func markWrittenBuffer(frames: Int) {
         if firstBufferGate.recordWrittenFrames(frames) {
             firstFrameTime = mach_absolute_time()
-            MicCaptureDiagnostics.record("first buffer written frames=\(frames)")
+            let actualSize = (try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let fileID = outputFile.map { String(describing: ObjectIdentifier($0)) } ?? "none"
+            MicCaptureDiagnostics.record(
+                "first buffer written handler=\(ObjectIdentifier(self)) file=\(fileID) output=\(outputURL.path) frames=\(frames) fileSize=\(actualSize)",
+            )
         }
+    }
+
+    func markTapInstalledForTesting() {
+        tapInstalled = true
     }
 }
 
@@ -638,7 +675,6 @@ public enum MicCaptureError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .noInputDevice: "No microphone hardware available"
-
         case let .invalidHardwareFormat(sampleRate, channelCount):
             "Microphone reported an invalid format (\(sampleRate) Hz, \(channelCount) ch)"
         case let .firstBufferTimeout(timeout, callbacks, frames):

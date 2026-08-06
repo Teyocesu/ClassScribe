@@ -33,7 +33,7 @@ func applicationCaptureFixture() async throws {
     )
     _ = try await controller.start(mode: .online, application: source, microphone: nil, folder: folder)
     try await Task.sleep(for: .seconds(6))
-    let result = try controller.stop()
+    let result = try await controller.stop()
     #expect(result.duration > 4)
     #expect(try rms(of: result.url) > 0.002)
     #expect(player.processIdentifier != ProcessInfo.processInfo.processIdentifier)
@@ -72,7 +72,7 @@ func microphoneCaptureFixture() async throws {
     )
     try await Task.sleep(for: .seconds(60))
     let level = controller.levelDBFS
-    let result = try controller.stop()
+    let result = try await controller.stop()
     #expect(result.duration >= 55)
     #expect(level > -120)
     #expect(try rms(of: result.url) > 0.0001)
