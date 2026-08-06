@@ -23,8 +23,9 @@ final class MicRestartRetryPolicyTests: XCTestCase {
 
     func testBackoffIsCapped() {
         // A late (but still in-budget) attempt must not exceed the cap.
-        guard case let .retry(delay) = MicRestartRetryPolicy.decide(attemptsSoFar: 4) else {
-            XCTFail("expected a retry at attempt 4")
+        let finalRetryAttempt = MicRestartRetryPolicy.maxAttempts - 1
+        guard case let .retry(delay) = MicRestartRetryPolicy.decide(attemptsSoFar: finalRetryAttempt) else {
+            XCTFail("expected a retry at the final in-budget attempt")
             return
         }
         XCTAssertLessThanOrEqual(delay, MicRestartRetryPolicy.maxBackoff)
