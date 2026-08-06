@@ -108,10 +108,11 @@ enum WavFile {
     }
 
     static func validate(_ url: URL) throws -> TimeInterval {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard size > 0 else { throw CaptureError.emptyAudioFile }
         let file = try AVAudioFile(forReading: url)
-        guard file.fileFormat.sampleRate > 0, file.length > 0 else {
-            throw CaptureError.emptyAudio
-        }
+        guard file.fileFormat.sampleRate > 0 else { throw CaptureError.emptyAudio }
+        guard file.length > 0 else { throw CaptureError.wavHeaderOnly }
         return Double(file.length) / file.fileFormat.sampleRate
     }
 }
@@ -133,6 +134,8 @@ enum CaptureError: LocalizedError {
     case permissionDenied
     case noProcesses
     case emptyAudio
+    case wavHeaderOnly
+    case emptyAudioFile
     case notRecording
 
     var errorDescription: String? {
@@ -141,6 +144,8 @@ enum CaptureError: LocalizedError {
         case .permissionDenied: "El permiso de micrófono fue denegado. Actívalo en Privacidad y seguridad."
         case .noProcesses: "La aplicación elegida ya no está en ejecución."
         case .emptyAudio: "El archivo de audio está vacío. El original se conservó para diagnóstico."
+        case .wavHeaderOnly: "El WAV solo contiene cabecera; el micrófono no entregó frames. El archivo se conservó para diagnóstico."
+        case .emptyAudioFile: "El archivo de audio no llegó a crearse con datos. Se conservó la sesión para diagnóstico."
         case .notRecording: "No hay una clase en grabación."
         }
     }
@@ -153,6 +158,7 @@ final class CaptureController {
     private(set) var microphones: [MicrophoneOption] = []
     private(set) var levelDBFS = -120.0
     private(set) var isCapturing = false
+    private(set) var isStarting = false
 
     let liveStore = LiveAudioBufferStore()
     private var onlineSession: AudioCaptureSession?
@@ -160,6 +166,9 @@ final class CaptureController {
     private var levelTimer: Timer?
     private var rawOnlineURL: URL?
     private var sourceWAVURL: URL?
+    private var terminalCaptureFailure: String?
+
+    var isBusy: Bool { isCapturing || isStarting }
 
     func refreshSources() {
         let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -192,7 +201,10 @@ final class CaptureController {
         microphone: MicrophoneOption?,
         folder: URL
     ) async throws -> URL {
-        guard !isCapturing else { throw CaptureError.notRecording }
+        guard !isBusy else { throw CaptureError.notRecording }
+        isStarting = true
+        defer { isStarting = false }
+        terminalCaptureFailure = nil
         await liveStore.reset()
         let sourceURL = folder.appendingPathComponent("source.wav")
         let sink: LiveAudioSink = { [liveStore] buffer in
@@ -220,11 +232,21 @@ final class CaptureController {
             onlineSession = session
 
         case .inPerson:
+            let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
+            MicCaptureDiagnostics.record(
+                "authorization=\(authorization.rawValue) bundle=\(Bundle.main.bundleIdentifier ?? "unknown") requested=\(microphone?.id ?? "none")"
+            )
             guard await requestMicrophonePermission() else { throw CaptureError.permissionDenied }
             guard let microphone else { throw CaptureError.sourceMissing }
-            let capture = MicCaptureHandler(outputURL: sourceURL, liveSink: sink)
+            let capture = MicCaptureHandler(outputURL: sourceURL, debugLogging: true, liveSink: sink)
             try capture.start(deviceUID: microphone.id)
             microphoneCapture = capture
+            do {
+                try await capture.waitForFirstBuffer()
+            } catch {
+                microphoneCapture = nil
+                throw error
+            }
         }
 
         sourceWAVURL = sourceURL
@@ -257,6 +279,11 @@ final class CaptureController {
         _ = try? stop()
     }
 
+    func takeTerminalFailure() -> String? {
+        defer { terminalCaptureFailure = nil }
+        return terminalCaptureFailure
+    }
+
     private func startLevelTimer() {
         levelTimer?.invalidate()
         levelTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
@@ -265,10 +292,26 @@ final class CaptureController {
                 if let onlineSession = self.onlineSession {
                     self.levelDBFS = onlineSession.appLevelDBFS
                 } else if let microphoneCapture = self.microphoneCapture {
+                    if let error = microphoneCapture.terminalError {
+                        self.terminateMicrophoneCapture(error)
+                        return
+                    }
                     self.levelDBFS = microphoneCapture.currentLevelDBFS
                 }
             }
         }
+    }
+
+    private func terminateMicrophoneCapture(_ error: MicCaptureError) {
+        guard isCapturing else { return }
+        microphoneCapture?.stop()
+        microphoneCapture = nil
+        isCapturing = false
+        levelTimer?.invalidate()
+        levelTimer = nil
+        levelDBFS = -120
+        terminalCaptureFailure = error.localizedDescription
+        MicCaptureDiagnostics.record("CaptureController stopped after terminal microphone error")
     }
 
     private func requestMicrophonePermission() async -> Bool {

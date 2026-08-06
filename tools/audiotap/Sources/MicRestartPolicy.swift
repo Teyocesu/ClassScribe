@@ -6,6 +6,11 @@ public enum MicRestartAction: Equatable {
     case skip
 }
 
+public enum MicRestartTrigger: Equatable {
+    case defaultInputChanged
+    case engineConfigurationChanged
+}
+
 /// Pure decision logic for mic engine restarts.
 /// Separated from MicCaptureHandler to enable unit testing without hardware.
 public enum MicRestartPolicy {
@@ -22,11 +27,16 @@ public enum MicRestartPolicy {
         isRestarting: Bool,
         selectedDeviceUID: String?,
         isSelectedDeviceAvailable: Bool,
+        trigger: MicRestartTrigger = .engineConfigurationChanged,
     ) -> MicRestartAction {
         guard isRecording else { return .skip }
         guard !isRestarting else { return .skip }
 
         if let uid = selectedDeviceUID, isSelectedDeviceAvailable {
+            // A user-selected device is independent from macOS's *default*
+            // input. Restarting it when some unrelated app changes the default
+            // causes an AVAudioEngine configuration loop on built-in mics.
+            if trigger == .defaultInputChanged { return .skip }
             return .restart(deviceUID: uid)
         }
         // No selected device, or selected device gone → use system default

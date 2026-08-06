@@ -35,4 +35,11 @@ final class TapFormatResolverTests: XCTestCase {
         ))
         XCTAssertNil(TapFormatResolver.tapFormat(forHardware: zeroRate))
     }
+
+    func testZeroChannelsRejected() throws {
+        let zeroChannels = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 0, interleaved: false,
+        ))
+        XCTAssertNil(TapFormatResolver.tapFormat(forHardware: zeroChannels))
+    }
 }

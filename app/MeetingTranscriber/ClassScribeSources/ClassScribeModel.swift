@@ -65,7 +65,7 @@ final class ClassScribeModel {
 
     var isRecording: Bool { capture.isCapturing }
     var canStart: Bool {
-        !isRecording && !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !capture.isBusy && !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && (mode == .online ? selectedApplication != nil : selectedMicrophone != nil)
     }
     var selectedApplication: RunningApplication? {
@@ -293,9 +293,24 @@ final class ClassScribeModel {
         elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, let startedAt = self.startedAt else { return }
+                if let failure = self.capture.takeTerminalFailure() {
+                    self.failActiveCapture(failure)
+                    return
+                }
                 self.elapsed = Date().timeIntervalSince(startedAt)
             }
         }
+    }
+
+    private func failActiveCapture(_ message: String) {
+        elapsedTimer?.invalidate()
+        elapsedTimer = nil
+        liveTask?.cancel()
+        liveTask = nil
+        state = .failed
+        errorMessage = message
+        statusDetail = "La captura se detuvo: \(message)"
+        persistCurrentState()
     }
 
     private func startLiveTranscription() {

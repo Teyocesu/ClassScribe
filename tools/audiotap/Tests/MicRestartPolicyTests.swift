@@ -58,6 +58,28 @@ final class MicRestartPolicyTests: XCTestCase {
         XCTAssertEqual(action, .restart(deviceUID: "com.apple.airpods"))
     }
 
+    func testSkipsDefaultInputChangeWhenSelectedDeviceIsStillAvailable() {
+        let action = MicRestartPolicy.decideRestart(
+            isRecording: true,
+            isRestarting: false,
+            selectedDeviceUID: "BuiltInMicrophoneDevice",
+            isSelectedDeviceAvailable: true,
+            trigger: .defaultInputChanged,
+        )
+        XCTAssertEqual(action, .skip)
+    }
+
+    func testRestartsSelectedDeviceForRealEngineConfigurationChange() {
+        let action = MicRestartPolicy.decideRestart(
+            isRecording: true,
+            isRestarting: false,
+            selectedDeviceUID: "BuiltInMicrophoneDevice",
+            isSelectedDeviceAvailable: true,
+            trigger: .engineConfigurationChanged,
+        )
+        XCTAssertEqual(action, .restart(deviceUID: "BuiltInMicrophoneDevice"))
+    }
+
     // MARK: - Device Fallback
 
     func testFallsBackToDefaultWhenSelectedDeviceGone() {

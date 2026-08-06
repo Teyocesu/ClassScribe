@@ -15,7 +15,7 @@ public enum MicRestartRetryAction: Equatable {
 /// give-up boundary are unit-testable without hardware.
 public enum MicRestartRetryPolicy {
     /// Maximum number of retries before giving up.
-    public static let maxAttempts = 5
+    public static let maxAttempts = 3
 
     /// First-retry backoff; doubles each subsequent attempt up to `maxBackoff`.
     static let baseBackoff = 0.3

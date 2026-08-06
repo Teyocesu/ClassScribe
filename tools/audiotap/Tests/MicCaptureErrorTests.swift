@@ -7,4 +7,15 @@ final class MicCaptureErrorTests: XCTestCase {
         let error = MicCaptureError.noInputDevice
         XCTAssertEqual(error.errorDescription, "No microphone hardware available")
     }
+
+    func testFirstBufferTimeoutIsActionable() {
+        let error = MicCaptureError.firstBufferTimeout(timeout: 2.5, callbacks: 0, frames: 0)
+        XCTAssertTrue(error.localizedDescription.contains("no entregó audio"))
+        XCTAssertTrue(error.localizedDescription.contains("2.5"))
+    }
+
+    func testRestartLimitIsActionable() {
+        let error = MicCaptureError.restartLimitExceeded(maximum: 3)
+        XCTAssertTrue(error.localizedDescription.contains("3 veces"))
+    }
 }
