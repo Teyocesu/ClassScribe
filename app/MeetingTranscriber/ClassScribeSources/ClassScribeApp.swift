@@ -4,6 +4,10 @@ import SwiftUI
 struct ClassScribeApp: App {
     @State private var model = ClassScribeModel()
 
+    init() {
+        BuildIdentity.recordLaunch()
+    }
+
     var body: some Scene {
         WindowGroup("ClassScribe") {
             ContentView(model: model)

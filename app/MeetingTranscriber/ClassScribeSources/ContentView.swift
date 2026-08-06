@@ -38,6 +38,12 @@ struct ContentView: View {
                 Text("ClassScribe").font(.title2.bold())
                 Text("Transcripción local de clases · sin nube")
                     .font(.caption).foregroundStyle(.secondary)
+                Text(BuildIdentity.provenanceLabel)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(BuildIdentity.provenanceLabel)
             }
             Spacer()
             Picker("Modo", selection: $model.mode) {
