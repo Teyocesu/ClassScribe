@@ -1,5 +1,6 @@
 @testable import AudioTapLib
 import Darwin
+import Dispatch
 import Foundation
 import XCTest
 
@@ -16,11 +17,11 @@ final class InFlightCallbackGateTests: XCTestCase {
         XCTAssertTrue(gate.enter())
 
         let closeStarted = expectation(description: "close started")
-        let closeFinished = expectation(description: "close finished")
+        let closeFinished = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
             closeStarted.fulfill()
             gate.closeAndWait()
-            closeFinished.fulfill()
+            closeFinished.signal()
         }
         wait(for: [closeStarted], timeout: 1)
         for _ in 0 ..< 1000 where gate.snapshot.accepting {
@@ -29,9 +30,9 @@ final class InFlightCallbackGateTests: XCTestCase {
 
         XCTAssertFalse(gate.snapshot.accepting)
         XCTAssertFalse(gate.enter())
-        XCTAssertEqual(XCTWaiter.wait(for: [closeFinished], timeout: 0.05), .timedOut)
+        XCTAssertEqual(closeFinished.wait(timeout: .now() + 0.05), .timedOut)
         gate.leave()
-        wait(for: [closeFinished], timeout: 1)
+        XCTAssertEqual(closeFinished.wait(timeout: .now() + 1), .success)
         XCTAssertEqual(gate.snapshot.inFlight, 0)
     }
 
