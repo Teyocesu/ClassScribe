@@ -115,6 +115,14 @@ private struct LiveTranscriptJournalEntry: Codable {
     var snapshot: LiveTranscriptSnapshot
 }
 
+/// Records the presence of a human-owned live edit independently from its
+/// contents. An empty string is meaningful: the person deliberately cleared
+/// the editor and the automatic transcript must not silently replace it.
+private struct LiveTranscriptEditOverride: Codable {
+    var version = 1
+    var text: String
+}
+
 struct SessionStore {
     let root: URL
     private let encoder: JSONEncoder
@@ -169,8 +177,12 @@ struct SessionStore {
         )
         try writeJSON(snapshot, to: folder.appendingPathComponent("live-transcript.json"))
         let readableText = visibleTextOverride ?? snapshot.accumulator.visibleText
-        try writeText(liveText(readableText, context: context), to: folder.appendingPathComponent("live-transcript.txt"))
-        try writeText(liveMarkdown(readableText, context: context), to: folder.appendingPathComponent("live-transcript.md"))
+        try saveReadableLiveText(
+            text: readableText,
+            context: context,
+            folder: folder,
+            recordsEditOverride: visibleTextOverride != nil,
+        )
     }
 
     func loadLive(folder: URL) -> LiveTranscriptAccumulator? {
@@ -236,7 +248,18 @@ struct SessionStore {
         )
     }
 
-    func saveReadableLiveText(text: String, context: LiveTranscriptContext, folder: URL) throws {
+    func saveReadableLiveText(
+        text: String,
+        context: LiveTranscriptContext,
+        folder: URL,
+        recordsEditOverride: Bool = false,
+    ) throws {
+        if recordsEditOverride {
+            try writeJSON(
+                LiveTranscriptEditOverride(text: text),
+                to: folder.appendingPathComponent("live-transcript-edit.json"),
+            )
+        }
         try writeText(liveText(text, context: context), to: folder.appendingPathComponent("live-transcript.txt"))
         try writeText(liveMarkdown(text, context: context), to: folder.appendingPathComponent("live-transcript.md"))
     }
@@ -325,6 +348,10 @@ struct SessionStore {
         let professorReadable = readNonemptyText(folder.appendingPathComponent("professor.txt"))
         let preferred = preferredText(in: folder, accumulator: accumulator)
         let liveBody = readLiveTranscript(folder.appendingPathComponent("live-transcript.txt"))
+        let explicitLiveEdit: LiveTranscriptEditOverride? = decodeFile(
+            "live-transcript-edit.json",
+            in: folder,
+        )
 
         return RestoredSession(
             summary: summary,
@@ -335,7 +362,8 @@ struct SessionStore {
             review: review,
             preferredText: preferred.text,
             preferredTextSource: preferred.source,
-            editedLiveText: liveBody.flatMap { $0 == accumulator.visibleText ? nil : $0 },
+            editedLiveText: explicitLiveEdit?.text
+                ?? liveBody.flatMap { $0 == accumulator.visibleText ? nil : $0 },
             editedAllText: allReadable.flatMap { $0 == allBase ? nil : $0 },
             editedProfessorText: professorReadable.flatMap { $0 == professorBase ? nil : $0 },
         )
@@ -362,7 +390,8 @@ struct SessionStore {
         let hasLegacyText = !(accumulator?.visibleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         let knownNames = [
             "live-transcript.txt", "live-transcript.json", "live-transcript-journal.jsonl",
-            "recovered-transcript.txt", "all-speakers.txt", "all-speakers.json", "professor.txt", "source.raw",
+            "live-transcript-edit.json", "recovered-transcript.txt", "all-speakers.txt",
+            "all-speakers.json", "professor.txt", "source.raw",
         ]
         let hasKnownContent = hasAudio || metadataData != nil || knownNames.contains {
             fileManager.fileExists(atPath: folder.appendingPathComponent($0).path)

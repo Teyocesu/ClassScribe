@@ -137,6 +137,7 @@ func selectedTabControlsCopyAndExportSource() throws {
         TranscriptSegment(start: 1, end: 2, text: "pregunta", speakerID: "Persona 2", confidence: 0.9),
     ]
     model.professorSpeakerID = "Persona 1"
+    #expect(!model.availableTranscriptTabs.contains(.liveEdit))
 
     model.selectedTab = .everyone
     #expect(model.bestAvailableText.contains("pregunta"))
@@ -155,5 +156,12 @@ func selectedTabControlsCopyAndExportSource() throws {
 
     model.selectedTab = .review
     #expect(model.bestAvailableText == "texto completo corregido")
+    #expect(model.selectedExportSegments.count == 2)
+
+    model.editedLiveText = "explicación corregida durante la clase"
+    #expect(model.availableTranscriptTabs.contains(.liveEdit))
+    model.selectedTab = .liveEdit
+    #expect(model.bestAvailableText == "explicación corregida durante la clase")
+    #expect(model.selectedExportHasFreeformEdit)
     #expect(model.selectedExportSegments.count == 2)
 }
