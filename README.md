@@ -83,7 +83,7 @@ Selecciona el micrófono. macOS pedirá permiso; si se negó antes, ve a **Ajust
 2. Elige “Clase online” o “Clase presencial” y la fuente. El único botón principal explica qué dato falta hasta que la configuración sea válida.
 3. Si hace falta, despliega “Agregar vocabulario técnico (opcional)” y escribe términos separados por comas.
 4. Pulsa “Iniciar grabación”. La app no declara una captura activa hasta recibir frames reales; una fuente silenciosa es válida, pero una fuente sin callbacks produce un error recuperable y accionable.
-5. La transcripción usa ventanas de 7 s con salto de 5,5 s (1,5 s de solapamiento). El cursor solo avanza después de un resultado correcto; los fallos transitorios reintentan la misma ventana con backoff.
+5. La transcripción aparece en un editor: puedes borrar o corregir palabras mientras la grabación continúa. Las frases nuevas se agregan al final sin restaurar lo que ya corregiste. Internamente usa ventanas de 7 s con salto de 5,5 s (1,5 s de solapamiento); el cursor solo avanza después de un resultado correcto.
 6. “Pausar transcripción” detiene inferencia, no la grabación. Un resultado tardío no puede sacar la interfaz del estado pausado.
 7. “Detener grabación” guarda el texto, detiene la espera en vivo de forma acotada, finaliza el audio y retranscribe el archivo completo. El texto sigue visible mientras procesa.
 8. La transcripción completa se persiste antes de identificar voces. La diarización corre en `ClassScribeDiarizer`, un proceso CPU-only separado y con timeout; si falla, la aplicación principal permanece abierta y permite reintentar.
@@ -91,8 +91,9 @@ Selecciona el micrófono. macOS pedirá permiso; si se negó antes, ve a **Ajust
 
 ## Ver, copiar y editar
 
-- El panel derecho conserva toda la transcripción. Durante la grabación es seleccionable; después de detener se vuelve editable.
-- “Seguir texto” mantiene el scroll cerca del final. Desactívalo para revisar párrafos anteriores sin que la vista vuelva a bajar.
+- El panel derecho es editable desde que empieza la grabación. Cada corrección humana prevalece sobre el reconocimiento y se guarda mientras escribes.
+- Una pausa normal para pensar mantiene la frase en el mismo párrafo. Solo una pausa claramente larga (aproximadamente cuatro segundos) después de una oración terminada inicia otro párrafo; al finalizar, un cambio de hablante también lo separa.
+- Si corregiste durante la clase, al terminar queda disponible la pestaña **Mi edición**, seleccionada por defecto, junto con las versiones finales **Profesor** y **Todos los hablantes**.
 - “Copiar transcripción” elige, en orden, una edición visible, la versión final del profesor, la final completa y la versión viva/recuperada. No copia vacío si existe texto útil.
 - “Copiar para ChatGPT” agrega materia, fecha, duración, modo y fuente. Solo usa el portapapeles.
 - El menú de acciones de la transcripción agrupa copiar, exportar, abrir el archivo de texto y mostrar la carpeta en Finder, sin repetir botones en la barra de estado.
@@ -117,6 +118,7 @@ La app genera automáticamente:
   live-transcript.md
   live-transcript.json
   live-transcript-journal.jsonl
+  live-transcript-edit.json          # solo cuando hubo una edición en vivo
   professor.txt
   professor.md
   professor.srt
@@ -159,7 +161,7 @@ swift test --package-path .toolchain/ClassScribePackage -j 2 \
   -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift"
 ```
 
-Las pruebas cubren acumulación monotónica (incluidas 100 ventanas), ring buffer acotado, cursor y backoff en vivo, carga single-flight, inferencias serializadas, cancelación, journal/TXT, recuperación legacy y desde RAW sin borrar evidencia, archivos WAV válidos e inválidos, copia/exportación, ediciones, fallos de ASR y diarización, timeout/terminación del helper, cambio de profesor y conservación de todos los hablantes. Las pruebas físicas de micrófono y audio de aplicación requieren permisos TCC e interacción con una fuente audible; no se simulan como éxitos en CI.
+Las pruebas cubren acumulación monotónica (incluidas 100 ventanas), ring buffer acotado, cursor y backoff en vivo, carga single-flight, inferencias serializadas, cancelación, journal/TXT, recuperación legacy y desde RAW sin borrar evidencia, archivos WAV válidos e inválidos, correcciones en vivo que sobreviven a nuevas ventanas ASR, continuidad de párrafos, copia/exportación, fallos de ASR y diarización, timeout/terminación del helper, cambio de profesor y conservación de todos los hablantes. Las pruebas físicas de micrófono y audio de aplicación requieren permisos TCC e interacción con una fuente audible; no se simulan como éxitos en CI.
 
 Fixtures y pruebas locales de modelos:
 
@@ -198,7 +200,7 @@ CLASSSCRIBE_RUN_MIC_CAPTURE_TEST=1 swift test \
   --filter microphoneCaptureFixture
 ```
 
-Resultados observados el 9 de agosto de 2026: 74 pruebas aprobaron con concurrencia estricta de Swift 6, incluyendo Parakeet sobre un fixture español, diarización de dos voces y captura CATap audible de `afplay`. El fixture CATap pasó además cuatro veces durante la corrección de su registro transitorio. La prueba física de micrófono no se ejecutó porque graba 60 segundos del ambiente y requiere autorización explícita del host.
+Resultados observados el 9 de agosto de 2026: 91 pruebas aprobaron con concurrencia estricta de Swift 6; cinco fixtures físicos/de modelos quedaron omitidos en el pase integrado. En pases opt-in separados también aprobaron Parakeet sobre un fixture español, diarización de dos voces y captura CATap audible de `afplay`. El fixture CATap pasó además cuatro veces durante la corrección de su registro transitorio. La prueba física de micrófono no se ejecutó porque graba 60 segundos del ambiente y requiere autorización explícita del host.
 
 ## Limitaciones conocidas del MVP
 

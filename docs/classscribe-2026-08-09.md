@@ -11,6 +11,8 @@ Este documento consolida los cambios realizados sobre ClassScribe en la rama `co
 - Estados y errores escritos en lenguaje de usuario, sin latencia, dBFS, nombres de modelos ni detalles WAV en la vista normal.
 - Acciones de texto agrupadas en un menú: copiar, copiar con contexto, exportar, abrir texto y mostrar carpeta.
 - Historial y paneles alineados arriba, con estados vacíos legibles.
+- Editor de transcripción disponible durante la grabación, sin perder correcciones al llegar texto nuevo.
+- Pausas naturales de pensamiento conservadas dentro del mismo párrafo.
 - Icono propio de macOS e instalación verificada en `/Applications/ClassScribe.app` y Launch Services.
 
 ## Captura de audio
@@ -57,6 +59,15 @@ Este documento consolida los cambios realizados sobre ClassScribe en la rama `co
 - Al recuperarse ASR se limpia únicamente el error que pertenecía a la transcripción en vivo.
 - La transcripción completa del archivo es la fuente final y recupera cualquier tramo omitido por la vista en vivo.
 
+### Edición en vivo y continuidad
+
+- El panel de transcripción es un editor durante la captura: se puede seleccionar, borrar y escribir sin detener el audio ni ASR.
+- La rama ASR y la rama editada se mantienen separadas. Cada ventana nueva aporta solo su sufijo; nunca repone palabras borradas ni sobrescribe correcciones humanas.
+- La edición se guarda con un debounce de 300 ms y se fuerza a disco al perder foco, cambiar de sesión, pausar, detener o crear un checkpoint. Un marcador interno conserva incluso la decisión de dejar **Mi edición** vacía.
+- Después del procesamiento final, **Mi edición** conserva el texto corregido y permite compararlo con **Profesor** y **Todos los hablantes**.
+- Una pausa inferior a cuatro segundos no crea un párrafo nuevo. Una pausa de al menos cuatro segundos solo lo crea si el fragmento anterior cierra una oración; esta política evita saltos de línea durante pausas de pensamiento.
+- La salida final agrupa segmentos consecutivos de la misma voz y separa un cambio de hablante o una pausa larga. SRT conserva la segmentación temporal original.
+
 ### Procesamiento final
 
 - El vocabulario técnico es una mejora opcional: si falla, continúa la transcripción base.
@@ -72,14 +83,14 @@ Este documento consolida los cambios realizados sobre ClassScribe en la rama `co
 | Interfaz | `app/MeetingTranscriber/ClassScribeSources/ContentView.swift`, `app/MeetingTranscriber/ClassScribeTests/ContentViewPresentationTests.swift` |
 | Captura | `app/MeetingTranscriber/ClassScribeSources/AudioCapture.swift`, `app/MeetingTranscriber/ClassScribeTests/AudioValidationTests.swift` |
 | AudioTap | `tools/audiotap/Sources/AppAudioCapture.swift`, `tools/audiotap/Sources/AppAudioCapture+PIDTranslation.swift`, `tools/audiotap/Sources/MicCaptureHandler.swift`, `tools/audiotap/Sources/CaptureLifecycleGate.swift` |
-| ASR | `app/MeetingTranscriber/ClassScribeSources/Inference.swift`, `app/MeetingTranscriber/ClassScribeSources/TranscriptLogic.swift`, `app/MeetingTranscriber/ClassScribeTests/TranscriptionReliabilityTests.swift` |
+| ASR | `app/MeetingTranscriber/ClassScribeSources/Inference.swift`, `app/MeetingTranscriber/ClassScribeSources/TranscriptLogic.swift`, `app/MeetingTranscriber/ClassScribeSources/LiveTranscriptEditing.swift`, `app/MeetingTranscriber/ClassScribeTests/TranscriptionReliabilityTests.swift`, `app/MeetingTranscriber/ClassScribeTests/LiveTranscriptEditingTests.swift` |
 | Coordinación | `app/MeetingTranscriber/ClassScribeSources/ClassScribeModel.swift`, `app/MeetingTranscriber/ClassScribeTests/FinalProcessingResilienceTests.swift` |
 | Diarización | `app/MeetingTranscriber/ClassScribeSources/DiarizationProcessRunner.swift`, `app/MeetingTranscriber/ClassScribeTests/DiarizationProcessRunnerTests.swift` |
 | Icono/bundle | `app/MeetingTranscriber/ClassScribeAssets/AppIcon.png`, `app/MeetingTranscriber/ClassScribeSources/Info.plist`, `scripts/run_app.sh` |
 
 ## Validación realizada
 
-- 74 pruebas aprobadas con `-strict-concurrency=complete`.
+- 91 pruebas aprobadas con `-strict-concurrency=complete`; cinco fixtures opt-in omitidos en el pase integrado.
 - Fixture Parakeet real en español aprobado.
 - Fixture de diarización real con al menos dos voces aprobado.
 - Captura CATap real y audible de `afplay` aprobada en el pase integrado.
@@ -100,6 +111,9 @@ No se ejecutó la prueba física de micrófono de 60 segundos porque capturaría
 - `198c44e` — `fix(app): harden capture and transcription lifecycle`
 - `4dedeb6` — `refactor(app): simplify the recording workflow`
 - `4dad662` — `feat(app): add ClassScribe application icon`
+- `9c70bb8` — `docs(app): document the ClassScribe reliability release`
+- `4b2b5a6` — `test(app): remove scheduler-sensitive timing assertions`
+- `bd1a59f` — `feat(app): support live transcript corrections`
 
 ## Instalación local
 
