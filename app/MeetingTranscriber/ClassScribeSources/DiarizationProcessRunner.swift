@@ -19,6 +19,7 @@ enum DiarizationProcessError: LocalizedError, Equatable, Sendable {
     case incompatibleProtocol
     case mismatchedJob
     case workerFailure(String)
+    case timedOut
 
     var errorDescription: String? {
         switch self {
@@ -36,6 +37,8 @@ enum DiarizationProcessError: LocalizedError, Equatable, Sendable {
             "La identificación de hablantes devolvió una respuesta inválida. El audio y la transcripción siguen disponibles."
         case .workerFailure:
             "No se pudieron identificar los hablantes. La transcripción completa se conservó y puedes reintentar."
+        case .timedOut:
+            "La identificación de hablantes excedió el tiempo máximo. El audio y la transcripción se conservaron para reintentar."
         }
     }
 }
@@ -44,6 +47,7 @@ private final class ProcessBox: @unchecked Sendable {
     let process: Process
     private let lock = NSLock()
     private var cancellationRequested = false
+    private var timeoutRequested = false
 
     init(process: Process) {
         self.process = process
@@ -52,8 +56,10 @@ private final class ProcessBox: @unchecked Sendable {
     func launch() throws {
         lock.lock()
         let cancelledBeforeLaunch = cancellationRequested
+        let timedOutBeforeLaunch = timeoutRequested
         lock.unlock()
         if cancelledBeforeLaunch {
+            if timedOutBeforeLaunch { throw DiarizationProcessError.timedOut }
             throw CancellationError()
         }
 
@@ -63,22 +69,46 @@ private final class ProcessBox: @unchecked Sendable {
         let shouldTerminate = cancellationRequested && process.isRunning
         lock.unlock()
         if shouldTerminate {
-            process.terminate()
+            terminateAndEscalateIfNeeded()
         }
     }
 
     func requestCancellation() {
+        requestStop(timedOut: false)
+    }
+
+    func requestTimeout() {
+        requestStop(timedOut: true)
+    }
+
+    var didTimeOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timeoutRequested
+    }
+
+    private func requestStop(timedOut: Bool) {
         lock.lock()
         cancellationRequested = true
+        timeoutRequested = timeoutRequested || timedOut
         let shouldTerminate = process.isRunning
         lock.unlock()
         if shouldTerminate {
-            process.terminate()
-            let processID = process.processIdentifier
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [process] in
-                if process.isRunning, process.processIdentifier == processID {
-                    Darwin.kill(processID, SIGKILL)
-                }
+            terminateAndEscalateIfNeeded()
+        }
+    }
+
+    /// A stop request can arrive in the narrow gap between the pre-launch
+    /// cancellation check and `Process.run()`. Both that path and a normal
+    /// in-flight timeout need the same TERM-then-KILL escalation; otherwise a
+    /// helper that ignores SIGTERM could keep the continuation suspended.
+    private func terminateAndEscalateIfNeeded() {
+        guard process.isRunning else { return }
+        let processID = process.processIdentifier
+        process.terminate()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [process] in
+            if process.isRunning, process.processIdentifier == processID {
+                Darwin.kill(processID, SIGKILL)
             }
         }
     }
@@ -121,6 +151,7 @@ enum DiarizationSubprocess {
         executableURL: URL,
         arguments: [String],
         currentDirectoryURL: URL,
+        timeout: TimeInterval? = nil,
     ) async throws -> DiarizationProcessTermination {
         let process = Process()
         process.executableURL = executableURL
@@ -129,6 +160,17 @@ enum DiarizationSubprocess {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         let box = ProcessBox(process: process)
+        let timeoutTask: Task<Void, Never>? = timeout.map { timeout in
+            Task.detached(priority: .utility) {
+                do {
+                    try await Task.sleep(for: .seconds(max(0, timeout)))
+                    box.requestTimeout()
+                } catch {
+                    // Normal completion cancels this watchdog.
+                }
+            }
+        }
+        defer { timeoutTask?.cancel() }
 
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
@@ -151,6 +193,9 @@ enum DiarizationSubprocess {
                 }
             }
             try Task.checkCancellation()
+            if box.didTimeOut {
+                throw DiarizationProcessError.timedOut
+            }
             return termination
         } onCancel: {
             box.requestCancellation()
@@ -161,9 +206,11 @@ enum DiarizationSubprocess {
 actor DiarizationProcessRunner {
     private static let maximumResponseBytes = 10 * 1024 * 1024
     private let explicitExecutableURL: URL?
+    private let processingTimeout: TimeInterval
 
-    init(executableURL: URL? = nil) {
+    init(executableURL: URL? = nil, processingTimeout: TimeInterval = 30 * 60) {
         explicitExecutableURL = executableURL
+        self.processingTimeout = max(0, processingTimeout)
     }
 
     func run(audioURL: URL) async throws -> DiarizationWorkerResponse {
@@ -201,9 +248,12 @@ actor DiarizationProcessRunner {
                 executableURL: executableURL,
                 arguments: [requestName],
                 currentDirectoryURL: folder,
+                timeout: processingTimeout,
             )
         } catch is CancellationError {
             throw CancellationError()
+        } catch let error as DiarizationProcessError {
+            throw error
         } catch {
             throw DiarizationProcessError.launchFailed
         }

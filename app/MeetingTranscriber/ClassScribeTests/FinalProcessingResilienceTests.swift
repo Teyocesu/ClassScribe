@@ -3,17 +3,20 @@ import Foundation
 import Testing
 
 private enum FinalStubBehavior: Equatable, Sendable {
+    case vocabularyFailure
     case transcriptionFailure
     case diarizationFailure
     case success
 }
 
 private enum FinalStubError: LocalizedError, Sendable {
+    case vocabulary
     case transcription
     case diarization
 
     var errorDescription: String? {
         switch self {
+        case .vocabulary: "fallo de vocabulario simulado"
         case .transcription: "fallo ASR simulado"
         case .diarization: "fallo de diarización simulado"
         }
@@ -27,7 +30,11 @@ private actor StubFinalProcessor: FinalProcessingProviding {
         self.behavior = behavior
     }
 
-    func configureVocabulary(file _: URL?) async throws {}
+    func configureVocabulary(file _: URL?) async throws {
+        if behavior == .vocabularyFailure {
+            throw FinalStubError.vocabulary
+        }
+    }
 
     func transcribe(_: URL) async throws -> [TranscriptSegment] {
         if behavior == .transcriptionFailure {
@@ -98,6 +105,21 @@ private actor CancellableFinalProcessor: FinalProcessingProviding {
     }
 }
 
+private actor RetryPreparationGate {
+    private var continuation: CheckedContinuation<RetryAudioPreparation, Never>?
+    private(set) var started = false
+
+    func wait() async -> RetryAudioPreparation {
+        started = true
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        continuation?.resume(returning: RetryAudioPreparation(duration: 1, recoveredRaw: false))
+        continuation = nil
+    }
+}
+
 @MainActor
 @Test
 func finalTranscriptionFailurePreservesRecovery() async throws {
@@ -144,6 +166,26 @@ func diarizationFailurePreservesFullTranscript() async throws {
     #expect(try String(contentsOf: fixture.folder.appendingPathComponent("all-speakers.md"), encoding: .utf8)
         .contains("transcripción final persistida"))
     #expect(try Data(contentsOf: fixture.audio) == originalAudio)
+}
+
+@MainActor
+@Test
+func optionalVocabularyFailureDoesNotAbortFinalTranscription() async throws {
+    let fixture = try makeRecoverableProcessingFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let model = ClassScribeModel(
+        store: fixture.store,
+        finalProcessor: StubFinalProcessor(.vocabularyFailure),
+    )
+    model.openHistory(try #require(model.history.first))
+
+    await model.retryProcessing()
+    await model.waitForFinalProcessingForTesting()
+
+    #expect(model.state == .complete)
+    #expect(model.allSegments.map(\.text) == ["transcripción final persistida"])
+    #expect(model.statusDetail.contains("vocabulario técnico"))
+    #expect(model.history.first?.isRecoverable == false)
 }
 
 @MainActor
@@ -239,6 +281,42 @@ func cancellingFinalProcessingKeepsAudioAndLiveText() async throws {
     #expect(model.hasCopyableTranscript)
     #expect(try Data(contentsOf: fixture.audio) == originalAudio)
     #expect(model.history.first?.isRecoverable == true)
+}
+
+@MainActor
+@Test
+func cancellingRetryPreparationStaysBusyUntilFileWorkExits() async throws {
+    let fixture = try makeRecoverableProcessingFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let gate = RetryPreparationGate()
+    let processor = SlowCountingFinalProcessor()
+    let model = ClassScribeModel(
+        store: fixture.store,
+        finalProcessor: processor,
+        retryAudioPreparer: { _, _ in await gate.wait() },
+    )
+    model.openHistory(try #require(model.history.first))
+
+    let retry = Task { @MainActor in await model.retryProcessing() }
+    for _ in 0 ..< 200 {
+        if await gate.started { break }
+        await Task.yield()
+    }
+    #expect(await gate.started)
+    model.cancelFinalProcessing()
+
+    #expect(model.state == .cancelled)
+    #expect(model.isRetrying)
+    #expect(model.isSessionBusy)
+    await gate.release()
+    await retry.value
+
+    #expect(!model.isRetrying)
+    #expect(!model.isSessionBusy)
+    let counts = await processor.counts()
+    #expect(counts.transcription == 0)
+    #expect(counts.diarization == 0)
+    #expect(model.bestAvailableText.contains("texto vivo durable"))
 }
 
 private struct RecoverableProcessingFixture {

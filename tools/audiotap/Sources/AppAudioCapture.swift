@@ -43,9 +43,14 @@ public class AppAudioCapture: @unchecked Sendable {
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
+    /// Guards delayed route-change retries. Without a generation token, a
+    /// retry already queued on the main dispatch queue can recreate the tap
+    /// after the user has stopped the recording.
+    private let lifecycle = CaptureLifecycleGate()
     /// Gates the IOProc callback (read on `writeQueue`), set on the start/stop
-    /// path on the main thread. `isRunning = true` must follow `AudioDeviceStart`,
-    /// so it can't be reordered ahead of the callback's read — hence an atomic lock.
+    /// path on the main thread. It becomes true immediately before
+    /// `AudioDeviceStart` so a synchronously-enqueued first callback is accepted;
+    /// the atomic lock makes that ordering visible to `writeQueue`.
     private let runningLock = OSAllocatedUnfairLock(initialState: false)
     private var isRunning: Bool {
         get { runningLock.withLock { $0 } }
@@ -132,8 +137,23 @@ public class AppAudioCapture: @unchecked Sendable {
     }
 
     public func start() throws {
-        try startCapture()
-        installOutputDeviceChangeListener()
+        guard let generation = lifecycle.begin() else {
+            throw NSError(
+                domain: "audiotap", code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Audio capture is already active"],
+            )
+        }
+        do {
+            try startCapture()
+            guard lifecycle.isActive(generation) else {
+                stopCapture()
+                throw CancellationError()
+            }
+            installOutputDeviceChangeListener()
+        } catch {
+            lifecycle.end(generation)
+            throw error
+        }
     }
 
     /// Query nominal sample rate from a CoreAudio device.
@@ -353,6 +373,7 @@ public class AppAudioCapture: @unchecked Sendable {
         )
         guard aggStatus == noErr else {
             AudioHardwareDestroyProcessTap(tapID)
+            tapID = AudioObjectID(kAudioObjectUnknown)
             throw NSError(
                 domain: "audiotap", code: Int(aggStatus),
                 userInfo: [
@@ -421,7 +442,9 @@ public class AppAudioCapture: @unchecked Sendable {
 
         guard ioProcStatus == noErr, let validProcID = newProcID else {
             AudioHardwareDestroyAggregateDevice(aggregateID)
+            aggregateID = AudioObjectID(kAudioObjectUnknown)
             AudioHardwareDestroyProcessTap(tapID)
+            tapID = AudioObjectID(kAudioObjectUnknown)
             throw NSError(
                 domain: "audiotap", code: Int(ioProcStatus),
                 userInfo: [
@@ -444,10 +467,14 @@ public class AppAudioCapture: @unchecked Sendable {
             deviceID: aggregateID, tapID: tapID, requestedRate: sampleRate,
         )
 
+        // Accept callbacks before asking CoreAudio to start. AudioDeviceStart
+        // may synchronously enqueue the first IOProc block; setting this flag
+        // afterwards dropped that first buffer and could make a short capture
+        // appear to have delivered no frames at all.
+        isRunning = true
         let startStatus = AudioDeviceStart(aggregateID, procID)
         guard startStatus == noErr else {
-            AudioHardwareDestroyAggregateDevice(aggregateID)
-            AudioHardwareDestroyProcessTap(tapID)
+            stopCapture()
             throw NSError(
                 domain: "audiotap", code: Int(startStatus),
                 userInfo: [
@@ -456,8 +483,6 @@ public class AppAudioCapture: @unchecked Sendable {
                 ],
             )
         }
-
-        isRunning = true
 
         logger.info("Audio capture started (PIDs \(self.pids), rate: \(self.actualSampleRate) Hz)")
     }
@@ -493,6 +518,9 @@ public class AppAudioCapture: @unchecked Sendable {
     }
 
     public func stop() {
+        // Invalidate retries before stopping hardware. A block that is already
+        // queued will observe a stale generation and return without restarting.
+        lifecycle.cancel()
         stopCapture()
         if outputListenerInstalled, let listener = outputDeviceChangeListener {
             AudioObjectRemovePropertyListenerBlock(
@@ -531,7 +559,7 @@ extension AppAudioCapture {
     }
 
     func handleOutputDeviceChanged() {
-        guard isRunning else { return }
+        guard isRunning, let generation = lifecycle.activeGeneration else { return }
         let action = deviceChangeCoordinator.handle(.deviceChanged)
         guard action != .ignore else { return }
 
@@ -543,46 +571,59 @@ extension AppAudioCapture {
                 "[debug] Output device change → name=\(newName, privacy: .public) uid=\(newUID, privacy: .public)",
             )
         }
-        applyAction(action)
+        applyAction(action, generation: generation)
     }
 
     /// Try a startCapture() and feed the result into the coordinator, dispatching
     /// any follow-up restart/retry/give-up action it asks for.
-    private func completeRestart() {
+    private func completeRestart(generation: UInt64) {
+        guard lifecycle.isActive(generation) else { return }
         let event: OutputDeviceChangeCoordinator.Event
         do {
             try startCapture()
+            guard lifecycle.isActive(generation) else {
+                stopCapture()
+                return
+            }
             event = .startSucceeded(rate: actualSampleRate)
         } catch {
             logger.error("Failed to restart app audio capture: \(error.localizedDescription, privacy: .public)")
             event = .startFailed
         }
-        applyAction(deviceChangeCoordinator.handle(event))
+        applyAction(deviceChangeCoordinator.handle(event), generation: generation)
     }
 
-    private func applyAction(_ action: OutputDeviceChangeCoordinator.Action) {
+    private func applyAction(_ action: OutputDeviceChangeCoordinator.Action, generation: UInt64) {
+        guard lifecycle.isActive(generation) else { return }
         switch action {
         case .ignore:
             break
 
         case let .stopAndRetry(delay):
             stopCapture()
-            scheduleRetry(after: delay)
+            scheduleRetry(after: delay, generation: generation)
 
         case let .restart(delay):
-            scheduleRetry(after: delay)
+            scheduleRetry(after: delay, generation: generation)
 
         case .complete:
             logger.info("App audio: tap restarted (rate: \(self.actualSampleRate) Hz)")
 
         case .giveUp:
+            lifecycle.end(generation)
+            // A second attempt can technically start a device yet still
+            // report an unusable zero rate. Giving up must tear that device
+            // down too; otherwise callbacks/hardware survive with no active
+            // lifecycle and `stop()` becomes the only eventual cleanup.
+            stopCapture()
             logger.error("App audio: retry failed; giving up")
         }
     }
 
-    private func scheduleRetry(after delay: TimeInterval) {
+    private func scheduleRetry(after delay: TimeInterval, generation: UInt64) {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.completeRestart()
+            guard let self, self.lifecycle.isActive(generation) else { return }
+            self.completeRestart(generation: generation)
         }
     }
 }

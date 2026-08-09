@@ -95,7 +95,10 @@ swift build --package-path "$BUILD_PACKAGE_DIR" "${SWIFT_ARGS[@]}"
 APP="$PACKAGE_DIR/.build/ClassScribe-Dev.app"
 MACOS="$APP/Contents/MacOS"
 HELPERS="$APP/Contents/Helpers"
+RESOURCES="$APP/Contents/Resources"
 INFO_PLIST="$APP/Contents/Info.plist"
+ICON_SOURCE="$PACKAGE_DIR/ClassScribeAssets/AppIcon.png"
+ICONSET="$PACKAGE_DIR/.build/ClassScribe.iconset"
 BUILD_TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 # `open "$APP"` activates an already-running app with this bundle identity.
@@ -135,11 +138,35 @@ esac
 rm -rf "$APP"
 mkdir -p "$MACOS"
 mkdir -p "$HELPERS"
+mkdir -p "$RESOURCES"
 cp "$PACKAGE_DIR/ClassScribeSources/Info.plist" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ClassScribeBuildCommit string $BUILD_COMMIT" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ClassScribeBuildTimestamp string $BUILD_TIMESTAMP" "$INFO_PLIST"
 cp "$BUILD_PACKAGE_DIR/.build/release/ClassScribe" "$MACOS/ClassScribe"
 cp "$BUILD_PACKAGE_DIR/.build/release/ClassScribeDiarizer" "$HELPERS/ClassScribeDiarizer"
+
+if [ ! -f "$ICON_SOURCE" ]; then
+    echo "No se encontró el icono de ClassScribe: $ICON_SOURCE" >&2
+    exit 1
+fi
+case "$ICONSET" in
+    "$PACKAGE_DIR"/.build/ClassScribe.iconset) ;;
+    *) echo "Destino de iconset inesperado: $ICONSET" >&2; exit 1 ;;
+esac
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+sips -z 16 16 "$ICON_SOURCE" --out "$ICONSET/icon_16x16.png" >/dev/null
+sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET/icon_16x16@2x.png" >/dev/null
+sips -z 32 32 "$ICON_SOURCE" --out "$ICONSET/icon_32x32.png" >/dev/null
+sips -z 64 64 "$ICON_SOURCE" --out "$ICONSET/icon_32x32@2x.png" >/dev/null
+sips -z 128 128 "$ICON_SOURCE" --out "$ICONSET/icon_128x128.png" >/dev/null
+sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET/icon_128x128@2x.png" >/dev/null
+sips -z 256 256 "$ICON_SOURCE" --out "$ICONSET/icon_256x256.png" >/dev/null
+sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET/icon_256x256@2x.png" >/dev/null
+sips -z 512 512 "$ICON_SOURCE" --out "$ICONSET/icon_512x512.png" >/dev/null
+sips -z 1024 1024 "$ICON_SOURCE" --out "$ICONSET/icon_512x512@2x.png" >/dev/null
+iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"
+rm -rf "$ICONSET"
 
 codesign --force --sign - "$HELPERS/ClassScribeDiarizer" >/dev/null
 

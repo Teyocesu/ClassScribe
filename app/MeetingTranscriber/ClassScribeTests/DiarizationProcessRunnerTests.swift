@@ -117,6 +117,35 @@ func cancellationTerminatesWorkerAndPreservesAudio() async throws {
 }
 
 @Test
+func timeoutTerminatesHungWorkerAndPreservesRecoveryFiles() async throws {
+    let folder = try makeDiarizationTestFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let audio = folder.appendingPathComponent("source.wav")
+    let original = Data([4, 3, 2, 1])
+    try original.write(to: audio)
+    let worker = try makeWorkerScript(
+        in: folder,
+        body: """
+        trap '' TERM
+        exec /bin/sleep 30
+        """,
+    )
+    let runner = DiarizationProcessRunner(executableURL: worker, processingTimeout: 0.05)
+    let started = Date()
+
+    do {
+        _ = try await runner.run(audioURL: audio)
+        Issue.record("Se esperaba timeout del helper")
+    } catch let error as DiarizationProcessError {
+        #expect(error == .timedOut)
+    }
+
+    #expect(Date().timeIntervalSince(started) < 4)
+    #expect(try Data(contentsOf: audio) == original)
+    #expect(try hiddenDiarizationFiles(in: folder).isEmpty)
+}
+
+@Test
 func runnerRejectsSymbolicAudioBeforeLaunchingWorker() async throws {
     let folder = try makeDiarizationTestFolder()
     defer { try? FileManager.default.removeItem(at: folder) }

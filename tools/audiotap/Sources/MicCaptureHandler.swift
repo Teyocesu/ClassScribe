@@ -135,20 +135,41 @@ public class MicCaptureHandler: @unchecked Sendable {
         MicCaptureDiagnostics.record(
             "start begin handler=\(ObjectIdentifier(self)) requestedUID=\(deviceUID ?? "default") output=\(outputURL.path)",
         )
-        try startEngine(deviceUID: deviceUID)
+        do {
+            try startEngine(deviceUID: deviceUID)
+        } catch {
+            // `startEngine` can fail after creating the WAV or attaching the
+            // input tap (for example if AVAudioEngine.start throws). Tear down
+            // deterministically instead of waiting for ARC/deinit timing.
+            stop()
+            throw error
+        }
         installDeviceChangeListener()
         installConfigChangeObserver()
     }
 
     /// Wait for audio that has actually reached the WAV writer. Callers must
     /// not present a recording as active before this succeeds.
+    @MainActor
     public func waitForFirstBuffer(timeout: TimeInterval = 2.5) async throws {
+        try Task.checkCancellation()
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if firstBufferGate.hasWrittenFrames {
+                try Task.checkCancellation()
                 return
             }
+            // A restart can reach its terminal limit before the startup wait
+            // expires. Surface that precise failure immediately instead of
+            // overwriting it with a generic first-buffer timeout.
+            if let terminalError {
+                throw terminalError
+            }
             try await Task.sleep(for: .milliseconds(50))
+        }
+        try Task.checkCancellation()
+        if let terminalError {
+            throw terminalError
         }
         let snapshot = firstBufferGate.snapshot
         let error = MicCaptureError.firstBufferTimeout(
@@ -193,27 +214,25 @@ public class MicCaptureHandler: @unchecked Sendable {
 
         if let uid = deviceUID {
             var deviceID = Self.deviceIDForUID(uid)
-            if deviceID != kAudioObjectUnknown {
-                let audioUnit = inputNode.audioUnit! // swiftlint:disable:this force_unwrapping
-                let status = AudioUnitSetProperty(
-                    audioUnit,
-                    kAudioOutputUnitProperty_CurrentDevice,
-                    kAudioUnitScope_Global, 0,
-                    &deviceID, UInt32(MemoryLayout<AudioDeviceID>.size),
-                )
-                if status == noErr {
-                    logger.info("Mic device set: \(uid) (ID \(deviceID))")
-                    MicCaptureDiagnostics.record("selected device applied uid=\(uid) id=\(deviceID)")
-                } else {
-                    logger.warning("Mic device set failed (status \(status)); using default")
-                    MicCaptureDiagnostics.record("selected device failed status=\(status); fallback=default")
-                    selectedDeviceUID = nil
-                }
-            } else {
-                logger.warning("Unknown mic device UID '\(uid)', using default")
-                MicCaptureDiagnostics.record("selected device UID unavailable; fallback=default")
-                selectedDeviceUID = nil
+            guard deviceID != kAudioObjectUnknown else {
+                logger.error("Selected mic device UID '\(uid)' is unavailable")
+                MicCaptureDiagnostics.record("selected device UID unavailable; start rejected")
+                throw MicCaptureError.deviceUnavailable(uid: uid)
             }
+            let audioUnit = inputNode.audioUnit! // swiftlint:disable:this force_unwrapping
+            let status = AudioUnitSetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global, 0,
+                &deviceID, UInt32(MemoryLayout<AudioDeviceID>.size),
+            )
+            guard status == noErr else {
+                logger.error("Mic device set failed (status \(status)); start rejected")
+                MicCaptureDiagnostics.record("selected device failed status=\(status); start rejected")
+                throw MicCaptureError.deviceSelectionFailed(uid: uid, status: status)
+            }
+            logger.info("Mic device set: \(uid) (ID \(deviceID))")
+            MicCaptureDiagnostics.record("selected device applied uid=\(uid) id=\(deviceID)")
         }
 
         let hwFormat = inputNode.outputFormat(forBus: 0)
@@ -668,6 +687,8 @@ private func sumOfSquaresInt16(
 
 public enum MicCaptureError: LocalizedError {
     case noInputDevice
+    case deviceUnavailable(uid: String)
+    case deviceSelectionFailed(uid: String, status: OSStatus)
     case invalidHardwareFormat(sampleRate: Double, channelCount: UInt32)
     case firstBufferTimeout(timeout: TimeInterval, callbacks: Int, frames: Int)
     case restartLimitExceeded(maximum: Int)
@@ -675,6 +696,10 @@ public enum MicCaptureError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .noInputDevice: "No microphone hardware available"
+        case let .deviceUnavailable(uid):
+            "El micrófono seleccionado ya no está disponible (\(uid)). Conéctalo de nuevo o elige otro."
+        case let .deviceSelectionFailed(uid, status):
+            "No se pudo activar el micrófono seleccionado (\(uid), OSStatus \(status)). Elige otro dispositivo."
         case let .invalidHardwareFormat(sampleRate, channelCount):
             "Microphone reported an invalid format (\(sampleRate) Hz, \(channelCount) ch)"
         case let .firstBufferTimeout(timeout, callbacks, frames):

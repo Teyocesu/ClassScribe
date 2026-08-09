@@ -23,6 +23,27 @@ private struct ClassSessionContext: Sendable {
     var technicalVocabularyURL: URL?
 }
 
+struct RetryAudioPreparation: Sendable, Equatable {
+    var duration: TimeInterval
+    var recoveredRaw: Bool
+}
+
+typealias RetryAudioPreparer = @Sendable (URL, URL) async throws -> RetryAudioPreparation
+
+private func prepareRetryAudio(audioURL: URL, rawURL: URL) async throws -> RetryAudioPreparation {
+    try await Task.detached(priority: .userInitiated) {
+        do {
+            return try RetryAudioPreparation(duration: WavFile.validate(audioURL), recoveredRaw: false)
+        } catch let wavError {
+            guard FileManager.default.fileExists(atPath: rawURL.path) else { throw wavError }
+            return try RetryAudioPreparation(
+                duration: WavFile.recoverFloat32Raw(rawURL, destination: audioURL),
+                recoveredRaw: true,
+            )
+        }
+    }.value
+}
+
 @MainActor
 @Observable
 final class ClassScribeModel {
@@ -59,6 +80,8 @@ final class ClassScribeModel {
     private let parakeet: ParakeetService
     private let store: SessionStore
     private let finalProcessor: any FinalProcessingProviding
+    private let retryAudioPreparer: RetryAudioPreparer
+    private let liveTaskStopGrace: TimeInterval
     private var classFolder: URL?
     private var startedAt: Date?
     private var elapsedTimer: Timer?
@@ -72,17 +95,22 @@ final class ClassScribeModel {
     private var accumulator = LiveTranscriptAccumulator()
     private var technicalVocabularyURL: URL?
     private var activeSession: ClassSessionContext?
+    private var liveTranscriptionError: String?
 
     init(
         store: SessionStore = SessionStore(),
         capture injectedCapture: CaptureController? = nil,
         parakeet injectedParakeet: ParakeetService? = nil,
         finalProcessor injectedFinalProcessor: (any FinalProcessingProviding)? = nil,
+        retryAudioPreparer: @escaping RetryAudioPreparer = prepareRetryAudio,
+        liveTaskStopGrace: TimeInterval = 3,
     ) {
         let parakeet = injectedParakeet ?? ParakeetService()
         self.parakeet = parakeet
         self.store = store
         finalProcessor = injectedFinalProcessor ?? FinalProcessor(parakeet: parakeet)
+        self.retryAudioPreparer = retryAudioPreparer
+        self.liveTaskStopGrace = max(0, liveTaskStopGrace)
         capture = injectedCapture ?? CaptureController()
         capture.refreshSources()
         history = store.history()
@@ -218,6 +246,7 @@ final class ClassScribeModel {
         guard canStart else { return }
         cancelCalibration()
         errorMessage = nil
+        liveTranscriptionError = nil
         finalReplacedLive = false
         stableLiveText = ""
         provisionalLiveText = ""
@@ -281,7 +310,7 @@ final class ClassScribeModel {
         accumulator.confirmProvisional()
         syncLiveTextFromAccumulator()
         state = .transcriptionPaused
-        statusDetail = "La grabación continúa; solo se pausó la inferencia."
+        statusDetail = "La grabación continúa; solo se pausó la transcripción."
         persistCurrentState(checkpoint: "paused")
     }
 
@@ -289,7 +318,7 @@ final class ClassScribeModel {
         guard isRecording, isTranscriptionPaused else { return }
         isTranscriptionPaused = false
         state = .recording
-        statusDetail = "Transcripción reanudada; el WAV nunca se interrumpió."
+        statusDetail = "Transcripción reanudada; el audio siguió grabándose."
         persistCurrentState(checkpoint: "resumed")
     }
 
@@ -315,10 +344,7 @@ final class ClassScribeModel {
         errorMessage = nil
         state = .stopping
         statusDetail = "Guardando transcripción antes de cerrar el audio."
-        let task = liveTask
-        task?.cancel()
-        await task?.value
-        liveTask = nil
+        _ = await stopLiveTranscription()
         elapsedTimer?.invalidate()
         elapsedTimer = nil
         accumulator.confirmProvisional()
@@ -332,7 +358,7 @@ final class ClassScribeModel {
 
         do {
             state = .finalizingAudio
-            statusDetail = "Cerrando y validando el WAV."
+            statusDetail = "Cerrando y validando el audio."
             let stopped = try await capture.stop()
             elapsed = stopped.duration
             try checkpointLive("audio-stopped", session: session)
@@ -348,8 +374,18 @@ final class ClassScribeModel {
     }
 
     func cancelFinalProcessing() {
+        let cancelledRetryPreparation = retryTask != nil && finalTask == nil
+        if retryTask != nil {
+            retryJobID = nil
+            retryTask?.cancel()
+        }
         finalTask?.cancel()
-        statusDetail = "Cancelando procesamiento; el texto y el WAV permanecen disponibles."
+        statusDetail = "Cancelando procesamiento; el texto y el audio permanecen disponibles."
+        if cancelledRetryPreparation, let session = activeSession {
+            state = .cancelled
+            statusDetail = "Procesamiento cancelado; se conservaron el audio y el mejor texto disponible."
+            persistCurrentState(checkpoint: "processing-cancelled", session: session)
+        }
     }
 
     func selectProfessor(_ id: String) {
@@ -596,7 +632,10 @@ final class ClassScribeModel {
         }
         retryTask = task
         await task.value
-        if retryJobID == jobID {
+        // A cancelled retry deliberately keeps `retryTask`/`isRetrying` set
+        // until its possibly non-cooperative RAW/WAV repair has really exited.
+        // No second repair may overlap the first on the same files.
+        if retryJobID == jobID || retryJobID == nil {
             retryJobID = nil
             retryTask = nil
             isRetrying = false
@@ -607,23 +646,13 @@ final class ClassScribeModel {
         let audioURL = session.folder.appendingPathComponent("source.wav")
         let rawURL = session.folder.appendingPathComponent("source.raw")
         do {
-            let preparation = try await Task.detached(priority: .userInitiated) {
-                do {
-                    return try (duration: WavFile.validate(audioURL), recoveredRaw: false)
-                } catch let wavError {
-                    guard FileManager.default.fileExists(atPath: rawURL.path) else { throw wavError }
-                    return try (
-                        duration: WavFile.recoverFloat32Raw(rawURL, destination: audioURL),
-                        recoveredRaw: true,
-                    )
-                }
-            }.value
+            let preparation = try await retryAudioPreparer(audioURL, rawURL)
             try ensureCurrentRetry(jobID: jobID, session: session)
             elapsed = preparation.duration
             errorMessage = nil
             statusDetail = preparation.recoveredRaw
-                ? "WAV reconstruido sin borrar el audio crudo; reintentando el procesamiento."
-                : "Audio validado; reintentando el procesamiento sin modificar el WAV."
+                ? "Audio recuperado; reintentando el procesamiento."
+                : "Audio listo; reintentando el procesamiento."
             try store.saveMetadata(metadata(session: session, state: .finalizingAudio), folder: session.folder)
             runFinalProcessing(audioURL: audioURL, session: session, reusePersistedTranscript: !allSegments.isEmpty)
         } catch is CancellationError {
@@ -631,7 +660,7 @@ final class ClassScribeModel {
         } catch {
             guard retryJobID == jobID, activeSession?.id == session.id else { return }
             state = .recoverable
-            errorMessage = "No se puede reprocesar el WAV: \(error.localizedDescription)"
+            errorMessage = "No se puede reprocesar el audio: \(error.localizedDescription)"
             statusDetail = "El texto recuperado sigue disponible."
             persistCurrentState(checkpoint: "audio-recovery-failed", session: session)
         }
@@ -668,12 +697,14 @@ final class ClassScribeModel {
         statusDetail = "Cerrando y validando el audio después del error del micrófono."
         elapsedTimer?.invalidate()
         elapsedTimer = nil
-        let task = liveTask
-        task?.cancel()
-        await task?.value
-        liveTask = nil
+        _ = await stopLiveTranscription()
         accumulator.confirmProvisional()
         syncLiveTextFromAccumulator()
+        // A terminal channel failure is reported before the controller tears
+        // down so this path can use the normal idempotent stop/finalization.
+        // In particular, an online RAW track must be wrapped into source.wav
+        // before validation and recovery metadata are written.
+        await capture.abortPreservingAudio()
         let audioURL = session.folder.appendingPathComponent("source.wav")
         let validation = await Task.detached(priority: .userInitiated) {
             Result { try WavFile.validate(audioURL) }
@@ -687,48 +718,107 @@ final class ClassScribeModel {
             elapsed = duration
             state = .recoverable
             errorMessage = message
-            statusDetail = "La captura se detuvo, pero el WAV fue validado y puede reprocesarse."
+            statusDetail = "La captura se detuvo, pero el audio se conservó y puede reprocesarse."
         case let .failure(validationError):
             state = .failed
-            errorMessage = "\(message) El WAV no pudo validarse: \(validationError.localizedDescription)"
+            errorMessage = "\(message) El audio no pudo validarse: \(validationError.localizedDescription)"
             statusDetail = "La captura se detuvo y el audio quedó conservado para diagnóstico."
         }
         persistCurrentState(checkpoint: "capture-failed", session: session)
         isStopping = false
     }
 
+    /// Cancel live inference and give it a short grace period to observe that
+    /// cancellation. Core ML occasionally finishes a prediction before it can
+    /// check cancellation; Stop must still proceed and finalize the durable WAV.
+    /// The live task checks both cancellation and `session.id` before every
+    /// post-inference mutation, so a late result cannot touch a newer session.
+    private func stopLiveTranscription() async -> Bool {
+        guard let task = liveTask else { return true }
+        task.cancel()
+        let finished = await TaskCompletionGracePeriod.wait(for: task, timeout: liveTaskStopGrace)
+        liveTask = nil
+        return finished
+    }
+
     private func startLiveTranscription(session: ClassSessionContext) {
         liveTask?.cancel()
         liveTask = Task { [weak self] in
             guard let self else { return }
-            var lastProcessedEnd: Int64 = 0
-            let minimumSamples: Int64 = 5 * 16000
-            let hopSamples: Int64 = 88000 // 5.5 seconds; 1.5 second overlap in a 7 second window
+            var cursor = LiveTranscriptionCursor() // 5.5-second hops; 1.5-second overlap in a 7-second window
+            var retryPolicy = LiveTranscriptionRetryPolicy()
+            var resumeAtLatestWindow = false
             while !Task.isCancelled, self.isRecording {
                 do { try await Task.sleep(for: .milliseconds(400)) }
                 catch { break }
                 guard !Task.isCancelled, self.activeSession?.id == session.id else { break }
-                guard !self.isTranscriptionPaused else { continue }
+                guard !self.isTranscriptionPaused else {
+                    // Pausing live inference must not build an unbounded queue
+                    // that is replayed when the user resumes.
+                    resumeAtLatestWindow = true
+                    continue
+                }
+                let uptime = ProcessInfo.processInfo.systemUptime
+                guard retryPolicy.canAttempt(atUptime: uptime) else { continue }
                 let total = await self.capture.liveStore.totalSamples()
-                guard total >= minimumSamples,
-                      total - lastProcessedEnd >= hopSamples,
-                      let window = await self.capture.liveStore.window(seconds: 7, endingAt: total) else { continue }
-                lastProcessedEnd = total
+                guard var windowEnd = cursor.nextWindowEnd(
+                    totalSamples: total,
+                    preferLatest: resumeAtLatestWindow,
+                ) else { continue }
+                resumeAtLatestWindow = false
+                var skippedExpiredSamples: Int64 = 0
+                var window = await self.capture.liveStore.window(
+                    seconds: 7,
+                    endingAt: windowEnd,
+                    requiresCompleteHistory: true,
+                )
+                if window == nil,
+                   let recovery = cursor.recoverFromExpiredWindow(totalSamples: total) {
+                    windowEnd = recovery.end
+                    skippedExpiredSamples = recovery.skippedSamples
+                    window = await self.capture.liveStore.window(
+                        seconds: 7,
+                        endingAt: windowEnd,
+                        requiresCompleteHistory: true,
+                    )
+                }
+                guard let window else { continue }
                 let began = Date()
                 do {
                     self.state = .loadingModel
-                    self.statusDetail = "Parakeet TDT v3 procesa una ventana local de 7 segundos."
+                    self.statusDetail = skippedExpiredSamples > 0
+                        ? "La vista en vivo retomó el audio reciente; la versión final recuperará el tramo anterior."
+                        : "Preparando la transcripción local…"
                     let text = try await self.parakeet.transcribe(samples: window.samples)
                     try Task.checkCancellation()
                     guard self.activeSession?.id == session.id, self.isRecording else { break }
+                    guard !self.isTranscriptionPaused else {
+                        // The user paused while Core ML was still returning a
+                        // result. Discard it and resume from recent audio later;
+                        // never overwrite the paused UI/state with a late result.
+                        resumeAtLatestWindow = true
+                        continue
+                    }
                     let pause = await self.capture.liveStore.hasRecentPause()
+                    try Task.checkCancellation()
+                    guard self.activeSession?.id == session.id, self.isRecording else { break }
+                    guard !self.isTranscriptionPaused else {
+                        resumeAtLatestWindow = true
+                        continue
+                    }
                     self.accumulator.accept(
                         text,
                         start: window.start,
-                        end: Double(total) / 16000,
+                        end: Double(windowEnd) / 16000,
                         confirmedByPause: pause,
                     )
+                    cursor.commit(windowEndingAt: windowEnd)
+                    retryPolicy.recordSuccess()
                     self.syncLiveTextFromAccumulator()
+                    if self.errorMessage == self.liveTranscriptionError {
+                        self.errorMessage = nil
+                    }
+                    self.liveTranscriptionError = nil
                     self.transcriptionLatency = Date().timeIntervalSince(began) + 1.5
                     self.state = .recording
                     self.statusDetail = pause
@@ -740,9 +830,15 @@ final class ClassScribeModel {
                     break
                 } catch {
                     guard !Task.isCancelled, self.activeSession?.id == session.id, self.isRecording else { break }
+                    let delay = retryPolicy.recordFailure(atUptime: ProcessInfo.processInfo.systemUptime)
                     self.state = .recording
-                    self.errorMessage = "Transcripción en vivo no disponible: \(error.localizedDescription). La grabación continúa."
-                    self.statusDetail = "La grabación continúa; se reintentará y habrá retranscripción final."
+                    let previousLiveError = self.liveTranscriptionError
+                    let message = "Transcripción en vivo no disponible: \(error.localizedDescription). La grabación continúa."
+                    self.liveTranscriptionError = message
+                    if self.errorMessage == nil || self.errorMessage == previousLiveError {
+                        self.errorMessage = message
+                    }
+                    self.statusDetail = "La grabación continúa; reintento en \(Int(delay)) s y retranscripción final al detener."
                 }
             }
         }
@@ -763,6 +859,7 @@ final class ClassScribeModel {
             guard let self else { return }
             do {
                 try self.ensureCurrentFinalJob(jobID: jobID, session: session)
+                var vocabularyWarning: String?
                 let transcript: [TranscriptSegment]
                 if reusePersistedTranscript, !self.allSegments.isEmpty {
                     transcript = self.allSegments
@@ -773,8 +870,19 @@ final class ClassScribeModel {
                     )
                 } else {
                     self.state = .finalTranscription
-                    self.statusDetail = "La versión en vivo permanece visible mientras se procesa el WAV completo."
-                    try await self.finalProcessor.configureVocabulary(file: session.technicalVocabularyURL)
+                    self.statusDetail = "La versión en vivo permanece visible mientras se prepara la versión completa."
+                    do {
+                        try await self.finalProcessor.configureVocabulary(file: session.technicalVocabularyURL)
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        // Custom vocabulary is an optional accuracy boost. A
+                        // missing CTC model or malformed list must not discard
+                        // an otherwise valid full-file transcription.
+                        let warning = "No se pudo aplicar el vocabulario técnico; la transcripción base continuó."
+                        vocabularyWarning = warning
+                        self.statusDetail = warning
+                    }
                     try self.ensureCurrentFinalJob(jobID: jobID, session: session)
                     transcript = try await self.finalProcessor.transcribe(audioURL)
                     try Task.checkCancellation()
@@ -794,7 +902,7 @@ final class ClassScribeModel {
                     self.selectedTab = .everyone
                 }
                 self.state = .diarizing
-                self.statusDetail = "FluidAudio identifica voces y genera embeddings locales."
+                self.statusDetail = "Identificando las voces de la clase…"
                 let diarization = try await self.finalProcessor.diarize(audioURL)
                 try Task.checkCancellation()
                 try self.ensureCurrentFinalJob(jobID: jobID, session: session)
@@ -806,7 +914,8 @@ final class ClassScribeModel {
                 self.chooseProfessorAutomatically(subject: session.subject, embeddings: diarization.embeddings)
                 self.finalReplacedLive = true
                 self.state = .complete
-                self.statusDetail = "La transcripción final reemplazó a la versión provisional."
+                self.statusDetail = vocabularyWarning
+                    ?? "La transcripción final reemplazó a la versión provisional."
                 if !self.persistFinalOutputs(session: session) {
                     self.state = .recoverable
                     self.statusDetail = "El texto sigue disponible, pero no se pudieron confirmar todas las salidas finales."

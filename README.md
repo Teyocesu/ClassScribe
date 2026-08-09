@@ -2,6 +2,8 @@
 
 ClassScribe es una aplicación nativa para macOS que graba y transcribe clases universitarias en español, completamente en el dispositivo. Captura **una aplicación elegida** o **un micrófono elegido**, nunca ambos automáticamente. El audio, las transcripciones y las referencias de voz permanecen en la Mac.
 
+La revisión de interfaz, captura, transcripción, instalación e icono realizada el 9 de agosto de 2026 está documentada en [docs/classscribe-2026-08-09.md](docs/classscribe-2026-08-09.md).
+
 > Obtén permiso del profesor y de las demás personas antes de grabar. Cumple las normas de tu universidad y la legislación aplicable.
 
 ## Privacidad
@@ -38,7 +40,7 @@ Desde el repositorio:
 ./scripts/run_app.sh
 ```
 
-El script resuelve FluidAudio 0.15.5 en una versión fija, compila con dos trabajos, arma y firma ad hoc `app/MeetingTranscriber/.build/ClassScribe-Dev.app`, cierra cualquier proceso anterior llamado ClassScribe y abre una única instancia nueva con `open -n`. La línea inferior de la ventana muestra el commit y timestamp embebidos. El bundle incluye un helper firmado para aislar la diarización.
+El script resuelve FluidAudio 0.15.5 en una versión fija, compila con dos trabajos, arma y firma ad hoc `app/MeetingTranscriber/.build/ClassScribe-Dev.app`, genera `AppIcon.icns`, cierra cualquier proceso anterior llamado ClassScribe y abre una única instancia nueva con `open -n`. El commit y timestamp quedan embebidos en el bundle y disponibles como ayuda accesible del encabezado. El bundle incluye un helper firmado para aislar la diarización.
 
 Solo compilar:
 
@@ -48,9 +50,22 @@ Solo compilar:
 
 `./scripts/pre-push.sh --with-tests` repite el build Release y las pruebas disponibles con el toolchain instalado. En esta Mac, el script prepara automáticamente un mirror local ignorado para compensar el SDK incompleto de Command Line Tools.
 
+### Instalar en Aplicaciones y Launchpad
+
+Después de compilar, copia el bundle firmado y regístralo con Launch Services:
+
+```bash
+ditto app/MeetingTranscriber/.build/ClassScribe-Dev.app /Applications/ClassScribe.app
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -f /Applications/ClassScribe.app
+open -n /Applications/ClassScribe.app
+```
+
+La app aparece como **ClassScribe** en Finder y Launchpad con el icono incluido en `app/MeetingTranscriber/ClassScribeAssets/AppIcon.png`.
+
 ## Modelos
 
-Parakeet TDT v3 y los modelos de diarización se descargan automáticamente en la primera transcripción/diarización mediante FluidAudio. El estado “Descargando/cargando modelos” es normal. Si faltan o falla la descarga, la grabación continúa y la interfaz informa el error sin cerrar la app. Los modelos no se guardan en Git.
+Parakeet TDT v3 y los modelos de diarización se descargan automáticamente en la primera transcripción/diarización mediante FluidAudio. Durante esa carga la interfaz muestra “Preparando transcripción”. Si faltan o falla la descarga, la grabación continúa y la interfaz informa el error sin cerrar la app. Los modelos no se guardan en Git.
 
 ## Permisos
 
@@ -64,14 +79,15 @@ Selecciona el micrófono. macOS pedirá permiso; si se negó antes, ve a **Ajust
 
 ## Uso
 
-1. Escribe materia y, opcionalmente, vocabulario técnico separado por comas.
-2. Elige “Clase online” o “Clase presencial” y la fuente.
-3. Pulsa “Iniciar clase”. En modo presencial, la app muestra “Esperando primer audio” y no activa el punto rojo ni el contador hasta que un buffer con frames haya sido escrito en el WAV.
-4. La transcripción usa ventanas de 7 s con salto de 5,5 s (1,5 s de solapamiento). Cada hipótesis anterior se confirma antes de instalar la siguiente: el contenido confirmado nunca se reemplaza ni vuelve a vacío. El texto tenue/cursivo es la única cola provisional.
-5. “Pausar transcripción” detiene inferencia, no la grabación. “Reanudar” vuelve a procesar ventanas recientes.
-6. “Detener clase” deshabilita el botón, guarda primero el texto, drena escrituras de audio, valida el WAV y retranscribe el archivo completo. El texto sigue visible y editable mientras procesa.
-7. La transcripción completa se persiste antes de identificar voces. La diarización corre en `ClassScribeDiarizer`, un proceso CPU-only separado; si Core ML falla o aborta, la aplicación principal permanece abierta y permite reintentar.
-8. Al terminar, la persona con más tiempo de habla se marca como profesor automático/provisional, salvo que una referencia local de voz coincida con suficiente similitud.
+1. Escribe la materia.
+2. Elige “Clase online” o “Clase presencial” y la fuente. El único botón principal explica qué dato falta hasta que la configuración sea válida.
+3. Si hace falta, despliega “Agregar vocabulario técnico (opcional)” y escribe términos separados por comas.
+4. Pulsa “Iniciar grabación”. La app no declara una captura activa hasta recibir frames reales; una fuente silenciosa es válida, pero una fuente sin callbacks produce un error recuperable y accionable.
+5. La transcripción usa ventanas de 7 s con salto de 5,5 s (1,5 s de solapamiento). El cursor solo avanza después de un resultado correcto; los fallos transitorios reintentan la misma ventana con backoff.
+6. “Pausar transcripción” detiene inferencia, no la grabación. Un resultado tardío no puede sacar la interfaz del estado pausado.
+7. “Detener grabación” guarda el texto, detiene la espera en vivo de forma acotada, finaliza el audio y retranscribe el archivo completo. El texto sigue visible mientras procesa.
+8. La transcripción completa se persiste antes de identificar voces. La diarización corre en `ClassScribeDiarizer`, un proceso CPU-only separado y con timeout; si falla, la aplicación principal permanece abierta y permite reintentar.
+9. Al terminar, la persona con más tiempo de habla se marca como profesor automático/provisional, salvo que una referencia local de voz coincida con suficiente similitud.
 
 ## Ver, copiar y editar
 
@@ -79,7 +95,7 @@ Selecciona el micrófono. macOS pedirá permiso; si se negó antes, ve a **Ajust
 - “Seguir texto” mantiene el scroll cerca del final. Desactívalo para revisar párrafos anteriores sin que la vista vuelva a bajar.
 - “Copiar transcripción” elige, en orden, una edición visible, la versión final del profesor, la final completa y la versión viva/recuperada. No copia vacío si existe texto útil.
 - “Copiar para ChatGPT” agrega materia, fecha, duración, modo y fuente. Solo usa el portapapeles.
-- “Abrir TXT” abre la mejor salida humana disponible; “Abrir carpeta” muestra la sesión en Finder. Ambos permanecen disponibles durante el procesamiento y después de un error.
+- El menú de acciones de la transcripción agrupa copiar, exportar, abrir el archivo de texto y mostrar la carpeta en Finder, sin repetir botones en la barra de estado.
 - Las ediciones se guardan de forma atómica. TXT y Markdown exportan la edición visible. SRT conserva la versión segmentada con tiempos y muestra una advertencia si hubo edición libre.
 
 ## Identificar y corregir al profesor
@@ -143,7 +159,7 @@ swift test --package-path .toolchain/ClassScribePackage -j 2 \
   -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift"
 ```
 
-Las pruebas cubren acumulación monotónica (incluidas 100 ventanas), journal/TXT, recuperación legacy y desde RAW sin borrar evidencia, archivos WAV válidos e inválidos, reintento único ligado a la sesión, copia/exportación según la pestaña visible, ediciones, fallos de ASR y diarización, aislamiento ante `SIGABRT`, cancelación del helper, cambio de profesor y conservación de todos los hablantes. Las pruebas físicas de micrófono y audio de aplicación requieren permisos TCC e interacción con una fuente audible; no se simulan como éxitos en CI.
+Las pruebas cubren acumulación monotónica (incluidas 100 ventanas), ring buffer acotado, cursor y backoff en vivo, carga single-flight, inferencias serializadas, cancelación, journal/TXT, recuperación legacy y desde RAW sin borrar evidencia, archivos WAV válidos e inválidos, copia/exportación, ediciones, fallos de ASR y diarización, timeout/terminación del helper, cambio de profesor y conservación de todos los hablantes. Las pruebas físicas de micrófono y audio de aplicación requieren permisos TCC e interacción con una fuente audible; no se simulan como éxitos en CI.
 
 Fixtures y pruebas locales de modelos:
 
@@ -182,7 +198,7 @@ CLASSSCRIBE_RUN_MIC_CAPTURE_TEST=1 swift test \
   --filter microphoneCaptureFixture
 ```
 
-Resultados automatizados observados el 6 de agosto de 2026: Parakeet aprobó el fixture español; el helper aislado separó al menos dos voces tanto en el fixture representativo como en una copia privada de la sesión recuperada; y el proceso padre sobrevivió una terminación simulada por `SIGABRT`. Micrófono, Chrome y relanzamiento solo se declaran aprobados después de completar las pruebas físicas sobre el commit final.
+Resultados observados el 9 de agosto de 2026: 74 pruebas aprobaron con concurrencia estricta de Swift 6, incluyendo Parakeet sobre un fixture español, diarización de dos voces y captura CATap audible de `afplay`. El fixture CATap pasó además cuatro veces durante la corrección de su registro transitorio. La prueba física de micrófono no se ejecutó porque graba 60 segundos del ambiente y requiere autorización explícita del host.
 
 ## Limitaciones conocidas del MVP
 
@@ -200,7 +216,7 @@ Resultados automatizados observados el 6 de agosto de 2026: Parakeet aprobó el 
 - **La transcripción tarda:** la primera carga de modelos puede demorar varios minutos. El WAV continúa grabándose.
 - **Falló “Identificando hablantes”:** la transcripción completa ya fue guardada. Usa Copiar/Abrir TXT y luego Reintentar procesamiento.
 - **Una sesión figura recuperable:** ábrela; el banner explica si puede reprocesarse o si solo puede recuperarse el texto.
-- **Duda sobre el binario abierto:** compara la línea `Build …` de la ventana con `git rev-parse HEAD`. `scripts/run_app.sh` imprime además PID y ruta exacta.
+- **Duda sobre el binario abierto:** coloca el cursor sobre el encabezado para consultar la procedencia del build y compárala con `git rev-parse HEAD`. `scripts/run_app.sh` imprime además PID y ruta exacta.
 
 ## GitHub
 

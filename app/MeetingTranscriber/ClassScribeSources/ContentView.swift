@@ -1,179 +1,348 @@
 import SwiftUI
 
+enum CapturePrimaryControlState: Equatable {
+    case ready
+    case starting
+    case recording(paused: Bool)
+    case stopping
+    case processing
+
+    static func resolve(
+        isStopping: Bool,
+        isStarting: Bool,
+        isRecording: Bool,
+        isPaused: Bool,
+        isProcessing: Bool,
+    ) -> Self {
+        if isStopping { return .stopping }
+        if isStarting { return .starting }
+        if isRecording { return .recording(paused: isPaused) }
+        if isProcessing { return .processing }
+        return .ready
+    }
+}
+
+enum CaptureStartGuidance: Equatable {
+    case ready
+    case subjectRequired
+    case sourceRequired(CaptureMode)
+
+    static func resolve(subject: String, mode: CaptureMode, hasSelectedSource: Bool) -> Self {
+        if subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .subjectRequired
+        }
+        if !hasSelectedSource {
+            return .sourceRequired(mode)
+        }
+        return .ready
+    }
+
+    var message: String? {
+        switch self {
+        case .ready:
+            nil
+        case .subjectRequired:
+            "Escribe el nombre de la materia."
+        case .sourceRequired(.online):
+            "Elige la aplicación donde está la clase."
+        case .sourceRequired(.inPerson):
+            "Elige el micrófono que quieres usar."
+        }
+    }
+}
+
 struct ContentView: View {
     @Bindable var model: ClassScribeModel
     @State private var followsLiveText = true
+    @State private var showsTechnicalVocabulary = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider()
             captureConfiguration
-            Divider()
             statusBar
             if model.errorMessage != nil {
-                Divider()
                 errorBanner
             }
             Divider()
             HSplitView {
                 speakersPanel
                     .frame(minWidth: 245, idealWidth: 280, maxWidth: 330)
+                    .frame(maxHeight: .infinity, alignment: .top)
                 transcriptPanel
                     .frame(minWidth: 700)
+                    .frame(maxHeight: .infinity, alignment: .top)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
     private var header: some View {
-        HStack(spacing: 14) {
-            Image(systemName: "waveform.and.mic")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundStyle(.indigo)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("ClassScribe").font(.title2.bold())
-                Text("Transcripción local de clases · sin nube")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text(BuildIdentity.provenanceLabel)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(BuildIdentity.provenanceLabel)
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(.indigo.gradient)
+                    .frame(width: 42, height: 42)
+                Image(systemName: "waveform.and.mic")
+                    .font(.system(size: 21, weight: .semibold))
+                    .foregroundStyle(.white)
             }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("ClassScribe")
+                    .font(.title2.bold())
+                Text("Graba y transcribe tus clases en esta Mac")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .help(BuildIdentity.provenanceLabel)
             Spacer()
-            Picker("Modo", selection: $model.mode) {
-                ForEach(CaptureMode.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 310)
-            .disabled(model.isSessionBusy)
+            Label("Procesamiento local", systemImage: "lock.shield")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 18)
-        .padding(.vertical, 12)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
     }
 
     private var captureConfiguration: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 12) {
-                TextField("Nombre de la materia", text: $model.subject)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(minWidth: 240)
-                    .disabled(model.isSessionBusy)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Configura la clase")
+                .font(.headline)
 
-                if model.mode == .online {
-                    Picker("Aplicación", selection: $model.selectedApplicationID) {
-                        Text("Seleccionar aplicación…").tag(Int32?.none)
-                        ForEach(model.capture.applications) { app in
-                            Text(app.name).tag(Int32?.some(app.id))
+            HStack(alignment: .bottom, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Materia")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    TextField("Ej.: Análisis matemático", text: $model.subject)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(model.isSessionBusy)
+                }
+                .frame(minWidth: 210, idealWidth: 250)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Tipo de clase")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Picker("Tipo de clase", selection: $model.mode) {
+                        ForEach(CaptureMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
                         }
                     }
-                    .frame(minWidth: 280)
-                    .disabled(model.isSessionBusy)
-                } else {
-                    Picker("Micrófono", selection: $model.selectedMicrophoneID) {
-                        Text("Seleccionar micrófono…").tag(String?.none)
-                        ForEach(model.capture.microphones) { mic in
-                            Text(mic.name).tag(String?.some(mic.id))
-                        }
-                    }
-                    .frame(minWidth: 280)
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
                     .disabled(model.isSessionBusy)
                 }
+                .frame(width: 265)
 
-                Button {
-                    model.refreshSources()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(model.mode == .online ? "Aplicación" : "Micrófono")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        sourcePicker
+                        Button {
+                            model.refreshSources()
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .help("Actualizar fuentes de audio")
+                        .accessibilityLabel("Actualizar fuentes de audio")
+                    }
+                    .disabled(model.isSessionBusy)
                 }
-                .help("Actualizar aplicaciones y micrófonos")
-                .disabled(model.isSessionBusy)
+                .frame(minWidth: 250, idealWidth: 300)
+
+                Spacer(minLength: 0)
+                primaryCaptureControls
             }
 
-            HStack(alignment: .top, spacing: 12) {
-                TextField(
-                    "Vocabulario técnico, separado por comas (Newton-Raphson, Runge-Kutta, PMBOK…)",
-                    text: $model.technicalVocabulary,
-                    axis: .vertical,
-                )
-                .lineLimit(2 ... 3)
-                .textFieldStyle(.roundedBorder)
-                .disabled(model.isSessionBusy)
-
-                recordingControls
+            DisclosureGroup(isExpanded: $showsTechnicalVocabulary) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Ayuda a reconocer nombres, siglas y términos propios de la materia.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField(
+                        "Ej.: Newton-Raphson, Runge-Kutta, PMBOK",
+                        text: $model.technicalVocabulary,
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(model.isSessionBusy)
+                }
+                .padding(.top, 7)
+            } label: {
+                Label("Agregar vocabulario técnico (opcional)", systemImage: "text.badge.plus")
+                    .font(.caption)
             }
         }
         .padding(14)
+        .background {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.secondary.opacity(0.07))
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 12)
     }
 
-    private var recordingControls: some View {
-        HStack(spacing: 8) {
-            if model.isStopping {
-                Button("Guardando transcripción…") {}
-                    .disabled(true)
-            } else if model.capture.isStarting {
-                Button("Esperando primer audio…") {}
-                    .disabled(true)
-            } else if !model.isRecording {
-                Button("Iniciar clase") { Task { await model.startClass() } }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!model.canStart)
-            } else {
-                if model.isTranscriptionPaused {
-                    Button("Reanudar transcripción") { model.resumeTranscription() }
-                } else {
-                    Button("Pausar transcripción") { model.pauseTranscription() }
+    @ViewBuilder
+    private var sourcePicker: some View {
+        if model.mode == .online {
+            Picker("Aplicación", selection: $model.selectedApplicationID) {
+                Text("Seleccionar aplicación…").tag(Int32?.none)
+                ForEach(model.capture.applications) { app in
+                    Text(app.name).tag(Int32?.some(app.id))
                 }
-                Button("Detener clase", role: .destructive) { Task { await model.stopClass() } }
             }
-            if model.state == .finalTranscription || model.state == .diarizing {
-                Button("Cancelar procesamiento", role: .cancel) { model.cancelFinalProcessing() }
+            .labelsHidden()
+            .frame(minWidth: 220)
+        } else {
+            Picker("Micrófono", selection: $model.selectedMicrophoneID) {
+                Text("Seleccionar micrófono…").tag(String?.none)
+                ForEach(model.capture.microphones) { mic in
+                    Text(mic.name).tag(String?.some(mic.id))
+                }
             }
+            .labelsHidden()
+            .frame(minWidth: 220)
         }
     }
 
+    private var primaryControlState: CapturePrimaryControlState {
+        .resolve(
+            isStopping: model.isStopping,
+            isStarting: model.capture.isStarting,
+            isRecording: model.isRecording,
+            isPaused: model.isTranscriptionPaused,
+            isProcessing: model.isProcessing,
+        )
+    }
+
+    private var startGuidance: CaptureStartGuidance {
+        .resolve(
+            subject: model.subject,
+            mode: model.mode,
+            hasSelectedSource: model.mode == .online
+                ? model.selectedApplication != nil
+                : model.selectedMicrophone != nil,
+        )
+    }
+
+    @ViewBuilder
+    private var primaryCaptureControls: some View {
+        VStack(alignment: .trailing, spacing: 5) {
+            switch primaryControlState {
+            case .stopping:
+                progressLabel("Guardando…")
+            case .starting:
+                progressLabel("Conectando al audio…")
+            case let .recording(paused):
+                HStack(spacing: 8) {
+                    Button {
+                        paused ? model.resumeTranscription() : model.pauseTranscription()
+                    } label: {
+                        Label(
+                            paused ? "Reanudar" : "Pausar texto",
+                            systemImage: paused ? "play.fill" : "pause.fill",
+                        )
+                    }
+                    Button(role: .destructive) {
+                        Task { await model.stopClass() }
+                    } label: {
+                        Label("Finalizar", systemImage: "stop.fill")
+                    }
+                }
+            case .processing:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    if model.isRetrying || model.state == .finalTranscription || model.state == .diarizing {
+                        Button("Cancelar procesamiento", role: .cancel) {
+                            model.cancelFinalProcessing()
+                        }
+                    }
+                }
+            case .ready:
+                Button {
+                    Task { await model.startClass() }
+                } label: {
+                    Label("Iniciar grabación", systemImage: "record.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(!model.canStart)
+                if !model.canStart, let message = startGuidance.message {
+                    Text(message)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(minWidth: 175, alignment: .trailing)
+    }
+
+    private func progressLabel(_ title: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text(title)
+                .font(.subheadline)
+        }
+        .foregroundStyle(.secondary)
+    }
+
     private var statusBar: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 16) {
             HStack(spacing: 7) {
                 Circle()
                     .fill(model.isRecording ? .red : statusColor)
                     .frame(width: 10, height: 10)
-                Text(model.isRecording ? "GRABANDO" : model.state.rawValue.uppercased())
-                    .font(.caption.bold())
+                Text(statusTitle)
+                    .font(.subheadline.bold())
             }
-            Label(Timecode.display(model.elapsed), systemImage: "timer")
-                .monospacedDigit()
-            HStack(spacing: 6) {
-                Image(systemName: "waveform")
-                Gauge(value: min(0, max(-60, model.capture.levelDBFS)), in: -60 ... 0) { EmptyView() }
+            if model.isRecording || model.elapsed > 0 {
+                Label(Timecode.display(model.elapsed), systemImage: "timer")
+                    .font(.subheadline)
+                    .monospacedDigit()
+            }
+            if model.isRecording {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform")
+                        .foregroundStyle(.secondary)
+                    Gauge(value: min(0, max(-60, model.capture.levelDBFS)), in: -60 ... 0) {
+                        Text("Nivel de audio")
+                    }
+                    .labelsHidden()
                     .gaugeStyle(.accessoryLinearCapacity)
-                    .frame(width: 120)
-                Text(String(format: "%.0f dB", model.capture.levelDBFS))
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .frame(width: 92)
+                    .accessibilityLabel("Nivel de audio")
+                }
             }
-            Label(String(format: "Demora %.1f s", model.transcriptionLatency), systemImage: "clock")
-                .font(.caption)
             Text(model.statusDetail)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
             Spacer()
-            if model.currentFolder != nil {
-                if model.canRetryProcessing {
-                    Button("Reintentar procesamiento") { Task { await model.retryProcessing() } }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+            if model.canRetryProcessing {
+                Button {
+                    Task { await model.retryProcessing() }
+                } label: {
+                    Label("Reintentar procesamiento", systemImage: "arrow.clockwise")
                 }
-                Button("Abrir TXT") { model.openCurrentTXT() }
-                    .controlSize(.small)
-                    .disabled(!model.canOpenTXT)
-                Button("Abrir carpeta") { model.openCurrentFolder() }
-                    .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 9)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var statusTitle: String {
+        if model.isRecording {
+            return model.isTranscriptionPaused ? "Grabando · texto pausado" : "Grabando y transcribiendo"
+        }
+        return model.state.rawValue
     }
 
     private var statusColor: Color {
@@ -187,20 +356,32 @@ struct ContentView: View {
     }
 
     private var speakersPanel: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Hablantes detectados").font(.headline)
+                Label("Voces", systemImage: "person.2.wave.2")
+                    .font(.headline)
                 Spacer()
-                Text("\(model.speakers.count)").foregroundStyle(.secondary)
+                if !model.speakers.isEmpty {
+                    Text("\(model.speakers.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if model.speakers.isEmpty {
-                ContentUnavailableView(
-                    "Aún sin voces",
-                    systemImage: "person.2.wave.2",
-                    description: Text("Las etiquetas Persona 1, Persona 2… aparecerán al diarizar. Nunca se descarta el audio."),
-                )
-                .frame(maxHeight: 210)
+                VStack(spacing: 7) {
+                    Image(systemName: "person.2.wave.2")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                    Text("Aún no hay voces identificadas")
+                        .font(.subheadline.bold())
+                    Text("Se identificarán al finalizar la grabación.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 8) {
@@ -212,54 +393,88 @@ struct ContentView: View {
                 .frame(maxHeight: 315)
             }
 
-            Button {
-                model.calibrateProfessorVoice()
-            } label: {
-                Label(
-                    model.isCalibrating ? "Calibrando… \(model.calibrationSecondsRemaining) s" : "Calibrar voz del profesor",
-                    systemImage: "waveform.badge.mic",
-                )
+            if model.isRecording {
+                Button {
+                    model.calibrateProfessorVoice()
+                } label: {
+                    Label(
+                        model.isCalibrating
+                            ? "Guardando voz… \(model.calibrationSecondsRemaining) s"
+                            : "Guardar voz del profesor (20 s)",
+                        systemImage: "waveform.badge.mic",
+                    )
+                }
+                .disabled(model.isCalibrating || model.isStopping)
+                .help("Crea una referencia local para reconocer al profesor en esta materia.")
             }
-            .disabled(!model.isRecording || model.isCalibrating || model.isStopping)
 
             if let professor = model.professorSpeakerID {
                 VStack(alignment: .leading, spacing: 3) {
                     Label("Profesor: \(professor)", systemImage: "person.crop.circle.badge.checkmark")
-                        .font(.subheadline.bold()).foregroundStyle(.indigo)
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.indigo)
                     if model.professorSelectionIsAutomatic {
-                        Text("Selección automática y provisional; corrígela con un clic.")
-                            .font(.caption).foregroundStyle(.orange)
+                        Text("Selección automática; puedes cambiarla.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
 
             Divider()
-            Text("Historial de clases").font(.headline)
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(model.history) { item in
-                        HStack(spacing: 6) {
-                            Button { model.openHistory(item) } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(item.subject).font(.subheadline.bold()).lineLimit(1)
-                                    Text("\(item.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(Timecode.display(item.duration))")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                    Text("\(item.mode.rawValue) · \(item.source)")
-                                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                    Text("\(item.professorSpeakerID ?? "Profesor pendiente") · \(item.speakerCount) hablante(s) · \(item.state.rawValue)")
-                                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                                    if let reason = item.recoveryReason {
-                                        Text(reason).font(.caption2).foregroundStyle(.orange).lineLimit(2)
+            HStack {
+                Label("Clases anteriores", systemImage: "clock.arrow.circlepath")
+                    .font(.headline)
+                Spacer()
+                if !model.history.isEmpty {
+                    Text("\(model.history.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if model.history.isEmpty {
+                Text("Tus grabaciones aparecerán aquí.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 18)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 6) {
+                        ForEach(model.history) { item in
+                            Button {
+                                model.openHistory(item)
+                            } label: {
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(item.subject)
+                                            .font(.subheadline.bold())
+                                            .lineLimit(1)
+                                        Text(
+                                            "\(item.startedAt.formatted(date: .abbreviated, time: .shortened)) · "
+                                                + Timecode.display(item.duration),
+                                        )
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        if item.isRecoverable {
+                                            Text("Necesita recuperar el procesamiento")
+                                                .font(.caption2)
+                                                .foregroundStyle(.orange)
+                                        }
                                     }
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                                .background(Color.secondary.opacity(0.06))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
                             }
                             .buttonStyle(.plain)
-                            Button { model.openHistoryFolder(item) } label: {
-                                Image(systemName: "folder")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("Mostrar carpeta en Finder")
+                            .disabled(model.isSessionBusy)
                         }
                     }
                 }
@@ -276,12 +491,14 @@ struct ContentView: View {
                 Text(Timecode.display(speaker.totalSpeakingTime)).font(.caption.monospacedDigit())
             }
             if let sample = speaker.recentFragments.last {
-                Text("“\(sample)”").font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                Text("“\(sample)”")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
             }
             HStack {
-                Text("Confianza \(Int(speaker.confidence * 100)) %").font(.caption2).foregroundStyle(.secondary)
                 Spacer()
-                Button(model.professorSpeakerID == speaker.id ? "Profesor ✓" : "Este es el profesor") {
+                Button(professorButtonTitle(for: speaker)) {
                     model.selectProfessor(speaker.id)
                 }
                 .controlSize(.mini)
@@ -293,36 +510,48 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
+    private func professorButtonTitle(for speaker: SpeakerRecord) -> String {
+        guard model.professorSpeakerID == speaker.id else { return "Elegir como profesor" }
+        return model.professorSelectionIsAutomatic ? "Confirmar profesor" : "Profesor ✓"
+    }
+
     private var transcriptPanel: some View {
         VStack(spacing: 0) {
-            HStack {
-                Picker("Transcripción", selection: $model.selectedTab) {
-                    ForEach(TranscriptTab.allCases) { tab in
-                        Text(tab.rawValue + (tab == .review && !model.reviewItems.isEmpty ? " (\(model.reviewItems.count))" : ""))
+            HStack(spacing: 10) {
+                if model.finalReplacedLive {
+                    Picker("Transcripción", selection: $model.selectedTab) {
+                        ForEach(TranscriptTab.allCases) { tab in
+                            Text(
+                                tab.rawValue
+                                    + (tab == .review && !model.reviewItems.isEmpty
+                                        ? " (\(model.reviewItems.count))"
+                                        : ""),
+                            )
                             .tag(tab)
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 500)
+                } else {
+                    Label(
+                        model.isRecording ? "Transcripción en vivo" : "Transcripción",
+                        systemImage: "text.alignleft",
+                    )
+                    .font(.headline)
                 }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 560)
                 if model.isRecording {
-                    Toggle("Seguir texto", isOn: $followsLiveText)
+                    Toggle("Seguir", isOn: $followsLiveText)
                         .toggleStyle(.switch)
                         .controlSize(.small)
+                        .help("Mantener visible el texto más reciente")
                 }
                 Spacer()
                 if model.isProcessing {
-                    ProgressView().controlSize(.small)
+                    ProgressView()
+                        .controlSize(.small)
                 }
-                Button("Copiar transcripción") { model.copyTranscript() }
-                    .disabled(!model.hasCopyableTranscript)
-                Button("Copiar para ChatGPT") { model.copyForChatGPT() }
-                    .disabled(!model.hasCopyableTranscript)
-                Button("Abrir TXT") { model.openCurrentTXT() }
-                    .disabled(!model.canOpenTXT)
-                Menu("Exportar") {
-                    ForEach(ExportKind.allCases) { kind in
-                        Button(kind.rawValue) { model.export(kind) }
-                    }
+                if model.hasCopyableTranscript || model.currentFolder != nil {
+                    transcriptActions
                 }
             }
             .padding(12)
@@ -333,6 +562,12 @@ struct ContentView: View {
                 liveTranscript
             } else if model.finalReplacedLive && model.selectedTab == .review {
                 reviewPanel
+            } else if !model.hasCopyableTranscript {
+                ContentUnavailableView(
+                    "La transcripción aparecerá aquí",
+                    systemImage: "text.quote",
+                    description: Text("Configura la clase y pulsa Iniciar grabación."),
+                )
             } else {
                 TextEditor(text: editableText)
                     .font(.system(.body, design: .rounded))
@@ -359,6 +594,53 @@ struct ContentView: View {
                 .padding(9)
                 .background(Color.green.opacity(0.08))
             }
+        }
+    }
+
+    private var transcriptActions: some View {
+        Menu {
+            Button {
+                model.copyTranscript()
+            } label: {
+                Label("Copiar transcripción", systemImage: "doc.on.doc")
+            }
+            .disabled(!model.hasCopyableTranscript)
+
+            Button {
+                model.copyForChatGPT()
+            } label: {
+                Label("Copiar con contexto", systemImage: "text.badge.plus")
+            }
+            .disabled(!model.hasCopyableTranscript)
+
+            Divider()
+
+            Button {
+                model.openCurrentTXT()
+            } label: {
+                Label("Abrir archivo de texto", systemImage: "doc.text")
+            }
+            .disabled(!model.canOpenTXT)
+
+            Button {
+                model.openCurrentFolder()
+            } label: {
+                Label("Mostrar carpeta en Finder", systemImage: "folder")
+            }
+            .disabled(model.currentFolder == nil)
+
+            Divider()
+
+            ForEach(ExportKind.allCases) { kind in
+                Button {
+                    model.export(kind)
+                } label: {
+                    Label("Exportar \(kind.rawValue)", systemImage: "square.and.arrow.up")
+                }
+                .disabled(!model.hasCopyableTranscript)
+            }
+        } label: {
+            Label("Acciones", systemImage: "ellipsis.circle")
         }
     }
 
