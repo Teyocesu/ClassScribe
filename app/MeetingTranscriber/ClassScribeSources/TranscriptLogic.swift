@@ -191,14 +191,19 @@ struct LiveTranscriptChunk: Identifiable, Codable, Equatable {
     var createdAt = Date()
     var status: LiveTranscriptChunkStatus
     var revision = 1
+    /// Optional for backwards-compatible decoding of version-2 live snapshots.
+    var paragraphBreakBefore: Bool?
 }
 
 struct LiveTranscriptAccumulator: Codable, Equatable {
     private(set) var committedChunks: [LiveTranscriptChunk] = []
     private(set) var provisionalChunk: LiveTranscriptChunk?
+    /// Optional so snapshots written before paragraph-aware rendering remain
+    /// decodable. `true` is consumed by the next genuinely novel chunk.
+    private var paragraphBreakPending: Bool?
 
     var stableText: String {
-        committedChunks.map(\.text).filter { !$0.isEmpty }.joined(separator: "\n\n")
+        Self.render(committedChunks)
     }
 
     var provisionalText: String {
@@ -206,7 +211,7 @@ struct LiveTranscriptAccumulator: Codable, Equatable {
     }
 
     var visibleText: String {
-        [stableText, provisionalText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        Self.render(committedChunks + [provisionalChunk].compactMap { $0 })
     }
 
     init() {}
@@ -227,11 +232,18 @@ struct LiveTranscriptAccumulator: Codable, Equatable {
         start: TimeInterval? = nil,
         end: TimeInterval? = nil,
         confirmedByPause: Bool,
+        pauseDuration: TimeInterval = 0,
     ) {
         let clean = hypothesis.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else {
             if confirmedByPause {
                 confirmProvisional()
+            }
+            if TranscriptParagraphPolicy.shouldBreakAfter(
+                text: visibleText,
+                trailingSilence: pauseDuration,
+            ) {
+                paragraphBreakPending = true
             }
             return
         }
@@ -242,14 +254,27 @@ struct LiveTranscriptAccumulator: Codable, Equatable {
         // than erasing a paragraph from a class.
         confirmProvisional()
         let novel = OverlapDeduplicator.novelText(stable: stableText, incoming: clean)
-        guard !novel.isEmpty else { return }
+        guard !novel.isEmpty else {
+            if TranscriptParagraphPolicy.shouldBreakAfter(
+                text: clean,
+                trailingSilence: pauseDuration,
+            ) {
+                paragraphBreakPending = true
+            }
+            return
+        }
 
         var chunk = LiveTranscriptChunk(
             start: start,
             end: end,
             text: novel,
             status: confirmedByPause ? .committed : .provisional,
+            paragraphBreakBefore: paragraphBreakPending == true ? true : nil,
         )
+        paragraphBreakPending = TranscriptParagraphPolicy.shouldBreakAfter(
+            text: clean,
+            trailingSilence: pauseDuration,
+        ) ? true : nil
         if confirmedByPause {
             chunk.status = .committed
             committedChunks.append(chunk)
@@ -263,6 +288,42 @@ struct LiveTranscriptAccumulator: Codable, Equatable {
         provisionalChunk.status = .committed
         committedChunks.append(provisionalChunk)
         self.provisionalChunk = nil
+    }
+
+    private static func render(_ chunks: [LiveTranscriptChunk]) -> String {
+        chunks.reduce(into: "") { result, chunk in
+            let text = chunk.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return }
+            if !result.isEmpty {
+                result += chunk.paragraphBreakBefore == true ? "\n\n" : " "
+            }
+            result += text
+        }
+    }
+}
+
+/// A deliberately conservative layout policy. Hesitations of two or three
+/// seconds are common while explaining a topic, so live text only starts a new
+/// paragraph after at least four seconds of silence and a strong sentence end.
+/// Final timed segments additionally use speaker changes as context changes.
+enum TranscriptParagraphPolicy {
+    static let longPause: TimeInterval = 4
+
+    static func shouldBreakAfter(text: String, trailingSilence: TimeInterval) -> Bool {
+        trailingSilence >= longPause && hasStrongSentenceEnding(text)
+    }
+
+    static func shouldBreak(
+        previous: TranscriptSegment,
+        next: TranscriptSegment,
+    ) -> Bool {
+        guard previous.speakerID == next.speakerID else { return true }
+        return max(0, next.start - previous.end) >= longPause
+    }
+
+    private static func hasStrongSentenceEnding(_ text: String) -> Bool {
+        guard let last = text.trimmingCharacters(in: .whitespacesAndNewlines).last else { return false }
+        return ".!?…".contains(last)
     }
 }
 
@@ -352,15 +413,16 @@ enum SpeakerAssignment {
 
 enum TranscriptExporter {
     static func plainText(_ segments: [TranscriptSegment]) -> String {
-        segments.map { "[\($0.formattedTimestamp)] \($0.speakerID): \($0.text)" }
-            .joined(separator: "\n")
+        paragraphs(segments).map { paragraph in
+            "[\(Timecode.display(paragraph.start))] \(paragraph.speakerID): \(paragraph.text)"
+        }.joined(separator: "\n\n")
     }
 
     static func markdown(subject: String, date: Date, segments: [TranscriptSegment]) -> String {
         let dateText = date.formatted(date: .long, time: .shortened)
-        return "# \(subject)\n\n_\(dateText)_\n\n" + segments.map {
-            "- **[\($0.formattedTimestamp)] \($0.speakerID):** \($0.text)"
-        }.joined(separator: "\n") + "\n"
+        return "# \(subject)\n\n_\(dateText)_\n\n" + paragraphs(segments).map { paragraph in
+            "- **[\(Timecode.display(paragraph.start))] \(paragraph.speakerID):** \(paragraph.text)"
+        }.joined(separator: "\n\n") + "\n"
     }
 
     static func markdown(subject: String, date: Date, text: String) -> String {
@@ -372,6 +434,38 @@ enum TranscriptExporter {
         segments.enumerated().map { index, segment in
             "\(index + 1)\n\(Timecode.srt(segment.start)) --> \(Timecode.srt(max(segment.end, segment.start + 0.2)))\n\(segment.text)"
         }.joined(separator: "\n\n") + (segments.isEmpty ? "" : "\n")
+    }
+
+    private struct Paragraph {
+        var start: TimeInterval
+        var speakerID: String
+        var text: String
+        var lastSegment: TranscriptSegment
+    }
+
+    private static func paragraphs(_ segments: [TranscriptSegment]) -> [Paragraph] {
+        var result: [Paragraph] = []
+        for segment in segments {
+            let clean = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { continue }
+            if var current = result.last,
+               !TranscriptParagraphPolicy.shouldBreak(previous: current.lastSegment, next: segment) {
+                // Final segments are already distinct timed ranges. Preserve
+                // intentional repetitions ("no, no", names, formulas) rather
+                // than applying the live-window overlap deduplicator here.
+                current.text += " " + clean
+                current.lastSegment = segment
+                result[result.count - 1] = current
+            } else {
+                result.append(Paragraph(
+                    start: segment.start,
+                    speakerID: segment.speakerID,
+                    text: clean,
+                    lastSegment: segment,
+                ))
+            }
+        }
+        return result
     }
 }
 

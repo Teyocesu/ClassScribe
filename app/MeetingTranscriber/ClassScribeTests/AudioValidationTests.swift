@@ -163,6 +163,52 @@ func liveAudioWaitAcceptsSilentFramesAndTimesOutWithoutCallbacks() async throws 
 }
 
 @Test
+func trailingSilenceDurationDistinguishesThinkingPauseFromLongPause() async {
+    let store = LiveAudioBufferStore()
+    var generation = await store.reset()
+    await store.append(
+        LiveAudioBuffer(
+            samples: Array(repeating: Float(0.2), count: 16_000)
+                + Array(repeating: 0, count: 44_800), // 2.8 s
+            channelCount: 1,
+            sampleRate: 16_000,
+            hostTime: 0,
+        ),
+        generation: generation,
+    )
+    let thinkingPause = await store.recentSilenceDuration()
+    #expect(abs(thinkingPause - 2.8) < 0.01)
+    #expect(await store.hasRecentPause())
+    #expect(thinkingPause < TranscriptParagraphPolicy.longPause)
+
+    let thinkingPauseBoundary = await store.totalSamples()
+    await store.append(
+        LiveAudioBuffer(
+            samples: Array(repeating: Float(0.2), count: 1_600),
+            channelCount: 1,
+            sampleRate: 16_000,
+            hostTime: 0,
+        ),
+        generation: generation,
+    )
+    #expect(await store.recentSilenceDuration() == 0)
+    #expect(abs(await store.recentSilenceDuration(endingAt: thinkingPauseBoundary) - 2.8) < 0.01)
+
+    generation = await store.reset()
+    await store.append(
+        LiveAudioBuffer(
+            samples: Array(repeating: Float(0.2), count: 16_000)
+                + Array(repeating: 0, count: 67_200), // 4.2 s
+            channelCount: 1,
+            sampleRate: 16_000,
+            hostTime: 0,
+        ),
+        generation: generation,
+    )
+    #expect(await store.recentSilenceDuration() >= TranscriptParagraphPolicy.longPause)
+}
+
+@Test
 func emptyNon16kCallbackIsIgnoredWithoutIndexingAnEmptyBuffer() async {
     let store = LiveAudioBufferStore()
     let generation = await store.reset()

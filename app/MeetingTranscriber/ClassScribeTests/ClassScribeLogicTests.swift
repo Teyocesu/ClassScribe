@@ -54,6 +54,27 @@ func exports() {
     #expect(TranscriptExporter.srt(segments).contains("00:00:01,200 --> 00:00:03,400"))
 }
 
+@Test("La transcripción final agrupa pausas naturales y separa cambios claros")
+func finalTranscriptParagraphs() {
+    let segments = [
+        TranscriptSegment(start: 0, end: 2, text: "Primera idea.", speakerID: "Persona 1", confidence: 1),
+        // A 2.8-second hesitation is still the same explanation.
+        TranscriptSegment(start: 4.8, end: 7, text: "La idea continúa.", speakerID: "Persona 1", confidence: 1),
+        // Four seconds of silence is a clear paragraph boundary.
+        TranscriptSegment(start: 11, end: 13, text: "Nuevo punto.", speakerID: "Persona 1", confidence: 1),
+        // A speaker change is a context boundary even without a long pause.
+        TranscriptSegment(start: 13.1, end: 15, text: "Tengo una pregunta.", speakerID: "Persona 2", confidence: 1),
+    ]
+
+    let text = TranscriptExporter.plainText(segments)
+    let paragraphs = text.components(separatedBy: "\n\n")
+    #expect(paragraphs.count == 3)
+    #expect(paragraphs[0].contains("Primera idea. La idea continúa."))
+    #expect(!paragraphs[0].contains("[00:04]"))
+    #expect(paragraphs[1].contains("Nuevo punto."))
+    #expect(paragraphs[2].contains("Persona 2"))
+}
+
 @Test("El WAV Float32 generado es legible y no está vacío")
 func wavValidation() throws {
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

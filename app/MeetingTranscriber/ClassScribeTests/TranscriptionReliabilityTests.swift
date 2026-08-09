@@ -4,11 +4,22 @@ import Testing
 
 private actor SingleFlightProbe {
     private(set) var calls = 0
+    private var callWaiters: [CheckedContinuation<Void, Never>] = []
 
     func load(after delay: Duration = .milliseconds(180)) async throws -> Int {
         calls += 1
+        let waiters = callWaiters
+        callWaiters.removeAll()
+        waiters.forEach { $0.resume() }
         try await Task.sleep(for: delay)
         return 42
+    }
+
+    func waitUntilCalled() async {
+        guard calls == 0 else { return }
+        await withCheckedContinuation { continuation in
+            callWaiters.append(continuation)
+        }
     }
 }
 
@@ -47,9 +58,7 @@ func cancelledModelWaiterDoesNotCancelSharedLoad() async throws {
     let probe = SingleFlightProbe()
     let first = Task { try await flight.value { try await probe.load(after: .milliseconds(300)) } }
 
-    for _ in 0 ..< 200 where await probe.calls == 0 {
-        await Task.yield()
-    }
+    await probe.waitUntilCalled()
     #expect(await probe.calls == 1)
     let second = Task { try await flight.value { try await probe.load() } }
     let cancelledAt = Date()

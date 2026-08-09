@@ -92,14 +92,42 @@ actor LiveAudioBufferStore {
         return (Array(samples[lower ..< upper]), Double(start) / Double(sampleRate))
     }
 
+    /// Measures trailing silence in short windows instead of treating every
+    /// ordinary hesitation as a paragraph boundary. The live transcript can
+    /// still confirm a hypothesis after a brief pause while reserving layout
+    /// breaks for substantially longer silence.
+    func recentSilenceDuration(
+        maximumMilliseconds: Int = 8_000,
+        analysisWindowMilliseconds: Int = 100,
+        thresholdDBFS: Double = -43,
+        endingAt endIndex: Int64? = nil,
+    ) -> TimeInterval {
+        let end = min(endIndex ?? totalSampleCount, totalSampleCount)
+        guard end > baseSampleIndex else { return 0 }
+        let retainedCount = Int(end - baseSampleIndex)
+        let maximumCount = min(retainedCount, sampleRate * max(0, maximumMilliseconds) / 1_000)
+        guard maximumCount > 0 else { return 0 }
+
+        let windowCount = max(1, sampleRate * max(1, analysisWindowMilliseconds) / 1_000)
+        let silencePower = pow(10, thresholdDBFS / 10)
+        var silentSamples = 0
+        let retainedEnd = retainedStartOffset + retainedCount
+        guard retainedEnd <= samples.count else { return 0 }
+        while silentSamples < maximumCount {
+            let count = min(windowCount, maximumCount - silentSamples)
+            let upper = retainedEnd - silentSamples
+            let lower = upper - count
+            let meanSquare = samples[lower ..< upper]
+                .reduce(0.0) { $0 + Double($1 * $1) } / Double(count)
+            guard meanSquare < silencePower else { break }
+            silentSamples += count
+        }
+        return Double(silentSamples) / Double(sampleRate)
+    }
+
     func hasRecentPause(milliseconds: Int = 550) -> Bool {
-        let retainedCount = samples.count - retainedStartOffset
-        let count = min(retainedCount, sampleRate * milliseconds / 1000)
-        guard count > 0 else { return true }
-        let tail = samples.suffix(count)
-        let meanSquare = tail.reduce(0.0) { $0 + Double($1 * $1) } / Double(count)
-        let db = meanSquare > 0 ? 10 * log10(meanSquare) : -120
-        return db < -43
+        recentSilenceDuration(maximumMilliseconds: milliseconds)
+            >= Double(milliseconds) / 1_000
     }
 
     private static func mono16k(_ buffer: LiveAudioBuffer) -> [Float] {

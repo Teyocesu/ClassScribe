@@ -4,6 +4,7 @@ import Observation
 import UniformTypeIdentifiers
 
 enum TranscriptTab: String, CaseIterable, Identifiable {
+    case liveEdit = "Mi edición"
     case professor = "Profesor"
     case everyone = "Todos los hablantes"
     case review = "Revisar"
@@ -90,9 +91,11 @@ final class ClassScribeModel {
     private var stopTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
     private var calibrationTask: Task<Void, Never>?
+    private var liveEditPersistenceTask: Task<Void, Never>?
     private var finalJobID: UUID?
     private var retryJobID: UUID?
     private var accumulator = LiveTranscriptAccumulator()
+    private var liveEditReconciler = LiveTranscriptEditReconciler()
     private var technicalVocabularyURL: URL?
     private var activeSession: ClassSessionContext?
     private var liveTranscriptionError: String?
@@ -157,6 +160,8 @@ final class ClassScribeModel {
             return editedLiveText ?? liveVisibleText
         }
         switch selectedTab {
+        case .liveEdit:
+            return editedLiveText ?? liveVisibleText
         case .professor:
             let professor = editedProfessorText ?? TranscriptExporter.plainText(professorSegments)
             if !professor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -171,15 +176,31 @@ final class ClassScribeModel {
     }
 
     var liveVisibleText: String {
-        let separator = stableLiveText.isEmpty || provisionalLiveText.isEmpty ? "" : "\n\n"
-        return stableLiveText + separator + provisionalLiveText
+        accumulator.visibleText
+    }
+
+    /// The user-owned live transcript. ASR continues on its own accumulator;
+    /// new windows are reconciled into this value without overwriting edits.
+    var liveEditableText: String {
+        get { editedLiveText ?? liveVisibleText }
+        set { updateEditedLiveText(newValue) }
     }
 
     var bestAvailableText: String {
+        // An explicit live edit is user-owned even when it is empty. Falling
+        // back to ASR here would make Copy/Export resurrect text they deleted.
+        if !finalReplacedLive, let editedLiveText {
+            return editedLiveText
+        }
+        if finalReplacedLive, selectedTab == .liveEdit {
+            return editedLiveText ?? liveVisibleText
+        }
         let selectedText: String? = if !finalReplacedLive {
-            editedLiveText ?? liveVisibleText
+            liveVisibleText
         } else {
             switch selectedTab {
+            case .liveEdit:
+                editedLiveText ?? liveVisibleText
             case .professor:
                 displayedText
             case .everyone, .review:
@@ -227,9 +248,18 @@ final class ClassScribeModel {
     }
 
     var selectedExportHasFreeformEdit: Bool {
-        selectedTab == .professor && !professorSegments.isEmpty
-            ? editedProfessorText != nil
-            : editedAllText != nil
+        switch selectedTab {
+        case .liveEdit:
+            true
+        case .professor where !professorSegments.isEmpty:
+            editedProfessorText != nil
+        case .professor, .everyone, .review:
+            editedAllText != nil
+        }
+    }
+
+    var availableTranscriptTabs: [TranscriptTab] {
+        TranscriptTab.allCases.filter { $0 != .liveEdit || editedLiveText != nil }
     }
 
     func refreshSources() {
@@ -245,6 +275,7 @@ final class ClassScribeModel {
     func startClass() async {
         guard canStart else { return }
         cancelCalibration()
+        guard flushEditedLiveText() else { return }
         errorMessage = nil
         liveTranscriptionError = nil
         finalReplacedLive = false
@@ -263,6 +294,7 @@ final class ClassScribeModel {
         elapsed = 0
         selectedTab = .professor
         accumulator = LiveTranscriptAccumulator()
+        liveEditReconciler.reset()
         let now = Date()
         do {
             let folder = try store.createFolder(subject: subject, date: now)
@@ -532,13 +564,28 @@ final class ClassScribeModel {
     func updateEditedLiveText(_ text: String) {
         editedLiveText = text
         guard let session = activeSession else { return }
+        scheduleLiveEditPersistence(text: text, session: session)
+    }
+
+    /// Forces the debounced edit to disk. The live editor calls this when it
+    /// loses focus; Stop also flushes through `checkpointLive`.
+    @discardableResult
+    func flushEditedLiveText() -> Bool {
+        liveEditPersistenceTask?.cancel()
+        liveEditPersistenceTask = nil
+        guard let text = editedLiveText, let session = activeSession else { return true }
         do {
             try store.saveReadableLiveText(
                 text: text,
                 context: liveContext(session: session),
                 folder: session.folder,
+                recordsEditOverride: true,
             )
-        } catch { errorMessage = "No se pudo guardar la edición: \(error.localizedDescription)" }
+            return true
+        } catch {
+            errorMessage = "No se pudo guardar la edición: \(error.localizedDescription)"
+            return false
+        }
     }
 
     func updateEditedProfessorText(_ text: String) {
@@ -572,6 +619,7 @@ final class ClassScribeModel {
     func openHistory(_ summary: SessionSummary) {
         guard !isSessionBusy else { return }
         cancelCalibration()
+        guard flushEditedLiveText() else { return }
         let restored = store.restore(summary)
         let metadata = restored.metadata
         classFolder = summary.folder
@@ -583,6 +631,7 @@ final class ClassScribeModel {
         professorSpeakerID = metadata.professorSpeakerID
         professorSelectionIsAutomatic = metadata.professorSelectionIsAutomatic
         accumulator = restored.liveAccumulator
+        liveEditReconciler.reset(asrText: accumulator.visibleText)
         syncLiveTextFromAccumulator()
         allSegments = restored.allSegments
         speakers = restored.speakers
@@ -597,6 +646,9 @@ final class ClassScribeModel {
             || restored.preferredTextSource == .everyone
             || !allSegments.isEmpty
         selectedTab = restored.preferredTextSource == .professor ? .professor : .everyone
+        if finalReplacedLive, editedLiveText != nil {
+            selectedTab = .liveEdit
+        }
         state = summary.state
         statusDetail = summary.isRecoverable
             ? "Sesión recuperable cargada. El audio y el mejor texto disponible permanecen intactos."
@@ -783,6 +835,11 @@ final class ClassScribeModel {
                     )
                 }
                 guard let window else { continue }
+                // Measure the pause at the edge of this exact ASR window. Core
+                // ML may return later, after newer speech has entered the ring.
+                let pauseDuration = await self.capture.liveStore.recentSilenceDuration(
+                    endingAt: windowEnd,
+                )
                 let began = Date()
                 do {
                     self.state = .loadingModel
@@ -799,7 +856,7 @@ final class ClassScribeModel {
                         resumeAtLatestWindow = true
                         continue
                     }
-                    let pause = await self.capture.liveStore.hasRecentPause()
+                    let pause = pauseDuration >= 0.55
                     try Task.checkCancellation()
                     guard self.activeSession?.id == session.id, self.isRecording else { break }
                     guard !self.isTranscriptionPaused else {
@@ -811,6 +868,7 @@ final class ClassScribeModel {
                         start: window.start,
                         end: Double(windowEnd) / 16000,
                         confirmedByPause: pause,
+                        pauseDuration: pauseDuration,
                     )
                     cursor.commit(windowEndingAt: windowEnd)
                     retryPolicy.recordSuccess()
@@ -822,8 +880,8 @@ final class ClassScribeModel {
                     self.transcriptionLatency = Date().timeIntervalSince(began) + 1.5
                     self.state = .recording
                     self.statusDetail = pause
-                        ? "Fragmento confirmado tras una pausa de voz."
-                        : "Texto tenue = hipótesis provisional pendiente de confirmar."
+                        ? "Texto actualizado. Puedes corregirlo mientras la grabación continúa."
+                        : "Puedes corregir el texto mientras la grabación continúa."
                     do { try self.checkpointLive("asr-window", session: session) }
                     catch { self.errorMessage = "No se pudo actualizar live-transcript.txt: \(error.localizedDescription)" }
                 } catch is CancellationError {
@@ -898,7 +956,9 @@ final class ClassScribeModel {
                     )
                 }
                 self.finalReplacedLive = true
-                if self.professorSegments.isEmpty {
+                if self.editedLiveText != nil {
+                    self.selectedTab = .liveEdit
+                } else if self.professorSegments.isEmpty {
                     self.selectedTab = .everyone
                 }
                 self.state = .diarizing
@@ -915,7 +975,9 @@ final class ClassScribeModel {
                 self.finalReplacedLive = true
                 self.state = .complete
                 self.statusDetail = vocabularyWarning
-                    ?? "La transcripción final reemplazó a la versión provisional."
+                    ?? (self.editedLiveText == nil
+                        ? "La transcripción final reemplazó a la versión provisional."
+                        : "La versión final está lista y tus correcciones permanecen en Mi edición.")
                 if !self.persistFinalOutputs(session: session) {
                     self.state = .recoverable
                     self.statusDetail = "El texto sigue disponible, pero no se pudieron confirmar todas las salidas finales."
@@ -1071,6 +1133,10 @@ final class ClassScribeModel {
     }
 
     private func checkpointLive(_ checkpoint: String, session: ClassSessionContext) throws {
+        // A checkpoint is also an immediate flush of the latest edit. Cancel a
+        // pending typing debounce so it cannot rewrite this newer snapshot.
+        liveEditPersistenceTask?.cancel()
+        liveEditPersistenceTask = nil
         try store.saveLive(
             accumulator: accumulator,
             context: LiveTranscriptContext(
@@ -1108,24 +1174,73 @@ final class ClassScribeModel {
         )
     }
 
+    private func scheduleLiveEditPersistence(text: String, session: ClassSessionContext) {
+        liveEditPersistenceTask?.cancel()
+        liveEditPersistenceTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .milliseconds(300)) }
+            catch { return }
+            guard let self,
+                  self.activeSession?.id == session.id,
+                  self.editedLiveText == text else { return }
+            do {
+                try self.store.saveReadableLiveText(
+                    text: text,
+                    context: self.liveContext(session: session),
+                    folder: session.folder,
+                    recordsEditOverride: true,
+                )
+            } catch {
+                self.errorMessage = "No se pudo guardar la edición: \(error.localizedDescription)"
+            }
+            self.liveEditPersistenceTask = nil
+        }
+    }
+
     private func refreshHistory() {
         history = store.scanSessions()
     }
 
-    private var currentReadableTextURL: URL? {
+    var currentReadableTextURL: URL? {
         guard let folder = classFolder else { return nil }
+        let existing: ([String]) -> URL? = { candidates in
+            candidates.map { folder.appendingPathComponent($0) }
+                .first { FileManager.default.fileExists(atPath: $0.path) }
+        }
+        if selectedTab == .liveEdit || !finalReplacedLive,
+           let live = existing(["live-transcript.txt"]) {
+            return live
+        }
+        if finalReplacedLive {
+            let selectedCandidates: [String] = switch selectedTab {
+            case .liveEdit:
+                ["live-transcript.txt"]
+            case .professor where !professorSegments.isEmpty || editedProfessorText != nil:
+                ["professor.txt", "all-speakers.txt"]
+            case .professor, .everyone, .review:
+                ["all-speakers.txt", "professor.txt"]
+            }
+            if let selected = existing(selectedCandidates) {
+                return selected
+            }
+        }
         if let summary = history.first(where: { $0.folder.standardizedFileURL == folder.standardizedFileURL }),
            let url = summary.preferredTextURL {
             return url
         }
         let candidates = ["professor.txt", "all-speakers.txt", "recovered-transcript.txt", "live-transcript.txt"]
-        return candidates.map { folder.appendingPathComponent($0) }
-            .first { FileManager.default.fileExists(atPath: $0.path) }
+        return existing(candidates)
     }
 
     private func syncLiveTextFromAccumulator() {
+        let updatedASRText = accumulator.visibleText
         stableLiveText = accumulator.stableText
         provisionalLiveText = accumulator.provisionalText
+        if let reconciled = liveEditReconciler.reconcile(
+            editedText: editedLiveText,
+            updatedASRText: updatedASRText,
+        ) {
+            editedLiveText = reconciled
+        }
     }
 
     private func cancelCalibration() {

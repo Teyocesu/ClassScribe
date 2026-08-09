@@ -70,6 +70,53 @@ func pauseAndStopPreserveLastProvisional() {
 }
 
 @Test
+func ordinaryThinkingPauseKeepsLiveTranscriptInOneParagraph() {
+    var accumulator = LiveTranscriptAccumulator()
+    accumulator.accept(
+        "La derivada nos indica la pendiente.",
+        end: 4,
+        confirmedByPause: true,
+        pauseDuration: 2.8,
+    )
+    accumulator.accept(
+        "Ahora podemos buscar el mínimo.",
+        start: 6.8,
+        confirmedByPause: false,
+    )
+
+    #expect(accumulator.visibleText
+        == "La derivada nos indica la pendiente. Ahora podemos buscar el mínimo.")
+    #expect(!accumulator.visibleText.contains("\n"))
+}
+
+@Test
+func longCompletedThoughtStartsNewLiveParagraph() {
+    var accumulator = LiveTranscriptAccumulator()
+    accumulator.accept(
+        "Con esto termina la primera demostración.",
+        confirmedByPause: true,
+        pauseDuration: 4.2,
+    )
+    accumulator.accept("Pasemos al siguiente teorema.", confirmedByPause: false)
+
+    #expect(accumulator.visibleText
+        == "Con esto termina la primera demostración.\n\nPasemos al siguiente teorema.")
+}
+
+@Test
+func longSilenceWithoutSentenceClosureDoesNotForceLiveParagraph() {
+    var accumulator = LiveTranscriptAccumulator()
+    accumulator.accept(
+        "si despejamos la variable",
+        confirmedByPause: true,
+        pauseDuration: 5,
+    )
+    accumulator.accept("obtenemos este resultado", confirmedByPause: false)
+
+    #expect(!accumulator.visibleText.contains("\n"))
+}
+
+@Test
 func oneHundredWindowsPreserveAllFragments() {
     var accumulator = LiveTranscriptAccumulator()
     var committedCounts: [Int] = []

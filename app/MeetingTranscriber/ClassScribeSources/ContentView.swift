@@ -53,8 +53,8 @@ enum CaptureStartGuidance: Equatable {
 
 struct ContentView: View {
     @Bindable var model: ClassScribeModel
-    @State private var followsLiveText = true
     @State private var showsTechnicalVocabulary = false
+    @FocusState private var liveEditorFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -520,7 +520,7 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 if model.finalReplacedLive {
                     Picker("Transcripción", selection: $model.selectedTab) {
-                        ForEach(TranscriptTab.allCases) { tab in
+                        ForEach(model.availableTranscriptTabs) { tab in
                             Text(
                                 tab.rawValue
                                     + (tab == .review && !model.reviewItems.isEmpty
@@ -538,12 +538,6 @@ struct ContentView: View {
                         systemImage: "text.alignleft",
                     )
                     .font(.headline)
-                }
-                if model.isRecording {
-                    Toggle("Seguir", isOn: $followsLiveText)
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                        .help("Mantener visible el texto más reciente")
                 }
                 Spacer()
                 if model.isProcessing {
@@ -576,7 +570,25 @@ struct ContentView: View {
                     .background(Color(nsColor: .textBackgroundColor))
             }
 
-            if let warning = model.professorUnavailableWarning, model.selectedTab == .professor {
+            if model.isRecording {
+                HStack {
+                    Image(systemName: "pencil.line").foregroundStyle(.indigo)
+                    Text("Puedes corregir el texto mientras la grabación continúa; las frases nuevas se agregarán al final.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(9)
+                .background(Color.indigo.opacity(0.06))
+            } else if model.finalReplacedLive, model.selectedTab == .liveEdit {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("Tus correcciones se conservaron. Puedes compararlas con la transcripción final en las otras pestañas.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(9)
+                .background(Color.green.opacity(0.08))
+            } else if let warning = model.professorUnavailableWarning, model.selectedTab == .professor {
                 HStack {
                     Image(systemName: "person.crop.circle.badge.questionmark").foregroundStyle(.orange)
                     Text(warning).font(.caption).foregroundStyle(.secondary)
@@ -645,31 +657,35 @@ struct ContentView: View {
     }
 
     private var liveTranscript: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(model.stableLiveText.isEmpty ? "La transcripción aparecerá aquí mientras habla el profesor…" : model.stableLiveText)
-                        .foregroundStyle(model.stableLiveText.isEmpty ? .secondary : .primary)
-                        .textSelection(.enabled)
-                    if !model.provisionalLiveText.isEmpty {
-                        Text(model.provisionalLiveText)
-                            .italic()
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
-                    Color.clear.frame(height: 1).id("live-transcript-bottom")
-                }
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-                .padding(18)
-            }
-            .onChange(of: model.liveVisibleText) {
-                guard followsLiveText else { return }
-                withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo("live-transcript-bottom", anchor: .bottom)
-                }
+        ZStack(alignment: .topLeading) {
+            TextEditor(text: liveEditableText)
+                .font(.system(.body, design: .rounded))
+                .scrollContentBackground(.hidden)
+                .padding(10)
+                .focused($liveEditorFocused)
+                .accessibilityLabel("Transcripción en vivo editable")
+            if model.liveEditableText.isEmpty {
+                Text("La transcripción aparecerá aquí mientras habla el profesor…")
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 15)
+                    .padding(.vertical, 18)
+                    .allowsHitTesting(false)
             }
         }
+        .onChange(of: liveEditorFocused) { _, focused in
+            if !focused {
+                model.flushEditedLiveText()
+            }
+        }
+        .onDisappear { _ = model.flushEditedLiveText() }
         .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private var liveEditableText: Binding<String> {
+        Binding(
+            get: { model.liveEditableText },
+            set: { model.liveEditableText = $0 },
+        )
     }
 
     private var editableText: Binding<String> {
@@ -679,6 +695,8 @@ struct ContentView: View {
                     return model.editedLiveText ?? model.liveVisibleText
                 }
                 switch model.selectedTab {
+                case .liveEdit:
+                    return model.editedLiveText ?? model.liveVisibleText
                 case .professor:
                     return model.editedProfessorText
                         ?? (model.professorSegments.isEmpty
@@ -691,6 +709,8 @@ struct ContentView: View {
             },
             set: { newValue in
                 if !model.finalReplacedLive {
+                    model.updateEditedLiveText(newValue)
+                } else if model.selectedTab == .liveEdit {
                     model.updateEditedLiveText(newValue)
                 } else if model.selectedTab == .professor, !model.professorSegments.isEmpty {
                     model.updateEditedProfessorText(newValue)
