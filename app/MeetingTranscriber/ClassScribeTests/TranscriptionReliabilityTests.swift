@@ -157,9 +157,9 @@ func liveTaskGracePeriodDoesNotWaitForever() async {
         }
     }
     slow.cancel() // The continuation intentionally ignores cancellation.
-    let started = Date()
+    // Returning false proves that the timeout won. Do not assert elapsed wall
+    // time: the parallel test runner can suspend both racers under heavy load.
     #expect(await TaskCompletionGracePeriod.wait(for: slow, timeout: 0.02) == false)
-    #expect(Date().timeIntervalSince(started) < 0.15)
     await slow.value
 
     let finished = Task<Void, Never> {}

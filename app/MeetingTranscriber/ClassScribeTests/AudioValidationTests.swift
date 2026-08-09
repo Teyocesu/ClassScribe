@@ -259,7 +259,10 @@ func audioProcessStartupWaitRetriesTransientRegistration() async throws {
     let probe = RegistrationProbe(succeedingOnAttempt: 3)
     let ready = try await AudioProcessStartupWaiter.waitUntilRegistered(
         pids: [123],
-        timeout: 1,
+        // The full suite runs tests concurrently and can starve this task for
+        // more than a second on a small Mac. A generous deadline keeps the
+        // assertion about retry count rather than scheduler timing.
+        timeout: 30,
         pollInterval: 0.001,
         registrationProbe: { _ in probe.poll() },
     )
