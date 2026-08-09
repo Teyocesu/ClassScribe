@@ -10,7 +10,7 @@ enum CaptureMode: String, Codable, CaseIterable, Identifiable {
 enum ProcessingState: String, Codable {
     case ready = "Lista"
     case startingCapture = "Esperando audio de la fuente"
-    case loadingModel = "Descargando/cargando modelos"
+    case loadingModel = "Preparando transcripción"
     case recording = "Grabando"
     case transcriptionPaused = "Grabando · transcripción pausada"
     case stopping = "Guardando transcripción"

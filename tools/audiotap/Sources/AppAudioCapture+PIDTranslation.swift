@@ -4,6 +4,15 @@ import Foundation
 /// Translates PIDs to CoreAudio process `AudioObjectID`s for `CATapDescription`.
 @available(macOS 14.2, *)
 extension AppAudioCapture {
+    /// Whether CoreAudio has published an audio-process object for at least one
+    /// candidate PID. A freshly launched player can be alive for a short window
+    /// before this becomes true; hosts use this probe to await registration
+    /// asynchronously instead of blocking the main actor or failing the first
+    /// capture attempt.
+    public static func hasRegisteredAudioProcess(in pids: [pid_t]) -> Bool {
+        pids.contains { translatePID($0) != nil }
+    }
+
     /// Translate every stored PID and return (pid, audioObjectID) pairs.
     /// PIDs that fail translation (helper has no audio-object entry, process
     /// exited between enumeration and tap creation) are dropped — that's

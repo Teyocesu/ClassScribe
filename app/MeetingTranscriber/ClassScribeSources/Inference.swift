@@ -2,8 +2,198 @@
 import FluidAudio
 import Foundation
 
+/// A cancellation-aware, shared async value. The first caller starts the
+/// operation; concurrent callers await that same task and a cancelled waiter
+/// leaves the shared work running for the remaining callers.
+///
+/// Keeping this separate from `ParakeetService` makes the actor-reentrancy
+/// guarantee explicit and unit-testable without downloading Core ML models.
+actor AsyncSingleFlight<Value: Sendable> {
+    private enum State {
+        case idle
+        case loading(id: UUID, task: Task<Value, Error>)
+        case ready(Value)
+    }
+
+    private var state: State = .idle
+
+    func value(
+        operation: @escaping @Sendable () async throws -> Value,
+    ) async throws -> Value {
+        try Task.checkCancellation()
+
+        let flight: (id: UUID, task: Task<Value, Error>)
+        switch state {
+        case let .ready(value):
+            return value
+        case let .loading(id, task):
+            flight = (id, task)
+        case .idle:
+            let id = UUID()
+            let task = Task.detached(priority: .userInitiated) {
+                try await operation()
+            }
+            state = .loading(id: id, task: task)
+            flight = (id, task)
+
+            // A waiter can be cancelled while the shared load continues. This
+            // observer still commits success (or resets failure) so the next
+            // caller never starts a duplicate load after the original ended.
+            Task.detached(priority: .utility) { [weak self] in
+                let result = await task.result
+                await self?.finish(id: id, result: result)
+            }
+        }
+
+        do {
+            let value = try await CancellableTaskWait.value(of: flight.task)
+            finish(id: flight.id, result: .success(value))
+            // Cache the successfully loaded value even if cancellation raced
+            // with completion, but do not let the cancelled caller continue.
+            try Task.checkCancellation()
+            return value
+        } catch is CancellationError {
+            // Cancellation belongs to this waiter. The observer above owns the
+            // shared task's eventual state transition.
+            throw CancellationError()
+        } catch {
+            finish(id: flight.id, result: .failure(error))
+            throw error
+        }
+    }
+
+    private func finish(id: UUID, result: Result<Value, Error>) {
+        guard case let .loading(currentID, _) = state, currentID == id else { return }
+        switch result {
+        case let .success(value):
+            state = .ready(value)
+        case .failure:
+            state = .idle
+        }
+    }
+}
+
+/// Serializes non-reentrant inference while allowing a cancelled caller to stop
+/// waiting immediately. The cancelled operation remains the queue head until
+/// Core ML actually returns, preventing a final-file transcription from
+/// overlapping an older live prediction that ignored cancellation.
+actor AsyncSerialExecutor {
+    private var tail: Task<Void, Never>?
+
+    func run<Value: Sendable>(
+        operation: @escaping @Sendable () async throws -> Value,
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        let predecessor = tail
+        let operationTask = Task.detached(priority: Task.currentPriority) {
+            await predecessor?.value
+            try Task.checkCancellation()
+            return try await operation()
+        }
+        tail = Task.detached(priority: .utility) {
+            _ = try? await operationTask.value
+        }
+
+        return try await withTaskCancellationHandler {
+            try await CancellableTaskWait.value(of: operationTask)
+        } onCancel: {
+            operationTask.cancel()
+        }
+    }
+}
+
+/// Bridges `Task.value` so cancellation stops waiting immediately without
+/// cancelling the unstructured shared task itself.
+private enum CancellableTaskWait {
+    static func value<Value: Sendable>(of task: Task<Value, Error>) async throws -> Value {
+        let box = CancellableTaskWaitBox<Value>()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                box.install(continuation)
+                Task.detached(priority: .utility) {
+                    box.resolve(await task.result)
+                }
+            }
+        } onCancel: {
+            box.cancel()
+        }
+    }
+}
+
+private final class CancellableTaskWaitBox<Value: Sendable>: @unchecked Sendable {
+    private enum State {
+        case pending
+        case waiting(CheckedContinuation<Value, Error>)
+        case resolved(Result<Value, Error>)
+        case cancelled
+        case finished
+    }
+
+    private let lock = NSLock()
+    private var state: State = .pending
+
+    func install(_ continuation: CheckedContinuation<Value, Error>) {
+        let outcome: Result<Value, Error>?
+        lock.lock()
+        switch state {
+        case .pending:
+            state = .waiting(continuation)
+            outcome = nil
+        case let .resolved(result):
+            state = .finished
+            outcome = result
+        case .cancelled:
+            state = .finished
+            outcome = .failure(CancellationError())
+        case .waiting, .finished:
+            lock.unlock()
+            preconditionFailure("Continuation installed more than once")
+        }
+        lock.unlock()
+        if let outcome {
+            continuation.resume(with: outcome)
+        }
+    }
+
+    func resolve(_ result: Result<Value, Error>) {
+        let continuation: CheckedContinuation<Value, Error>?
+        lock.lock()
+        switch state {
+        case .pending:
+            state = .resolved(result)
+            continuation = nil
+        case let .waiting(waiting):
+            state = .finished
+            continuation = waiting
+        case .resolved, .cancelled, .finished:
+            continuation = nil
+        }
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+
+    func cancel() {
+        let continuation: CheckedContinuation<Value, Error>?
+        lock.lock()
+        switch state {
+        case .pending, .resolved:
+            state = .cancelled
+            continuation = nil
+        case let .waiting(waiting):
+            state = .finished
+            continuation = waiting
+        case .cancelled, .finished:
+            continuation = nil
+        }
+        lock.unlock()
+        continuation?.resume(throwing: CancellationError())
+    }
+}
+
 actor ParakeetService {
-    private var manager: AsrManager?
+    private let modelLoad = AsyncSingleFlight<AsrManager>()
+    private let inferenceQueue = AsyncSerialExecutor()
     private(set) var downloadProgress = 0.0
     private struct VocabularyBooster {
         let context: CustomVocabularyContext
@@ -12,45 +202,69 @@ actor ParakeetService {
     }
     private var vocabularyBooster: VocabularyBooster?
     private var configuredVocabularyPath: String?
+    private var vocabularyGeneration = 0
 
     func loadIfNeeded() async throws {
-        guard manager == nil else { return }
-        downloadProgress = 0
-        let models = try await AsrModels.downloadAndLoad(version: .v3) { [weak self] progress in
-            Task { await self?.setDownloadProgress(progress.fractionCompleted) }
+        _ = try await loadedManager()
+    }
+
+    private func loadedManager() async throws -> AsrManager {
+        try Task.checkCancellation()
+        let manager = try await modelLoad.value { [weak self] in
+            await self?.setDownloadProgress(0)
+            let models = try await AsrModels.downloadAndLoad(version: .v3) { [weak self] progress in
+                Task { await self?.setDownloadProgress(progress.fractionCompleted) }
+            }
+            try Task.checkCancellation()
+            let asr = AsrManager(config: ASRConfig(
+                parallelChunkConcurrency: 2,
+                melChunkContext: false,
+                dualDecodeArbitration: true
+            ))
+            try await asr.loadModels(models)
+            try Task.checkCancellation()
+            await self?.setDownloadProgress(1)
+            return asr
         }
-        let asr = AsrManager(config: ASRConfig(
-            parallelChunkConcurrency: 2,
-            melChunkContext: false,
-            dualDecodeArbitration: true
-        ))
-        try await asr.loadModels(models)
-        manager = asr
-        downloadProgress = 1
+        try Task.checkCancellation()
+        return manager
     }
 
     func transcribe(samples: [Float]) async throws -> String {
-        try await loadIfNeeded()
-        guard let manager else { throw InferenceError.modelUnavailable }
-        var state = await TdtDecoderState.make(decoderLayers: manager.decoderLayerCount)
-        let result = try await manager.transcribe(samples, decoderState: &state, language: .spanish)
+        try Task.checkCancellation()
+        let manager = try await loadedManager()
+        try Task.checkCancellation()
+        let result = try await inferenceQueue.run {
+            var state = await TdtDecoderState.make(decoderLayers: manager.decoderLayerCount)
+            try Task.checkCancellation()
+            return try await manager.transcribe(samples, decoderState: &state, language: .spanish)
+        }
+        try Task.checkCancellation()
         return result.text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func transcribe(file: URL) async throws -> [TranscriptSegment] {
-        try await loadIfNeeded()
-        guard let manager else { throw InferenceError.modelUnavailable }
-        var state = await TdtDecoderState.make(decoderLayers: manager.decoderLayerCount)
-        let result = try await manager.transcribe(file, decoderState: &state, language: .spanish)
+        try Task.checkCancellation()
+        let manager = try await loadedManager()
+        try Task.checkCancellation()
+        let result = try await inferenceQueue.run {
+            var state = await TdtDecoderState.make(decoderLayers: manager.decoderLayerCount)
+            try Task.checkCancellation()
+            return try await manager.transcribe(file, decoderState: &state, language: .spanish)
+        }
+        try Task.checkCancellation()
         var segments = Self.makeSegments(result)
         if let vocabularyBooster,
            let timings = result.tokenTimings,
            !timings.isEmpty {
+            try Task.checkCancellation()
             let samples = try Self.loadSamples(file)
+            try Task.checkCancellation()
             let spotting = try await vocabularyBooster.spotter.spotKeywordsWithLogProbs(
                 audioSamples: samples,
                 customVocabulary: vocabularyBooster.context
             )
+            try Task.checkCancellation()
             if !spotting.logProbs.isEmpty {
                 let output = vocabularyBooster.rescorer.ctcTokenRescore(
                     transcript: result.text,
@@ -78,12 +292,21 @@ actor ParakeetService {
 
     func configureVocabulary(file: URL?) async throws {
         guard let file else {
+            vocabularyGeneration += 1
             vocabularyBooster = nil
             configuredVocabularyPath = nil
             return
         }
-        guard configuredVocabularyPath != file.path else { return }
+        guard configuredVocabularyPath != file.path || vocabularyBooster == nil else { return }
+        vocabularyGeneration += 1
+        let generation = vocabularyGeneration
+        // Never keep a previous class's booster active while a replacement is
+        // loading or after that optional enhancement fails.
+        vocabularyBooster = nil
+        configuredVocabularyPath = nil
+        try Task.checkCancellation()
         let (context, models) = try await CustomVocabularyContext.loadWithCtcTokens(from: file.path)
+        try Task.checkCancellation()
         let spotter = CtcKeywordSpotter(models: models, blankId: models.vocabulary.count)
         let rescorer = try await VocabularyRescorer.create(
             spotter: spotter,
@@ -91,6 +314,8 @@ actor ParakeetService {
             config: .default,
             ctcModelDirectory: CtcModels.defaultCacheDirectory(for: models.variant)
         )
+        try Task.checkCancellation()
+        guard generation == vocabularyGeneration else { throw CancellationError() }
         vocabularyBooster = VocabularyBooster(context: context, spotter: spotter, rescorer: rescorer)
         configuredVocabularyPath = file.path
     }
@@ -215,6 +440,6 @@ enum InferenceError: LocalizedError {
     case modelUnavailable
 
     var errorDescription: String? {
-        "No se pudo cargar el modelo local Parakeet. Comprueba la conexión para la primera descarga y el espacio libre."
+        "No se pudo preparar la transcripción local. Comprueba la conexión para la primera descarga y el espacio libre."
     }
 }

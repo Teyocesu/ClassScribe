@@ -1,5 +1,146 @@
 import Foundation
 
+/// Advances only after an ASR window has produced a usable result. A failed
+/// inference therefore retries the exact same audio range instead of silently
+/// dropping 5.5 seconds of class content.
+struct LiveTranscriptionCursor: Equatable, Sendable {
+    let hopSamples: Int64
+    private(set) var committedEnd: Int64 = 0
+    private(set) var pendingEnd: Int64?
+
+    init(hopSamples: Int64 = 88_000) {
+        precondition(hopSamples > 0)
+        self.hopSamples = hopSamples
+    }
+
+    mutating func nextWindowEnd(totalSamples: Int64, preferLatest: Bool = false) -> Int64? {
+        if preferLatest {
+            pendingEnd = nil
+        } else if let pendingEnd {
+            return totalSamples >= pendingEnd ? pendingEnd : nil
+        }
+        let next = preferLatest ? latestAlignedEnd(totalSamples: totalSamples) : committedEnd + hopSamples
+        guard next >= hopSamples, next > committedEnd else { return nil }
+        pendingEnd = next
+        return totalSamples >= next ? next : nil
+    }
+
+    /// Replaces a pending end that has fallen out of the live buffer's retained
+    /// range. The full WAV remains authoritative; live captions resume from the
+    /// newest hop instead of remaining stuck on an index the ring no longer has.
+    mutating func recoverFromExpiredWindow(totalSamples: Int64) -> (end: Int64, skippedSamples: Int64)? {
+        guard let expired = pendingEnd else { return nil }
+        let latest = latestAlignedEnd(totalSamples: totalSamples)
+        guard latest >= hopSamples, latest > committedEnd else { return nil }
+        pendingEnd = latest
+        return (latest, max(0, latest - expired))
+    }
+
+    mutating func commit(windowEndingAt end: Int64) {
+        guard end > committedEnd else { return }
+        committedEnd = end
+        if pendingEnd == end {
+            pendingEnd = nil
+        }
+    }
+
+    private func latestAlignedEnd(totalSamples: Int64) -> Int64 {
+        totalSamples - max(0, totalSamples % hopSamples)
+    }
+}
+
+/// Bounds repeated live-ASR failures. Final full-file transcription remains the
+/// durable fallback, while the live loop retries at progressively wider gaps
+/// instead of repeatedly reloading a missing/broken model.
+struct LiveTranscriptionRetryPolicy: Equatable, Sendable {
+    private static let delays: [TimeInterval] = [2, 4, 8, 15, 30]
+    private(set) var consecutiveFailures = 0
+    private(set) var retryAfterUptime: TimeInterval?
+
+    func canAttempt(atUptime now: TimeInterval) -> Bool {
+        retryAfterUptime.map { now >= $0 } ?? true
+    }
+
+    @discardableResult
+    mutating func recordFailure(atUptime now: TimeInterval) -> TimeInterval {
+        let index = min(consecutiveFailures, Self.delays.count - 1)
+        let delay = Self.delays[index]
+        consecutiveFailures += 1
+        retryAfterUptime = now + delay
+        return delay
+    }
+
+    mutating func recordSuccess() {
+        consecutiveFailures = 0
+        retryAfterUptime = nil
+    }
+}
+
+/// Bounded wait used after cancelling live inference. The underlying task is
+/// intentionally not cancelled here (the caller already did so); this merely
+/// prevents a Core ML call that ignores cancellation from freezing Stop.
+enum TaskCompletionGracePeriod {
+    static func wait(for task: Task<Void, Never>, timeout: TimeInterval) async -> Bool {
+        guard timeout > 0 else { return false }
+        let box = CompletionRaceBox()
+        return await withCheckedContinuation { continuation in
+            box.install(continuation)
+            Task.detached(priority: .utility) {
+                await task.value
+                box.resolve(true)
+            }
+            Task.detached(priority: .utility) {
+                let nanoseconds = UInt64(min(timeout, 86_400) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanoseconds)
+                box.resolve(false)
+            }
+        }
+    }
+}
+
+private final class CompletionRaceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private var earlyResult: Bool?
+    private var finished = false
+
+    func install(_ continuation: CheckedContinuation<Bool, Never>) {
+        let result: Bool?
+        lock.lock()
+        precondition(self.continuation == nil && !finished)
+        if let earlyResult {
+            finished = true
+            result = earlyResult
+        } else {
+            self.continuation = continuation
+            result = nil
+        }
+        lock.unlock()
+        if let result {
+            continuation.resume(returning: result)
+        }
+    }
+
+    func resolve(_ value: Bool) {
+        let continuation: CheckedContinuation<Bool, Never>?
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        if let waiting = self.continuation {
+            finished = true
+            self.continuation = nil
+            continuation = waiting
+        } else {
+            earlyResult = value
+            continuation = nil
+        }
+        lock.unlock()
+        continuation?.resume(returning: value)
+    }
+}
+
 /// Removes the repeated prefix introduced by overlapping ASR windows.
 enum OverlapDeduplicator {
     static func novelText(stable: String, incoming: String, maximumWords: Int = 80) -> String {

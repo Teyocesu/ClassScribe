@@ -1,0 +1,167 @@
+@testable import ClassScribe
+import Foundation
+import Testing
+
+private actor SingleFlightProbe {
+    private(set) var calls = 0
+
+    func load(after delay: Duration = .milliseconds(180)) async throws -> Int {
+        calls += 1
+        try await Task.sleep(for: delay)
+        return 42
+    }
+}
+
+private actor SerialExecutionProbe {
+    private(set) var calls = 0
+    private(set) var active = 0
+    private(set) var maximumActive = 0
+
+    func perform(for duration: Duration) async throws -> Int {
+        calls += 1
+        active += 1
+        maximumActive = max(maximumActive, active)
+        defer { active -= 1 }
+        try await Task.sleep(for: duration)
+        return calls
+    }
+}
+
+@Test
+func concurrentModelLoadsShareOneOperation() async throws {
+    let flight = AsyncSingleFlight<Int>()
+    let probe = SingleFlightProbe()
+
+    async let first = flight.value { try await probe.load() }
+    async let second = flight.value { try await probe.load() }
+
+    #expect(try await (first, second) == (42, 42))
+    #expect(await probe.calls == 1)
+    #expect(try await flight.value { try await probe.load() } == 42)
+    #expect(await probe.calls == 1)
+}
+
+@Test
+func cancelledModelWaiterDoesNotCancelSharedLoad() async throws {
+    let flight = AsyncSingleFlight<Int>()
+    let probe = SingleFlightProbe()
+    let first = Task { try await flight.value { try await probe.load(after: .milliseconds(300)) } }
+
+    for _ in 0 ..< 200 where await probe.calls == 0 {
+        await Task.yield()
+    }
+    #expect(await probe.calls == 1)
+    let second = Task { try await flight.value { try await probe.load() } }
+    let cancelledAt = Date()
+    first.cancel()
+
+    do {
+        _ = try await first.value
+        Issue.record("Se esperaba CancellationError")
+    } catch is CancellationError {
+        // Expected: only this waiter leaves; the shared operation survives.
+    }
+    #expect(Date().timeIntervalSince(cancelledAt) < 0.2)
+    #expect(try await second.value == 42)
+    #expect(await probe.calls == 1)
+}
+
+@Test
+func inferenceExecutorPreventsOverlappingPredictions() async throws {
+    let executor = AsyncSerialExecutor()
+    let probe = SerialExecutionProbe()
+
+    async let first = executor.run { try await probe.perform(for: .milliseconds(80)) }
+    async let second = executor.run { try await probe.perform(for: .milliseconds(20)) }
+    _ = try await (first, second)
+
+    #expect(await probe.calls == 2)
+    #expect(await probe.maximumActive == 1)
+}
+
+@Test
+func cancelledQueuedPredictionNeverStarts() async throws {
+    let executor = AsyncSerialExecutor()
+    let probe = SerialExecutionProbe()
+    let first = Task { try await executor.run { try await probe.perform(for: .milliseconds(180)) } }
+    for _ in 0 ..< 200 {
+        if await probe.active == 1 { break }
+        await Task.yield()
+    }
+    #expect(await probe.active == 1)
+
+    let queued = Task { try await executor.run { try await probe.perform(for: .milliseconds(10)) } }
+    queued.cancel()
+    do {
+        _ = try await queued.value
+        Issue.record("Se esperaba CancellationError")
+    } catch is CancellationError {
+        // Expected: it leaves promptly but retains its place until predecessor ends.
+    }
+    _ = try await first.value
+    try await Task.sleep(for: .milliseconds(20))
+    #expect(await probe.calls == 1)
+    #expect(await probe.maximumActive == 1)
+}
+
+@Test
+func liveCursorCommitsOnlySuccessfulWindows() {
+    var cursor = LiveTranscriptionCursor(hopSamples: 10)
+    #expect(cursor.nextWindowEnd(totalSamples: 35) == 10)
+    // No commit represents an ASR failure: the exact range remains pending.
+    #expect(cursor.nextWindowEnd(totalSamples: 70) == 10)
+    cursor.commit(windowEndingAt: 10)
+    #expect(cursor.nextWindowEnd(totalSamples: 70) == 20)
+    cursor.commit(windowEndingAt: 20)
+    #expect(cursor.nextWindowEnd(totalSamples: 57, preferLatest: true) == 50)
+}
+
+@Test
+func liveCursorRecoversWhenPendingWindowExpiredFromRing() {
+    var cursor = LiveTranscriptionCursor(hopSamples: 10)
+    #expect(cursor.nextWindowEnd(totalSamples: 10) == 10)
+
+    // Simulate enough failed/backed-off time that end=10 is no longer in a
+    // bounded ring whose newest sample is 100.
+    let recovery = cursor.recoverFromExpiredWindow(totalSamples: 107)
+    #expect(recovery?.end == 100)
+    #expect(recovery?.skippedSamples == 90)
+    #expect(cursor.nextWindowEnd(totalSamples: 107) == 100)
+    cursor.commit(windowEndingAt: 100)
+    #expect(cursor.nextWindowEnd(totalSamples: 110) == 110)
+}
+
+@Test
+func liveRetryBackoffIsBoundedAndResetsAfterSuccess() {
+    var policy = LiveTranscriptionRetryPolicy()
+    var now: TimeInterval = 100
+    for expected in [2.0, 4, 8, 15, 30, 30] {
+        let delay = policy.recordFailure(atUptime: now)
+        #expect(delay == expected)
+        #expect(!policy.canAttempt(atUptime: now + delay - 0.01))
+        now += delay
+        #expect(policy.canAttempt(atUptime: now))
+    }
+    policy.recordSuccess()
+    #expect(policy.consecutiveFailures == 0)
+    #expect(policy.canAttempt(atUptime: now))
+}
+
+@Test
+func liveTaskGracePeriodDoesNotWaitForever() async {
+    let slow = Task<Void, Never> {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.2) {
+                continuation.resume()
+            }
+        }
+    }
+    slow.cancel() // The continuation intentionally ignores cancellation.
+    let started = Date()
+    #expect(await TaskCompletionGracePeriod.wait(for: slow, timeout: 0.02) == false)
+    #expect(Date().timeIntervalSince(started) < 0.15)
+    await slow.value
+
+    let finished = Task<Void, Never> {}
+    #expect(await TaskCompletionGracePeriod.wait(for: finished, timeout: 0.2))
+}

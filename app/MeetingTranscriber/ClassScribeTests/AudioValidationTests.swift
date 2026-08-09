@@ -144,6 +144,159 @@ func liveAudioGenerationRejectsQueuedBuffersFromPreviousSession() async {
     #expect(await store.totalSamples() == 1600)
 }
 
+@Test
+func liveAudioWaitAcceptsSilentFramesAndTimesOutWithoutCallbacks() async throws {
+    let store = LiveAudioBufferStore()
+    let generation = await store.reset()
+    let silentBuffer = LiveAudioBuffer(
+        samples: Array(repeating: 0, count: 320),
+        channelCount: 1,
+        sampleRate: 16000,
+        hostTime: 0,
+    )
+
+    await store.append(silentBuffer, generation: generation)
+    #expect(try await store.waitForSamples(after: 0, timeout: 0) == 320)
+
+    _ = await store.reset()
+    #expect(try await store.waitForSamples(after: 0, timeout: 0) == nil)
+}
+
+@Test
+func emptyNon16kCallbackIsIgnoredWithoutIndexingAnEmptyBuffer() async {
+    let store = LiveAudioBufferStore()
+    let generation = await store.reset()
+    await store.append(
+        LiveAudioBuffer(samples: [], channelCount: 2, sampleRate: 48000, hostTime: 0),
+        generation: generation,
+    )
+    #expect(await store.totalSamples() == 0)
+}
+
+@Test
+func preciseLiveWindowRejectsHistoryClippedByTheRing() async {
+    let store = LiveAudioBufferStore()
+    let generation = await store.reset()
+    // The store retains 45 seconds (720,000 samples). Rotating even a small
+    // prefix out must not let an ASR retry commit a shortened historical range.
+    await store.append(
+        LiveAudioBuffer(
+            samples: Array(repeating: 0, count: 720_100),
+            channelCount: 1,
+            sampleRate: 16000,
+            hostTime: 0,
+        ),
+        generation: generation,
+    )
+
+    #expect(await store.window(seconds: 7, endingAt: 88_000) != nil)
+    #expect(await store.window(
+        seconds: 7,
+        endingAt: 88_000,
+        requiresCompleteHistory: true,
+    ) == nil)
+    #expect(await store.window(
+        seconds: 7,
+        endingAt: 720_000,
+        requiresCompleteHistory: true,
+    ) != nil)
+}
+
+@Test
+func liveAudioWaitPropagatesCancellation() async {
+    let store = LiveAudioBufferStore()
+    _ = await store.reset()
+    let wait = Task {
+        try await store.waitForSamples(after: 0, timeout: 30)
+    }
+    wait.cancel()
+
+    do {
+        _ = try await wait.value
+        Issue.record("La espera cancelada no debe continuar hasta el timeout")
+    } catch is CancellationError {
+        // Expected.
+    } catch {
+        Issue.record("Error inesperado: \(error)")
+    }
+}
+
+@Test
+func audioFrameWatchdogTracksFramesRatherThanAudibility() {
+    var watchdog = AudioFrameWatchdog(stallTimeout: 5)
+    watchdog.reset(sampleCount: 320, now: 10)
+
+    let beforeTimeout = watchdog.observe(sampleCount: 320, now: 14.99)
+    #expect(!beforeTimeout)
+    let atTimeout = watchdog.observe(sampleCount: 320, now: 15)
+    #expect(atTimeout)
+    // A silent callback still advances the sample count and restores health.
+    let resumed = watchdog.observe(sampleCount: 640, now: 15.1)
+    #expect(!resumed)
+    let healthyBeforeSecondTimeout = watchdog.observe(sampleCount: 640, now: 20.09)
+    #expect(!healthyBeforeSecondTimeout)
+    let secondTimeout = watchdog.observe(sampleCount: 640, now: 20.1)
+    #expect(secondTimeout)
+}
+
+@Test
+func captureSourceFailuresGiveActionableRecovery() {
+    let noAppFrames = CaptureError.applicationAudioUnavailable.localizedDescription
+    #expect(noAppFrames.contains("permiso de Audio"))
+    #expect(noAppFrames.contains("siga abierta"))
+    #expect(CaptureError.microphoneUnavailable.localizedDescription.contains("elige otro"))
+}
+
+@Test
+func processLivenessProbeDoesNotSignalTheSource() {
+    #expect(CaptureController.processIsRunning(getpid()))
+    #expect(!CaptureController.processIsRunning(-1))
+    #expect(!CaptureController.processIsRunning(pid_t.max))
+}
+
+@Test
+func audioProcessStartupWaitRetriesTransientRegistration() async throws {
+    let probe = RegistrationProbe(succeedingOnAttempt: 3)
+    let ready = try await AudioProcessStartupWaiter.waitUntilRegistered(
+        pids: [123],
+        timeout: 1,
+        pollInterval: 0.001,
+        registrationProbe: { _ in probe.poll() },
+    )
+
+    #expect(ready)
+    #expect(probe.attempts == 3)
+}
+
+@Test
+func audioProcessStartupWaitTimesOutAndHonorsCancellation() async {
+    let timedOut = try? await AudioProcessStartupWaiter.waitUntilRegistered(
+        pids: [123],
+        timeout: 0,
+        registrationProbe: { _ in false },
+    )
+    #expect(timedOut == false)
+
+    let probe = RegistrationProbe(succeedingOnAttempt: .max)
+    let wait = Task {
+        try await AudioProcessStartupWaiter.waitUntilRegistered(
+            pids: [123],
+            timeout: 30,
+            pollInterval: 1,
+            registrationProbe: { _ in probe.poll() },
+        )
+    }
+    wait.cancel()
+    do {
+        _ = try await wait.value
+        Issue.record("Una espera de registro cancelada no debe iniciar captura más tarde")
+    } catch is CancellationError {
+        // Expected: the structured wait leaves no autonomous retry behind.
+    } catch {
+        Issue.record("Error inesperado: \(error)")
+    }
+}
+
 private func makeAudioValidationFolder() throws -> URL {
     let folder = FileManager.default.temporaryDirectory
         .appendingPathComponent("classscribe-audio-validation-\(UUID().uuidString)", isDirectory: true)
@@ -171,4 +324,27 @@ private func pcm16WAVHeader(dataBytes: UInt32) -> Data {
     withUnsafeBytes(of: riffSize.littleEndian) { bytes.replaceSubrange(4 ..< 8, with: $0) }
     withUnsafeBytes(of: dataBytes.littleEndian) { bytes.replaceSubrange(40 ..< 44, with: $0) }
     return Data(bytes)
+}
+
+private final class RegistrationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let succeedingOnAttempt: Int
+    private var pollCount = 0
+
+    init(succeedingOnAttempt: Int) {
+        self.succeedingOnAttempt = succeedingOnAttempt
+    }
+
+    func poll() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pollCount += 1
+        return pollCount >= succeedingOnAttempt
+    }
+
+    var attempts: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pollCount
+    }
 }
