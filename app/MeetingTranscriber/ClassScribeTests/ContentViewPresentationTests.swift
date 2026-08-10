@@ -74,3 +74,38 @@ func captureStartGuidance() {
     #expect(ready == .ready)
     #expect(ready.message == nil)
 }
+
+@Test("El seguimiento en vivo distingue observación, edición y texto pendiente")
+func liveTranscriptFollowPresentation() {
+    let following = LiveTranscriptFollowPresentation.resolve(
+        isFollowing: true,
+        isEditing: false,
+        hasUnseenText: false,
+    )
+    #expect(following.actionTitle == nil)
+    #expect(following.message.contains("automáticamente"))
+
+    let editing = LiveTranscriptFollowPresentation.resolve(
+        isFollowing: false,
+        isEditing: true,
+        hasUnseenText: false,
+    )
+    #expect(editing.actionTitle == "Seguir en vivo")
+    #expect(editing.message.contains("cursor"))
+
+    let reviewing = LiveTranscriptFollowPresentation.resolve(
+        isFollowing: false,
+        isEditing: false,
+        hasUnseenText: false,
+    )
+    #expect(reviewing.actionTitle == "Seguir en vivo")
+    #expect(reviewing.message.contains("pausado"))
+
+    let unseen = LiveTranscriptFollowPresentation.resolve(
+        isFollowing: false,
+        isEditing: true,
+        hasUnseenText: true,
+    )
+    #expect(unseen.actionTitle == "Ver texto nuevo")
+    #expect(unseen.message.contains("no se movieron"))
+}

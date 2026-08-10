@@ -51,10 +51,46 @@ enum CaptureStartGuidance: Equatable {
     }
 }
 
+struct LiveTranscriptFollowPresentation: Equatable {
+    var message: String
+    var actionTitle: String?
+    var systemImage: String
+
+    static func resolve(
+        isFollowing: Bool,
+        isEditing: Bool,
+        hasUnseenText: Bool,
+    ) -> LiveTranscriptFollowPresentation {
+        if isFollowing {
+            return LiveTranscriptFollowPresentation(
+                message: "Siguiendo la transcripción automáticamente.",
+                actionTitle: nil,
+                systemImage: "arrow.down.to.line.compact",
+            )
+        }
+        if hasUnseenText {
+            return LiveTranscriptFollowPresentation(
+                message: "Hay texto nuevo; tu cursor y tu posición no se movieron.",
+                actionTitle: "Ver texto nuevo",
+                systemImage: "text.badge.plus",
+            )
+        }
+        return LiveTranscriptFollowPresentation(
+            message: isEditing
+                ? "Edición activa: tu cursor y tu posición quedan fijos."
+                : "Seguimiento pausado para que puedas revisar el texto.",
+            actionTitle: "Seguir en vivo",
+            systemImage: isEditing ? "character.cursor.ibeam" : "pause.circle",
+        )
+    }
+}
+
 struct ContentView: View {
     @Bindable var model: ClassScribeModel
     @State private var showsTechnicalVocabulary = false
-    @FocusState private var liveEditorFocused: Bool
+    @State private var liveEditorIsEditing = false
+    @State private var followsLiveTranscript = true
+    @State private var hasUnseenLiveTranscript = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -539,6 +575,16 @@ struct ContentView: View {
                     )
                     .font(.headline)
                 }
+                if let actionTitle = liveFollowPresentation.actionTitle,
+                   model.isRecording {
+                    Button {
+                        resumeLiveTranscriptFollowing()
+                    } label: {
+                        Label(actionTitle, systemImage: "arrow.down.to.line.compact")
+                    }
+                    .controlSize(.small)
+                    .help("Volver al texto más reciente y continuar siguiéndolo")
+                }
                 Spacer()
                 if model.isProcessing {
                     ProgressView()
@@ -572,13 +618,14 @@ struct ContentView: View {
 
             if model.isRecording {
                 HStack {
-                    Image(systemName: "pencil.line").foregroundStyle(.indigo)
-                    Text("Puedes corregir el texto mientras la grabación continúa; las frases nuevas se agregarán al final.")
+                    Image(systemName: liveFollowPresentation.systemImage)
+                        .foregroundStyle(followsLiveTranscript ? .indigo : .orange)
+                    Text(liveFollowPresentation.message)
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
                 .padding(9)
-                .background(Color.indigo.opacity(0.06))
+                .background((followsLiveTranscript ? Color.indigo : Color.orange).opacity(0.06))
             } else if model.finalReplacedLive, model.selectedTab == .liveEdit {
                 HStack {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
@@ -658,12 +705,12 @@ struct ContentView: View {
 
     private var liveTranscript: some View {
         ZStack(alignment: .topLeading) {
-            TextEditor(text: liveEditableText)
-                .font(.system(.body, design: .rounded))
-                .scrollContentBackground(.hidden)
-                .padding(10)
-                .focused($liveEditorFocused)
-                .accessibilityLabel("Transcripción en vivo editable")
+            LiveTranscriptEditor(
+                text: liveEditableText,
+                isEditing: $liveEditorIsEditing,
+                isFollowing: $followsLiveTranscript,
+                onFinalize: { _ = model.flushEditedLiveText() },
+            )
             if model.liveEditableText.isEmpty {
                 Text("La transcripción aparecerá aquí mientras habla el profesor…")
                     .foregroundStyle(.secondary)
@@ -672,13 +719,42 @@ struct ContentView: View {
                     .allowsHitTesting(false)
             }
         }
-        .onChange(of: liveEditorFocused) { _, focused in
-            if !focused {
+        .onChange(of: liveEditorIsEditing) { _, isEditing in
+            if !isEditing {
                 model.flushEditedLiveText()
             }
         }
-        .onDisappear { _ = model.flushEditedLiveText() }
+        .onChange(of: model.liveVisibleText) { _, _ in
+            if !followsLiveTranscript {
+                hasUnseenLiveTranscript = true
+            }
+        }
+        .onAppear {
+            liveEditorIsEditing = false
+            followsLiveTranscript = true
+            hasUnseenLiveTranscript = false
+        }
+        .onDisappear {
+            _ = model.flushEditedLiveText()
+            liveEditorIsEditing = false
+            followsLiveTranscript = true
+            hasUnseenLiveTranscript = false
+        }
         .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private var liveFollowPresentation: LiveTranscriptFollowPresentation {
+        LiveTranscriptFollowPresentation.resolve(
+            isFollowing: followsLiveTranscript,
+            isEditing: liveEditorIsEditing,
+            hasUnseenText: hasUnseenLiveTranscript,
+        )
+    }
+
+    private func resumeLiveTranscriptFollowing() {
+        _ = model.flushEditedLiveText()
+        hasUnseenLiveTranscript = false
+        followsLiveTranscript = true
     }
 
     private var liveEditableText: Binding<String> {

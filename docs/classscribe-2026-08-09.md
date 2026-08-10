@@ -1,6 +1,6 @@
-# Revisión ClassScribe — 9 de agosto de 2026
+# Revisión ClassScribe — 9 y 10 de agosto de 2026
 
-Este documento consolida los cambios realizados sobre ClassScribe en la rama `codex/simplify-voice-transcription-ui`. El objetivo fue simplificar la experiencia, eliminar controles duplicados y hacer más resilientes la captura, la transcripción y la recuperación.
+Este documento consolida los cambios realizados sobre ClassScribe en las ramas `codex/simplify-voice-transcription-ui`, `codex/live-editable-transcript` y `codex/fix-live-editor-follow`. El objetivo fue simplificar la experiencia, eliminar controles duplicados y hacer más resilientes la captura, la transcripción, la edición durante la grabación y la recuperación.
 
 ## Resultado para el usuario
 
@@ -63,6 +63,8 @@ Este documento consolida los cambios realizados sobre ClassScribe en la rama `co
 
 - El panel de transcripción es un editor durante la captura: se puede seleccionar, borrar y escribir sin detener el audio ni ASR.
 - La rama ASR y la rama editada se mantienen separadas. Cada ventana nueva aporta solo su sufijo; nunca repone palabras borradas ni sobrescribe correcciones humanas.
+- Un editor AppKit conserva todos los rangos de selección UTF-16, la afinidad del cursor y el viewport cuando la persona edita. Los sufijos ASR se agregan sin entrar en Undo y se difieren durante la composición de acentos o IME.
+- El modo inicial **Siguiendo** baja automáticamente con cada frase. Foco, escritura o scroll humano cambia a **Revisando**; perder el foco no lo revierte. **Seguir en vivo** o **Ver texto nuevo** vuelve al final de forma explícita.
 - La edición se guarda con un debounce de 300 ms y se fuerza a disco al perder foco, cambiar de sesión, pausar, detener o crear un checkpoint. Un marcador interno conserva incluso la decisión de dejar **Mi edición** vacía.
 - Después del procesamiento final, **Mi edición** conserva el texto corregido y permite compararlo con **Profesor** y **Todos los hablantes**.
 - Una pausa inferior a cuatro segundos no crea un párrafo nuevo. Una pausa de al menos cuatro segundos solo lo crea si el fragmento anterior cierra una oración; esta política evita saltos de línea durante pausas de pensamiento.
@@ -80,7 +82,7 @@ Este documento consolida los cambios realizados sobre ClassScribe en la rama `co
 
 | Área | Archivos |
 |---|---|
-| Interfaz | `app/MeetingTranscriber/ClassScribeSources/ContentView.swift`, `app/MeetingTranscriber/ClassScribeTests/ContentViewPresentationTests.swift` |
+| Interfaz | `app/MeetingTranscriber/ClassScribeSources/ContentView.swift`, `app/MeetingTranscriber/ClassScribeSources/LiveTranscriptEditor.swift`, `app/MeetingTranscriber/ClassScribeTests/ContentViewPresentationTests.swift`, `app/MeetingTranscriber/ClassScribeTests/LiveTranscriptEditorTests.swift` |
 | Captura | `app/MeetingTranscriber/ClassScribeSources/AudioCapture.swift`, `app/MeetingTranscriber/ClassScribeTests/AudioValidationTests.swift` |
 | AudioTap | `tools/audiotap/Sources/AppAudioCapture.swift`, `tools/audiotap/Sources/AppAudioCapture+PIDTranslation.swift`, `tools/audiotap/Sources/MicCaptureHandler.swift`, `tools/audiotap/Sources/CaptureLifecycleGate.swift` |
 | ASR | `app/MeetingTranscriber/ClassScribeSources/Inference.swift`, `app/MeetingTranscriber/ClassScribeSources/TranscriptLogic.swift`, `app/MeetingTranscriber/ClassScribeSources/LiveTranscriptEditing.swift`, `app/MeetingTranscriber/ClassScribeTests/TranscriptionReliabilityTests.swift`, `app/MeetingTranscriber/ClassScribeTests/LiveTranscriptEditingTests.swift` |
@@ -90,7 +92,7 @@ Este documento consolida los cambios realizados sobre ClassScribe en la rama `co
 
 ## Validación realizada
 
-- 91 pruebas aprobadas con `-strict-concurrency=complete`; cinco fixtures opt-in omitidos en el pase integrado.
+- 114 pruebas aprobadas con `-strict-concurrency=complete`; cinco fixtures opt-in omitidos en el pase integrado.
 - Fixture Parakeet real en español aprobado.
 - Fixture de diarización real con al menos dos voces aprobado.
 - Captura CATap real y audible de `afplay` aprobada en el pase integrado.
@@ -114,6 +116,7 @@ No se ejecutó la prueba física de micrófono de 60 segundos porque capturaría
 - `9c70bb8` — `docs(app): document the ClassScribe reliability release`
 - `4b2b5a6` — `test(app): remove scheduler-sensitive timing assertions`
 - `bd1a59f` — `feat(app): support live transcript corrections`
+- `aca7832` — `fix(app): preserve live editor position while transcribing`
 
 ## Instalación local
 
