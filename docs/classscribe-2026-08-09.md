@@ -116,6 +116,7 @@ No se ejecutó la prueba física de micrófono de 60 segundos porque capturaría
 - `9c70bb8` — `docs(app): document the ClassScribe reliability release`
 - `4b2b5a6` — `test(app): remove scheduler-sensitive timing assertions`
 - `bd1a59f` — `feat(app): support live transcript corrections`
+- `aca7832` — `fix(app): preserve live editor position while transcribing`
 
 ## Instalación local
 
