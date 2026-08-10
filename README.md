@@ -2,7 +2,7 @@
 
 ClassScribe es una aplicación nativa para macOS que graba y transcribe clases universitarias en español, completamente en el dispositivo. Captura **una aplicación elegida** o **un micrófono elegido**, nunca ambos automáticamente. El audio, las transcripciones y las referencias de voz permanecen en la Mac.
 
-La revisión de interfaz, captura, transcripción, instalación e icono realizada el 9 de agosto de 2026 está documentada en [docs/classscribe-2026-08-09.md](docs/classscribe-2026-08-09.md).
+La revisión de interfaz, captura, transcripción, edición en vivo, instalación e icono realizada el 9 y 10 de agosto de 2026 está documentada en [docs/classscribe-2026-08-09.md](docs/classscribe-2026-08-09.md).
 
 > Obtén permiso del profesor y de las demás personas antes de grabar. Cumple las normas de tu universidad y la legislación aplicable.
 
@@ -92,6 +92,8 @@ Selecciona el micrófono. macOS pedirá permiso; si se negó antes, ve a **Ajust
 ## Ver, copiar y editar
 
 - El panel derecho es editable desde que empieza la grabación. Cada corrección humana prevalece sobre el reconocimiento y se guarda mientras escribes.
+- Mientras solo observas, la vista sigue automáticamente cada frase nueva. Hacer clic para editar o desplazarse hacia arriba pausa ese seguimiento y conserva exactamente el cursor, la selección y la posición visible aunque ASR siga agregando texto.
+- “Seguir en vivo” vuelve al final; si llegaron frases mientras revisabas, el mismo control se presenta como “Ver texto nuevo”. Perder el foco no reactiva el seguimiento por sorpresa.
 - Una pausa normal para pensar mantiene la frase en el mismo párrafo. Solo una pausa claramente larga (aproximadamente cuatro segundos) después de una oración terminada inicia otro párrafo; al finalizar, un cambio de hablante también lo separa.
 - Si corregiste durante la clase, al terminar queda disponible la pestaña **Mi edición**, seleccionada por defecto, junto con las versiones finales **Profesor** y **Todos los hablantes**.
 - “Copiar transcripción” elige, en orden, una edición visible, la versión final del profesor, la final completa y la versión viva/recuperada. No copia vacío si existe texto útil.
@@ -161,7 +163,7 @@ swift test --package-path .toolchain/ClassScribePackage -j 2 \
   -Xswiftc -resource-dir -Xswiftc "$PWD/.toolchain/usr/lib/swift"
 ```
 
-Las pruebas cubren acumulación monotónica (incluidas 100 ventanas), ring buffer acotado, cursor y backoff en vivo, carga single-flight, inferencias serializadas, cancelación, journal/TXT, recuperación legacy y desde RAW sin borrar evidencia, archivos WAV válidos e inválidos, correcciones en vivo que sobreviven a nuevas ventanas ASR, continuidad de párrafos, copia/exportación, fallos de ASR y diarización, timeout/terminación del helper, cambio de profesor y conservación de todos los hablantes. Las pruebas físicas de micrófono y audio de aplicación requieren permisos TCC e interacción con una fuente audible; no se simulan como éxitos en CI.
+Las pruebas cubren acumulación monotónica (incluidas 100 ventanas), ring buffer acotado, cursor y backoff en vivo, carga single-flight, inferencias serializadas, cancelación, journal/TXT, recuperación legacy y desde RAW sin borrar evidencia, archivos WAV válidos e inválidos, correcciones en vivo que sobreviven a nuevas ventanas ASR, preservación AppKit de caret/selección/viewport, seguimiento automático, composición IME, continuidad de párrafos, copia/exportación, fallos de ASR y diarización, timeout/terminación del helper, cambio de profesor y conservación de todos los hablantes. Las pruebas físicas de micrófono y audio de aplicación requieren permisos TCC e interacción con una fuente audible; no se simulan como éxitos en CI.
 
 Fixtures y pruebas locales de modelos:
 
@@ -200,7 +202,7 @@ CLASSSCRIBE_RUN_MIC_CAPTURE_TEST=1 swift test \
   --filter microphoneCaptureFixture
 ```
 
-Resultados observados el 9 de agosto de 2026: 91 pruebas aprobaron con concurrencia estricta de Swift 6; cinco fixtures físicos/de modelos quedaron omitidos en el pase integrado. En pases opt-in separados también aprobaron Parakeet sobre un fixture español, diarización de dos voces y captura CATap audible de `afplay`. El fixture CATap pasó además cuatro veces durante la corrección de su registro transitorio. La prueba física de micrófono no se ejecutó porque graba 60 segundos del ambiente y requiere autorización explícita del host.
+Resultados observados el 10 de agosto de 2026: 114 pruebas aprobaron con concurrencia estricta de Swift 6; cinco fixtures físicos/de modelos quedaron omitidos en el pase integrado. En pases opt-in separados también aprobaron Parakeet sobre un fixture español, diarización de dos voces y captura CATap audible de `afplay`. El fixture CATap pasó además cuatro veces durante la corrección de su registro transitorio. La prueba física de micrófono no se ejecutó porque graba 60 segundos del ambiente y requiere autorización explícita del host.
 
 ## Limitaciones conocidas del MVP
 
