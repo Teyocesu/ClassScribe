@@ -63,6 +63,10 @@ open -n /Applications/ClassScribe.app
 
 La app aparece como **ClassScribe** en Finder y Launchpad con el icono incluido en `app/MeetingTranscriber/ClassScribeAssets/AppIcon.png`.
 
+## Distribución
+
+Las versiones para compartir se publican como assets de GitHub Releases en el repositorio privado. Un tag `vX.Y.Z` que coincida con `VERSION` crea una release ad-hoc con `ClassScribe-vX.Y.Z-arm64.dmg` y su checksum; el propietario puede descargar ese DMG y enviarlo manualmente sin dar acceso al repositorio. No requiere una cuenta de Apple Developer. La guía de creación, instalación y la futura opción de notarización está en [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md).
+
 ## Modelos
 
 Parakeet TDT v3 y los modelos de diarización se descargan automáticamente en la primera transcripción/diarización mediante FluidAudio. Durante esa carga la interfaz muestra “Preparando transcripción”. Si faltan o falla la descarga, la grabación continúa y la interfaz informa el error sin cerrar la app. Los modelos no se guardan en Git.

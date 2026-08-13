@@ -321,7 +321,7 @@ public class AppAudioCapture: @unchecked Sendable {
         // handle is included; for native apps the array is a single PID.
         let tap = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
         tap.uuid = UUID()
-        tap.name = "MeetingTranscriber-tap"
+        tap.name = "ClassScribe-tap"
         tap.isPrivate = true
         tap.muteBehavior = .unmuted
 

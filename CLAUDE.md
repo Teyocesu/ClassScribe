@@ -79,26 +79,16 @@ gh workflow run quality-and-safety.yml -f run-sanitizer=true -f run-quality=fals
 # that debug-mode tolerates; flags App Store variant when --with-appstore)
 ./scripts/pre-push.sh
 
-# Build self-contained .app + DMG for distribution (Homebrew)
-./scripts/build_release.sh
+# Build a local, ad-hoc-signed distribution test (not notarized)
+./scripts/build_release.sh --signing-mode=adhoc
 
-# Run app with debug RPC server enabled (dev-only; binds 127.0.0.1:9876)
-MEETINGTRANSCRIBER_DEBUG_RPC=1 ./scripts/run_app.sh
-
-# Build mt-cli (talks to the running RPC server)
-cd tools/mt-cli && swift build && .build/debug/mt-cli state
-
-# Live smoketest of the RPC server (kills + builds + launches + asserts)
-./scripts/test_rpc.sh
-
-# Build App Store variant (sandbox, no Claude CLI)
-./scripts/build_release.sh --appstore --no-notarize
 ```
 
 ## Distribution
 
-Homebrew Cask distribution (stable vs `@beta`), the `v*` tag release workflow, and
-the stable-tag ruleset gate → see the `distribution` skill (`.claude/skills/distribution/`).
+GitHub Release assets are the distribution channel. A `vX.Y.Z` tag matching `VERSION`
+publishes an ad-hoc DMG from the private repository; `workflow_dispatch` produces only
+a private temporary artifact. See [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md).
 
 ## Git Workflow
 
@@ -303,20 +293,10 @@ the naming-confirm lane, or runner configuration.
 
 View via Console.app, subsystem `com.meetingtranscriber.audiotap`. Off by default; turn on when investigating silent recordings or unusual routing.
 
-## Build Variants
+## Distribution Target
 
-Two build variants controlled by compile-time flag `APPSTORE` (`-Xswiftc -DAPPSTORE`):
-
-| | Homebrew | App Store |
-|---|---|---|
-| **Claude CLI** | Yes (Process subprocess) | No (sandbox forbids Process) |
-| **OpenAI API** | Yes | Yes (only LLM option) |
-| **Debug RPC server** | Yes (env-gated) | No (`#if !APPSTORE`) |
-| **Entitlements** | Mic only | Sandbox + mic + network + file picker |
-| **Build** | `./scripts/build_release.sh` | `./scripts/build_release.sh --appstore` |
-| **Tests** | ~1,900 | fewer (CLI + RPC tests excluded via `#if !APPSTORE`) |
-
-- CLI-specific code lives in `ClaudeCLIProtocolGenerator.swift` and `DebugRPCServer.swift` (each entire file `#if !APPSTORE`)
-- `ProtocolProvider` enum uses `CaseIterable` — `.claudeCLI` case excluded at compile time, picker adapts automatically
-- `ProtocolError` has `#if !APPSTORE` around CLI error cases (enum cases cannot be added via extension)
-- FFmpegHelper also uses `Process()` but falls back gracefully to `nil` — no `#if` needed
+The current SwiftPM products are `ClassScribe` and `ClassScribeDiarizer`. The
+GitHub Release pipeline packages that pair for direct macOS distribution. The
+legacy sources that use the `APPSTORE` flag, RPC server, protocol providers, and
+Homebrew casks are not part of the current `ClassScribe` target or this release
+pipeline; `build_release.sh` deliberately has no App Store mode.

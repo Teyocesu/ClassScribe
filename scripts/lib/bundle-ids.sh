@@ -17,7 +17,7 @@
 _BUNDLE_IDS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 RELEASE_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
-    "$_BUNDLE_IDS_ROOT/app/MeetingTranscriber/Sources/Info.plist")"
+    "$_BUNDLE_IDS_ROOT/app/MeetingTranscriber/ClassScribeSources/Info.plist")"
 
 # The dev build carries its own identity so it never shares TCC grants,
 # settings or a notification registration with an installed release. Derived

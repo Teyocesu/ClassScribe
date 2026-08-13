@@ -1,0 +1,132 @@
+name: Publish ClassScribe release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build ad-hoc (for example v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: classscribe-release-${{ github.event_name == 'push' && github.ref || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      ARTIFACT_NAME: ${{ github.event_name == 'push' && format('ClassScribe-release-{0}', github.ref_name) || format('ClassScribe-ad-hoc-{0}', inputs.tag) }}
+    steps:
+      # Pinned v4 action revisions; the release path has no Apple secrets.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag, source commit, and version
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$RELEASE_TAG" = "v$version"
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          test "$(git rev-parse HEAD)" = "$tag_commit"
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main || {
+            echo "ERROR: official and ad-hoc release tags must point to a commit already in origin/main." >&2
+            exit 1
+          }
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+          swift --version
+
+      - name: Resolve, build, and test
+        run: |
+          set -euo pipefail
+          swift package resolve --package-path app/MeetingTranscriber
+          swift build --package-path app/MeetingTranscriber -c release --arch arm64 -j 2 -Xswiftc -strict-concurrency=complete
+          swift test --package-path app/MeetingTranscriber -j 2 --enable-swift-testing --enable-xctest -Xswiftc -strict-concurrency=complete
+
+      - name: Assemble verified distributable
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          ./scripts/build_release.sh --version="$version" --signing-mode=adhoc
+
+      - name: Upload final release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            .build/release/ClassScribe-v*-arm64.dmg
+            .build/release/ClassScribe-v*-arm64.dmg.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      ARTIFACT_NAME: ClassScribe-release-${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: release-assets
+
+      - name: Validate final assets
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          dmg="ClassScribe-v${version}-arm64.dmg"
+          checksum="${dmg}.sha256"
+          test -f "release-assets/$dmg"
+          test -f "release-assets/$checksum"
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 2
+          (cd release-assets && sha256sum -c "$checksum")
+
+      - name: Create and publish GitHub Release
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          dmg="release-assets/ClassScribe-v${version}-arm64.dmg"
+          checksum="${dmg}.sha256"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "ERROR: a release for $RELEASE_TAG already exists; refusing to replace it." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" "$dmg" "$checksum" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "ClassScribe v${version}" \
+            --notes $'Distribución privada para Apple Silicon (macOS 14.2 o posterior).\n\nEsta build está firmada ad-hoc. No usa Developer ID y no está notarizada por Apple.\n\nPara instalarla: abre el DMG, arrastra ClassScribe a Applications y, si macOS muestra una advertencia y confías en quien te envió el archivo, haz clic con control en la app, selecciona Abrir y confirma el diálogo. No desactives Gatekeeper.'
+          release_json="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,tagName,assets)"
+          test "$(jq -r '.isDraft' <<<"$release_json")" = true
+          test "$(jq -r '.tagName' <<<"$release_json")" = "$RELEASE_TAG"
+          expected_assets="ClassScribe-v${version}-arm64.dmg
+          ClassScribe-v${version}-arm64.dmg.sha256"
+          actual_assets="$(jq -r '.assets[].name' <<<"$release_json" | sort)"
+          test "$actual_assets" = "$expected_assets"
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

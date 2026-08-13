@@ -100,6 +100,7 @@ INFO_PLIST="$APP/Contents/Info.plist"
 ICON_SOURCE="$PACKAGE_DIR/ClassScribeAssets/AppIcon.png"
 ICONSET="$PACKAGE_DIR/.build/ClassScribe.iconset"
 BUILD_TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+APP_VERSION="$(tr -d '[:space:]' < "$PROJECT_ROOT/VERSION")"
 
 # `open "$APP"` activates an already-running app with this bundle identity.
 # That previously left an old process alive after a newly compiled executable
@@ -140,6 +141,8 @@ mkdir -p "$MACOS"
 mkdir -p "$HELPERS"
 mkdir -p "$RESOURCES"
 cp "$PACKAGE_DIR/ClassScribeSources/Info.plist" "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ClassScribeBuildCommit string $BUILD_COMMIT" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :ClassScribeBuildTimestamp string $BUILD_TIMESTAMP" "$INFO_PLIST"
 cp "$BUILD_PACKAGE_DIR/.build/release/ClassScribe" "$MACOS/ClassScribe"
