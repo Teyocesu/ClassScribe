@@ -90,6 +90,21 @@ Los archivos resultantes quedan en `.build/windows/release/`. Para omitir solo e
 ./scripts/build_windows.ps1 -SkipInstaller
 ```
 
+Si el `dotnet publish` autocontenido se generó desde macOS o Linux, el mismo
+directorio puede empaquetarse con NSIS 3 sin ejecutar el binario Windows:
+
+```bash
+./scripts/package_windows_nsis.sh \
+  --publish-dir=/ruta/al/publish/win-x64 \
+  --makensis=/ruta/a/makensis
+```
+
+El empaquetador aplica las mismas comprobaciones de PE, runtimes nativos y
+ausencia de símbolos, excluye arquitecturas no utilizadas y produce el mismo
+conjunto de instalador, ZIP portable y checksums. La prueba de arranque del
+ejecutable debe hacerse aparte en Windows; el pipeline oficial la realiza antes
+de empaquetar.
+
 ## Build ad-hoc desde Actions
 
 Desde **Actions → Publish ClassScribe release → Run workflow**, elige un tag existente. Una ejecución manual produce artifacts privados durante siete días, pero nunca crea ni modifica una GitHub Release.
