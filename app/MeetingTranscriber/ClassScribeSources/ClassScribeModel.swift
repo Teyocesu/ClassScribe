@@ -20,6 +20,7 @@ private struct ClassSessionContext: Sendable {
     var startedAt: Date
     var mode: CaptureMode
     var source: String
+    var language: TranscriptionLanguage
     var technicalVocabulary: String
     var technicalVocabularyURL: URL?
 }
@@ -49,6 +50,7 @@ private func prepareRetryAudio(audioURL: URL, rawURL: URL) async throws -> Retry
 @Observable
 final class ClassScribeModel {
     var mode: CaptureMode = .online
+    var language: TranscriptionLanguage = .spanish
     var subject = ""
     var technicalVocabulary = ""
     var selectedApplicationID: Int32?
@@ -308,6 +310,7 @@ final class ClassScribeModel {
                 startedAt: now,
                 mode: mode,
                 source: selectedSourceName,
+                language: language,
                 technicalVocabulary: technicalVocabulary,
                 technicalVocabularyURL: technicalVocabularyURL,
             )
@@ -626,6 +629,7 @@ final class ClassScribeModel {
         startedAt = metadata.startedAt
         subject = metadata.subject
         mode = metadata.mode
+        language = metadata.language ?? .spanish
         technicalVocabulary = metadata.technicalVocabulary
         elapsed = metadata.duration
         professorSpeakerID = metadata.professorSpeakerID
@@ -662,6 +666,7 @@ final class ClassScribeModel {
             startedAt: metadata.startedAt,
             mode: metadata.mode,
             source: metadata.source,
+            language: metadata.language ?? .spanish,
             technicalVocabulary: metadata.technicalVocabulary,
             technicalVocabularyURL: FileManager.default.fileExists(atPath: vocabularyURL.path) ? vocabularyURL : nil,
         )
@@ -846,7 +851,10 @@ final class ClassScribeModel {
                     self.statusDetail = skippedExpiredSamples > 0
                         ? "La vista en vivo retomó el audio reciente; la versión final recuperará el tramo anterior."
                         : "Preparando la transcripción local…"
-                    let text = try await self.parakeet.transcribe(samples: window.samples)
+                    let text = try await self.parakeet.transcribe(
+                        samples: window.samples,
+                        language: session.language,
+                    )
                     try Task.checkCancellation()
                     guard self.activeSession?.id == session.id, self.isRecording else { break }
                     guard !self.isTranscriptionPaused else {
@@ -929,6 +937,7 @@ final class ClassScribeModel {
                 } else {
                     self.state = .finalTranscription
                     self.statusDetail = "La versión en vivo permanece visible mientras se prepara la versión completa."
+                    await self.finalProcessor.configureLanguage(session.language)
                     do {
                         try await self.finalProcessor.configureVocabulary(file: session.technicalVocabularyURL)
                     } catch is CancellationError {
@@ -1083,6 +1092,7 @@ final class ClassScribeModel {
             state: override ?? state,
             folderPath: session.folder.path,
             technicalVocabulary: session.technicalVocabulary,
+            language: session.language,
         )
     }
 

@@ -28,16 +28,28 @@ body:
     attributes:
       label: Build variant
       options:
+        - Windows installer
+        - Windows portable ZIP
+        - macOS DMG
         - Built from source
-        - Development bundle
+    validations:
+      required: true
+
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11 x64
+        - macOS Apple Silicon
     validations:
       required: true
 
   - type: input
-    id: macos
+    id: os-version
     attributes:
-      label: macOS version
-      placeholder: "14.5"
+      label: OS version/build
+      placeholder: "Windows 11 build 26100 or macOS 15.6"
     validations:
       required: true
 

@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ClassScribe.Core/ClassScribe.Core.csproj" />
+    <Project Path="src/ClassScribe.Windows/ClassScribe.Windows.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ClassScribe.Core.Tests/ClassScribe.Core.Tests.csproj" />
+  </Folder>
+</Solution>

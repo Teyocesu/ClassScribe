@@ -170,7 +170,21 @@ struct ContentView: View {
                     .pickerStyle(.segmented)
                     .disabled(model.isSessionBusy)
                 }
-                .frame(width: 265)
+                .frame(width: 240)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Idioma")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Picker("Idioma de transcripción", selection: $model.language) {
+                        ForEach(TranscriptionLanguage.allCases) { language in
+                            Text(language.displayName).tag(language)
+                        }
+                    }
+                    .labelsHidden()
+                    .disabled(model.isSessionBusy)
+                }
+                .frame(width: 105)
 
                 VStack(alignment: .leading, spacing: 5) {
                     Text(model.mode == .online ? "Aplicación" : "Micrófono")

@@ -1,0 +1,268 @@
+<Window x:Class="ClassScribe.Windows.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:automation="clr-namespace:System.Windows.Automation;assembly=PresentationCore"
+        Title="ClassScribe" Width="1180" Height="800"
+        MinWidth="960" MinHeight="680"
+        WindowStartupLocation="CenterScreen"
+        Loaded="Window_Loaded" Closing="Window_Closing">
+  <Window.Resources>
+    <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+    <Style x:Key="SectionLabel" TargetType="TextBlock">
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="Margin" Value="3,12,3,3" />
+      <Setter Property="Foreground" Value="#3E3B52" />
+    </Style>
+    <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Background" Value="{StaticResource AccentBrush}" />
+      <Setter Property="Foreground" Value="White" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+    <Style x:Key="TranscriptBox" TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+      <Setter Property="AcceptsReturn" Value="True" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+      <Setter Property="VerticalScrollBarVisibility" Value="Auto" />
+      <Setter Property="HorizontalScrollBarVisibility" Value="Disabled" />
+      <Setter Property="FontFamily" Value="Segoe UI" />
+      <Setter Property="FontSize" Value="15" />
+      <Setter Property="Padding" Value="16" />
+      <Setter Property="BorderBrush" Value="#DDD9EE" />
+      <Setter Property="Background" Value="White" />
+    </Style>
+  </Window.Resources>
+
+  <Grid Background="{StaticResource PanelBrush}">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+      <RowDefinition Height="Auto" />
+    </Grid.RowDefinitions>
+
+    <Border Grid.Row="0" Background="White" BorderBrush="#E5E2F0" BorderThickness="0,0,0,1" Padding="20,14">
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+        <Border Width="42" Height="42" CornerRadius="10" Background="{StaticResource AccentBrush}">
+          <TextBlock Text="CS" Foreground="White" FontSize="17" FontWeight="Bold"
+                     HorizontalAlignment="Center" VerticalAlignment="Center" />
+        </Border>
+        <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+          <TextBlock Text="ClassScribe" FontSize="23" FontWeight="SemiBold" Foreground="#242134" />
+          <TextBlock Text="Transcripción privada y local para Windows" Foreground="#6F6A81" />
+        </StackPanel>
+        <StackPanel Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center">
+          <TextBlock Text="{Binding ElapsedText}" FontSize="20" FontWeight="SemiBold"
+                     HorizontalAlignment="Right" />
+          <TextBlock Text="{Binding StatusText}" Foreground="#6F6A81" MaxWidth="430"
+                     TextTrimming="CharacterEllipsis" HorizontalAlignment="Right" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <Grid Grid.Row="1" Margin="16">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="355" />
+        <ColumnDefinition Width="12" />
+        <ColumnDefinition Width="*" />
+      </Grid.ColumnDefinitions>
+
+      <Border Grid.Column="0" Background="White" BorderBrush="#E2DFEC" BorderThickness="1"
+              CornerRadius="12" Padding="16">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel>
+            <TextBlock Text="Nueva clase" FontSize="19" FontWeight="SemiBold" Foreground="#29263A" />
+
+            <TextBlock Style="{StaticResource SectionLabel}" Text="Materia" />
+            <TextBox Text="{Binding Subject, UpdateSourceTrigger=PropertyChanged}"
+                     automation:AutomationProperties.Name="Materia"
+                     ToolTip="Nombre de la materia o reunión" />
+
+            <TextBlock Style="{StaticResource SectionLabel}" Text="Tipo de captura" />
+            <ComboBox ItemsSource="{Binding CaptureModes}" SelectedItem="{Binding SelectedMode}"
+                      DisplayMemberPath="Name" SelectionChanged="CaptureMode_SelectionChanged"
+                      automation:AutomationProperties.Name="Tipo de captura" />
+
+            <TextBlock Style="{StaticResource SectionLabel}" Text="Idioma de la clase" />
+            <ComboBox ItemsSource="{Binding Languages}" SelectedItem="{Binding SelectedLanguage}"
+                      DisplayMemberPath="Name"
+                      automation:AutomationProperties.Name="Idioma de transcripción" />
+            <TextBlock Text="Reconocimiento optimizado para español, inglés o francés."
+                       Margin="5,2,5,4" Foreground="#777287" FontSize="12" TextWrapping="Wrap" />
+
+            <TextBlock Style="{StaticResource SectionLabel}" Text="Fuente de audio" />
+            <DockPanel LastChildFill="True">
+              <Button DockPanel.Dock="Right" Content="Actualizar" Click="RefreshSources_Click"
+                      Padding="10,7" ToolTip="Volver a buscar aplicaciones o micrófonos" />
+              <ComboBox ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedSource}"
+                        DisplayMemberPath="DisplayName" MinWidth="225"
+                        automation:AutomationProperties.Name="Fuente de audio" />
+            </DockPanel>
+
+            <TextBlock Style="{StaticResource SectionLabel}" Text="Vocabulario técnico (opcional)" />
+            <TextBox Text="{Binding Vocabulary, UpdateSourceTrigger=PropertyChanged}"
+                     Height="68" AcceptsReturn="True" TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto"
+                     automation:AutomationProperties.Name="Vocabulario técnico"
+                     ToolTip="Nombres propios, siglas y términos separados por comas" />
+
+            <TextBlock Style="{StaticResource SectionLabel}" Text="Nivel de audio" />
+            <ProgressBar Value="{Binding AudioLevel}" Maximum="1" Height="10" Margin="4,3,4,8"
+                         Foreground="{StaticResource AccentBrush}" />
+
+            <UniformGrid Columns="2" Margin="0,4,0,0">
+              <Button Content="Iniciar" Style="{StaticResource PrimaryButton}"
+                      IsEnabled="{Binding CanStart}" Click="Start_Click"
+                      automation:AutomationProperties.Name="Iniciar grabación" />
+              <Button Content="Detener" IsEnabled="{Binding CanStop}" Click="Stop_Click"
+                      automation:AutomationProperties.Name="Detener y procesar" />
+              <Button Content="{Binding PauseButtonText}" IsEnabled="{Binding CanPause}"
+                      Click="Pause_Click" />
+              <Button Content="Cancelar proceso" IsEnabled="{Binding CanCancel}"
+                      Click="Cancel_Click" />
+            </UniformGrid>
+
+            <ProgressBar Value="{Binding ModelProgress}" Maximum="1" Height="5" Margin="4,12,4,4"
+                         Foreground="{StaticResource AccentBrush}" />
+
+            <Border Background="#FFF3DA" BorderBrush="#F1D18C" BorderThickness="1"
+                    CornerRadius="7" Padding="10" Margin="3,10,3,2"
+                    Visibility="{Binding HasWarning, Converter={StaticResource BoolToVisibility}}">
+              <TextBlock Text="{Binding WarningText}" TextWrapping="Wrap" Foreground="#6A4B0B" />
+            </Border>
+
+            <Separator Margin="3,15,3,10" />
+            <TextBlock Text="Sesión actual" FontWeight="SemiBold" />
+            <TextBlock Text="{Binding CurrentFolderLabel}" TextWrapping="Wrap"
+                       Foreground="#777287" Margin="0,4,0,7" />
+            <UniformGrid Columns="2">
+              <Button Content="Abrir carpeta" IsEnabled="{Binding HasCurrentSession}"
+                      Click="OpenFolder_Click" />
+              <Button Content="Reprocesar" IsEnabled="{Binding CanReprocess}"
+                      Click="Reprocess_Click" ToolTip="Repite transcripción y hablantes desde el audio guardado" />
+            </UniformGrid>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
+
+      <Border Grid.Column="2" Background="White" BorderBrush="#E2DFEC" BorderThickness="1"
+              CornerRadius="12" Padding="10">
+        <TabControl x:Name="DocumentsTabs" Background="Transparent" BorderThickness="0">
+          <TabItem Header="En vivo">
+            <Grid Margin="4,10,4,4">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+              </Grid.RowDefinitions>
+              <TextBlock Text="Puedes corregir el texto mientras se graba; tus cambios no se sobrescriben."
+                         Foreground="#777287" Margin="5,0,5,8" />
+              <TextBox Grid.Row="1" Style="{StaticResource TranscriptBox}"
+                       Text="{Binding LiveText, UpdateSourceTrigger=PropertyChanged}"
+                       automation:AutomationProperties.Name="Transcripción en vivo" />
+            </Grid>
+          </TabItem>
+
+          <TabItem Header="Todos">
+            <TextBox Margin="4,10,4,4" Style="{StaticResource TranscriptBox}"
+                     Text="{Binding AllText, UpdateSourceTrigger=PropertyChanged}"
+                     automation:AutomationProperties.Name="Transcripción de todos los hablantes" />
+          </TabItem>
+
+          <TabItem Header="Profesor">
+            <Grid Margin="4,10,4,4">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+              </Grid.RowDefinitions>
+              <DockPanel Margin="4,0,4,8">
+                <Button DockPanel.Dock="Right" Content="Aplicar y guardar"
+                        Click="ApplyProfessor_Click" Padding="12,7" />
+                <TextBlock DockPanel.Dock="Left" Text="Hablante profesor:" VerticalAlignment="Center"
+                           FontWeight="SemiBold" Margin="3,0,8,0" />
+                <ComboBox ItemsSource="{Binding Speakers}" SelectedItem="{Binding SelectedProfessor}"
+                          DisplayMemberPath="DisplayName" MinWidth="190"
+                          automation:AutomationProperties.Name="Hablante profesor" />
+              </DockPanel>
+              <TextBox Grid.Row="1" Style="{StaticResource TranscriptBox}"
+                       Text="{Binding ProfessorText, UpdateSourceTrigger=PropertyChanged}"
+                       automation:AutomationProperties.Name="Transcripción del profesor" />
+            </Grid>
+          </TabItem>
+
+          <TabItem Header="Revisión">
+            <Grid Margin="4,10,4,4">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+              </Grid.RowDefinitions>
+              <TextBlock Text="Revisa solapamientos o asignaciones dudosas. Marca los fragmentos que pertenecen al profesor."
+                         Foreground="#777287" TextWrapping="Wrap" Margin="5,0,5,8" />
+              <DataGrid Grid.Row="1" ItemsSource="{Binding ReviewRows}" AutoGenerateColumns="False"
+                        CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                        AlternatingRowBackground="#F8F7FC" BorderBrush="#DDD9EE">
+                <DataGrid.Columns>
+                  <DataGridTextColumn Header="Tiempo" Binding="{Binding Time}" Width="70" IsReadOnly="True" />
+                  <DataGridTextColumn Header="Hablante" Binding="{Binding Speaker}" Width="105" IsReadOnly="True" />
+                  <DataGridTextColumn Header="Motivo" Binding="{Binding Reason}" Width="180" IsReadOnly="True" />
+                  <DataGridTextColumn Header="Texto" Binding="{Binding Text}" Width="*" IsReadOnly="True" />
+                  <DataGridCheckBoxColumn Header="Profesor" Binding="{Binding IncludeForProfessor, UpdateSourceTrigger=PropertyChanged}"
+                                          Width="75" />
+                </DataGrid.Columns>
+              </DataGrid>
+            </Grid>
+          </TabItem>
+
+          <TabItem Header="Historial">
+            <Grid Margin="4,10,4,4">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="310" />
+                <ColumnDefinition Width="12" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
+              <ListBox ItemsSource="{Binding History}" SelectedItem="{Binding SelectedHistory}"
+                       BorderBrush="#DDD9EE" automation:AutomationProperties.Name="Historial de clases">
+                <ListBox.ItemTemplate>
+                  <DataTemplate>
+                    <StackPanel Margin="7,6" MinWidth="260">
+                      <TextBlock Text="{Binding Heading}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                      <TextBlock Text="{Binding Date}" Foreground="#777287" FontSize="12" />
+                      <TextBlock Text="{Binding Detail}" Foreground="#777287" FontSize="12" />
+                    </StackPanel>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+              <Border Grid.Column="2" Background="#F8F7FC" CornerRadius="8" Padding="22">
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="Abrir una clase anterior" FontSize="19" FontWeight="SemiBold"
+                             HorizontalAlignment="Center" />
+                  <TextBlock Text="Carga sus textos editables. Si quedó interrumpida, ClassScribe puede reconstruir el WAV y volver a procesarla."
+                             TextAlignment="Center" TextWrapping="Wrap" Foreground="#777287"
+                             Margin="12,8,12,16" />
+                  <Button Content="Abrir selección" Style="{StaticResource PrimaryButton}"
+                          Click="LoadHistory_Click" HorizontalAlignment="Center" MinWidth="150" />
+                </StackPanel>
+              </Border>
+            </Grid>
+          </TabItem>
+        </TabControl>
+      </Border>
+    </Grid>
+
+    <Border Grid.Row="2" Background="White" BorderBrush="#E5E2F0" BorderThickness="0,1,0,0"
+            Padding="16,10">
+      <DockPanel>
+        <TextBlock DockPanel.Dock="Left"
+                   Text="Audio y modelos permanecen en tu equipo; Internet solo se usa para la primera descarga del modelo."
+                   Foreground="#777287" VerticalAlignment="Center" />
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button Content="Guardar cambios" IsEnabled="{Binding HasCurrentSession}" Click="Save_Click" />
+          <Button Content="Copiar para chat" IsEnabled="{Binding HasCurrentSession}" Click="Copy_Click" />
+          <Button Content="Exportar…" IsEnabled="{Binding HasCurrentSession}" Click="Export_Click" />
+        </StackPanel>
+      </DockPanel>
+    </Border>
+  </Grid>
+</Window>

@@ -124,6 +124,10 @@ private struct LiveTranscriptEditOverride: Codable {
 }
 
 struct SessionStore {
+    private static let maximumMetadataBytes: UInt64 = 1 * 1_024 * 1_024
+    private static let maximumStructuredBytes: UInt64 = 64 * 1_024 * 1_024
+    private static let maximumTextBytes: UInt64 = 64 * 1_024 * 1_024
+    private static let maximumJournalBytes: UInt64 = 16 * 1_024 * 1_024
     let root: URL
     private let encoder: JSONEncoder
     private let journalEncoder: JSONEncoder
@@ -153,14 +157,19 @@ struct SessionStore {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd_HHmmss"
         let slug = subject.filenameSlug.isEmpty ? "Clase" : subject.filenameSlug
-        let folder = root.appendingPathComponent("\(formatter.string(from: date))_\(slug)", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: folder,
-            withIntermediateDirectories: false,
-            attributes: [.posixPermissions: 0o700],
-        )
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
-        return folder
+        let baseName = "\(formatter.string(from: date))_\(slug)"
+        for suffix in 1 ... 10_000 {
+            let name = suffix == 1 ? baseName : "\(baseName)-\(suffix)"
+            let folder = root.appendingPathComponent(name, isDirectory: true)
+            if mkdir(folder.path, 0o700) == 0 {
+                try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
+                return folder
+            }
+            if errno != EEXIST {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        }
+        throw SessionStoreError.cannotReserveUniqueFolder
     }
 
     func saveLive(
@@ -187,12 +196,12 @@ struct SessionStore {
 
     func loadLive(folder: URL) -> LiveTranscriptAccumulator? {
         let url = folder.appendingPathComponent("live-transcript.json")
-        if let data = try? Data(contentsOf: url),
+        if let data = readRegularData(url, maximumBytes: Self.maximumStructuredBytes),
            let snapshot = try? decoder.decode(LiveTranscriptSnapshot.self, from: data) {
             return snapshot.accumulator
         }
         let journalURL = folder.appendingPathComponent("live-transcript-journal.jsonl")
-        guard let data = try? Data(contentsOf: journalURL) else { return nil }
+        guard let data = readRegularData(journalURL, maximumBytes: Self.maximumJournalBytes) else { return nil }
         for line in data.split(separator: 0x0A).reversed() {
             if let entry = try? decoder.decode(LiveTranscriptJournalEntry.self, from: Data(line)) {
                 return entry.snapshot.accumulator
@@ -310,7 +319,7 @@ struct SessionStore {
     func loadVoiceReference(subject: String) -> ProfessorVoiceReference? {
         let name = subject.filenameSlug.isEmpty ? "Profesor" : subject.filenameSlug
         let url = root.deletingLastPathComponent().appendingPathComponent("ProfessorVoices/\(name).json")
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let data = readRegularData(url, maximumBytes: Self.maximumStructuredBytes) else { return nil }
         return try? decoder.decode(ProfessorVoiceReference.self, from: data)
     }
 
@@ -372,7 +381,7 @@ struct SessionStore {
     private func inspectSession(folder: URL, materializeLegacyText: Bool) -> SessionSummary? {
         let fileManager = FileManager.default
         let metadataURL = folder.appendingPathComponent("metadata.json")
-        let metadataData = try? Data(contentsOf: metadataURL)
+        let metadataData = readRegularData(metadataURL, maximumBytes: Self.maximumMetadataBytes)
         let decodedMetadata = metadataData.flatMap { try? decoder.decode(ClassMetadata.self, from: $0) }
         let audioURL = folder.appendingPathComponent("source.wav")
         let hasAudio = fileManager.fileExists(atPath: audioURL.path)
@@ -486,7 +495,9 @@ struct SessionStore {
     }
 
     private func readNonemptyText(_ url: URL) -> String? {
-        guard let value = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        guard let data = readRegularData(url, maximumBytes: Self.maximumTextBytes),
+              let value = String(data: data, encoding: .utf8)
+        else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
@@ -500,8 +511,18 @@ struct SessionStore {
 
     private func decodeFile<T: Decodable>(_ name: String, in folder: URL) -> T? {
         let url = folder.appendingPathComponent(name)
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let data = readRegularData(url, maximumBytes: Self.maximumStructuredBytes) else { return nil }
         return try? decoder.decode(T.self, from: data)
+    }
+
+    private func readRegularData(_ url: URL, maximumBytes: UInt64) -> Data? {
+        var status = stat()
+        guard lstat(url.path, &status) == 0,
+              status.st_mode & S_IFMT == S_IFREG,
+              status.st_size >= 0,
+              UInt64(status.st_size) <= maximumBytes
+        else { return nil }
+        return try? Data(contentsOf: url, options: [.mappedIfSafe])
     }
 
     private func inferredMetadata(for folder: URL, duration: TimeInterval) -> ClassMetadata {
@@ -556,6 +577,19 @@ struct SessionStore {
     private func appendJournal(_ value: some Encodable, to url: URL) throws {
         var data = try journalEncoder.encode(value)
         data.append(0x0A)
+        var status = stat()
+        if lstat(url.path, &status) == 0 {
+            guard status.st_mode & S_IFMT == S_IFREG else {
+                throw CocoaError(.fileWriteNoPermission)
+            }
+            let currentSize = UInt64(max(0, status.st_size))
+            if currentSize + UInt64(data.count) > Self.maximumJournalBytes {
+                // live-transcript.json is the authoritative atomic snapshot.
+                // Keep a fresh fallback entry without quadratic journal growth.
+                try writePrivateData(data, to: url)
+                return
+            }
+        }
         if !FileManager.default.fileExists(atPath: url.path) {
             guard FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
                 throw CocoaError(.fileWriteUnknown)
@@ -629,8 +663,14 @@ struct SessionStore {
 
 enum SessionStoreError: LocalizedError {
     case emptyTranscript
+    case cannotReserveUniqueFolder
 
     var errorDescription: String? {
-        "La transcripción final no produjo texto; se conserva la versión en vivo."
+        switch self {
+        case .emptyTranscript:
+            "La transcripción final no produjo texto; se conserva la versión en vivo."
+        case .cannotReserveUniqueFolder:
+            "No se pudo reservar una carpeta única para esta clase."
+        }
     }
 }

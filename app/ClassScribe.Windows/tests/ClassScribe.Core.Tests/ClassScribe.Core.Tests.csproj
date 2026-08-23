@@ -1,0 +1,10 @@
+<Project Sdk="MSTest.Sdk/4.3.3">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>ClassScribe.Core.Tests</RootNamespace>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/ClassScribe.Core/ClassScribe.Core.csproj" />
+  </ItemGroup>
+</Project>

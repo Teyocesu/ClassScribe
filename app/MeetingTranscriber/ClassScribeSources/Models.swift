@@ -7,6 +7,22 @@ enum CaptureMode: String, Codable, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum TranscriptionLanguage: String, Codable, CaseIterable, Identifiable, Sendable {
+    case spanish = "es"
+    case english = "en"
+    case french = "fr"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .spanish: "Español"
+        case .english: "English"
+        case .french: "Français"
+        }
+    }
+}
+
 enum ProcessingState: String, Codable {
     case ready = "Lista"
     case startingCapture = "Esperando audio de la fuente"
@@ -91,27 +107,35 @@ struct ClassMetadata: Identifiable, Codable, Equatable {
     var state: ProcessingState
     var folderPath: String
     var technicalVocabulary: String
+    /// Optional keeps metadata from versions before multilingual support decodable.
+    var language: TranscriptionLanguage? = nil
 }
 
 enum Timecode {
     static func display(_ seconds: TimeInterval) -> String {
-        let total = max(0, Int(seconds.rounded(.down)))
+        let total = safeInteger(seconds.rounded(.down))
         let hours = total / 3600
         let minutes = (total % 3600) / 60
         let secs = total % 60
-        if hours > 0 { return String(format: "%d:%02d:%02d", hours, minutes, secs) }
-        return String(format: "%02d:%02d", minutes, secs)
+        if hours > 0 { return "\(hours):\(padded(minutes)):\(padded(secs))" }
+        return "\(padded(minutes)):\(padded(secs))"
     }
 
     static func srt(_ seconds: TimeInterval) -> String {
-        let milliseconds = max(0, Int((seconds * 1_000).rounded()))
-        return String(
-            format: "%02d:%02d:%02d,%03d",
-            milliseconds / 3_600_000,
-            (milliseconds / 60_000) % 60,
-            (milliseconds / 1_000) % 60,
-            milliseconds % 1_000
-        )
+        let milliseconds = safeInteger((seconds * 1_000).rounded())
+        return "\(padded(milliseconds / 3_600_000)):\(padded((milliseconds / 60_000) % 60)):"
+            + "\(padded((milliseconds / 1_000) % 60)),\(padded(milliseconds % 1_000, width: 3))"
+    }
+
+    private static func safeInteger(_ value: Double) -> Int {
+        guard value.isFinite, value > 0 else { return 0 }
+        guard value < Double(Int.max) else { return Int.max }
+        return Int(value)
+    }
+
+    private static func padded(_ value: Int, width: Int = 2) -> String {
+        let text = String(value)
+        return String(repeating: "0", count: max(0, width - text.count)) + text
     }
 }
 

@@ -28,67 +28,9 @@ if [ "$(xcode-select -p)" = "/Library/Developer/CommandLineTools" ]; then
     export SWIFTPM_CUSTOM_LIBS_DIR
     SWIFT_ARGS+=(-Xswiftc -resource-dir -Xswiftc "$PROJECT_ROOT/.toolchain/usr/lib/swift")
 
-    # SwiftPM does not forward -resource-dir while evaluating a dependency
-    # manifest. Build an ignored package mirror that points at the exact,
-    # official FluidAudio copy prepared above. The tracked Package.swift
-    # remains a fixed remote dependency for normal toolchains and CI.
+    # prepare_local_toolchain.sh also creates the ignored package mirror used
+    # by every local test/build entrypoint.
     BUILD_PACKAGE_DIR="$PROJECT_ROOT/.toolchain/ClassScribePackage"
-    mkdir -p "$BUILD_PACKAGE_DIR"
-    ln -sfn "$PACKAGE_DIR/ClassScribeSources" "$BUILD_PACKAGE_DIR/ClassScribeSources"
-    ln -sfn "$PACKAGE_DIR/ClassScribeTests" "$BUILD_PACKAGE_DIR/ClassScribeTests"
-    ln -sfn "$PACKAGE_DIR/ProcessingIPCSources" "$BUILD_PACKAGE_DIR/ProcessingIPCSources"
-    ln -sfn "$PACKAGE_DIR/DiarizationHelperSources" "$BUILD_PACKAGE_DIR/DiarizationHelperSources"
-    cat > "$BUILD_PACKAGE_DIR/Package.swift" <<EOF
-// swift-tools-version: 6.1
-
-import PackageDescription
-
-let package = Package(
-    name: "ClassScribe",
-    platforms: [.macOS("14.2")],
-    products: [
-        .executable(name: "ClassScribe", targets: ["ClassScribe"]),
-        .executable(name: "ClassScribeDiarizer", targets: ["ClassScribeDiarizer"]),
-    ],
-    dependencies: [
-        .package(path: "$PROJECT_ROOT/.toolchain/FluidAudio"),
-        .package(path: "$PROJECT_ROOT/tools/audiotap"),
-    ],
-    targets: [
-        .executableTarget(
-            name: "ClassScribe",
-            dependencies: [
-                .product(name: "FluidAudio", package: "FluidAudio"),
-                .product(name: "AudioTapLib", package: "audiotap"),
-                "ClassScribeProcessingIPC",
-            ],
-            path: "ClassScribeSources",
-            exclude: ["Info.plist"]
-        ),
-        .target(
-            name: "ClassScribeProcessingIPC",
-            path: "ProcessingIPCSources"
-        ),
-        .executableTarget(
-            name: "ClassScribeDiarizer",
-            dependencies: [
-                .product(name: "FluidAudio", package: "FluidAudio"),
-                "ClassScribeProcessingIPC",
-            ],
-            path: "DiarizationHelperSources"
-        ),
-        .testTarget(
-            name: "ClassScribeTests",
-            dependencies: [
-                "ClassScribe",
-                .product(name: "AudioTapLib", package: "audiotap"),
-            ],
-            path: "ClassScribeTests"
-        ),
-    ],
-    swiftLanguageModes: [.v6]
-)
-EOF
 fi
 swift build --package-path "$BUILD_PACKAGE_DIR" "${SWIFT_ARGS[@]}"
 

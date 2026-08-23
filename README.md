@@ -1,17 +1,27 @@
 # ClassScribe
 
-ClassScribe es una aplicación nativa para macOS que graba y transcribe clases universitarias en español, completamente en el dispositivo. Captura **una aplicación elegida** o **un micrófono elegido**, nunca ambos automáticamente. El audio, las transcripciones y las referencias de voz permanecen en la Mac.
+ClassScribe es una aplicación nativa para macOS y Windows que graba y transcribe clases universitarias en **español, inglés o francés**, completamente en el dispositivo. Captura **una aplicación elegida** o **un micrófono elegido**, nunca ambos automáticamente. El audio, las transcripciones y las referencias de voz permanecen en tu equipo.
 
 La revisión de interfaz, captura, transcripción, edición en vivo, instalación e icono realizada el 9 y 10 de agosto de 2026 está documentada en [docs/classscribe-2026-08-09.md](docs/classscribe-2026-08-09.md).
 
 > Obtén permiso del profesor y de las demás personas antes de grabar. Cumple las normas de tu universidad y la legislación aplicable.
 
+## Descargar e instalar
+
+La forma recomendada es abrir [GitHub Releases](https://github.com/Teyocesu/ClassScribe/releases/latest) y descargar el archivo de tu sistema:
+
+- **Windows 11 x64:** `ClassScribe-vX.Y.Z-windows-x64-setup.exe`. Abre el instalador y sigue el asistente; no requiere .NET, Git ni herramientas de desarrollo. También hay un ZIP portable.
+- **macOS 14.2+ con Apple Silicon:** `ClassScribe-vX.Y.Z-arm64.dmg`. Ábrelo y arrastra ClassScribe a Aplicaciones.
+- Cada descarga incluye un `.sha256` para comprobar su integridad. Las builds actuales no tienen firma comercial: Windows SmartScreen o macOS Gatekeeper pueden pedir una confirmación adicional.
+
+El repositorio y sus Releases son privados; una persona autorizada puede descargar los instaladores y compartir los archivos sin entregar el código ni los datos de las clases.
+
 ## Privacidad
 
 - No hay cuentas, telemetría, servidores ni base de datos remota.
 - No usa OpenAI, Claude, Ollama, LM Studio ni ninguna API externa.
-- Solo se accede a Internet durante la primera descarga de FluidAudio y de los modelos Core ML.
-- Audio, texto, etiquetas y embeddings se guardan con permisos de propietario bajo `~/Library/Application Support/ClassScribe/`.
+- Solo se accede a Internet durante la primera descarga verificada de los modelos locales.
+- Audio, texto, etiquetas y embeddings se guardan en `~/Library/Application Support/ClassScribe/` (macOS) o `%LOCALAPPDATA%\ClassScribe\` (Windows).
 - “Copiar para ChatGPT” solo copia texto al portapapeles; no abre ni automatiza ChatGPT.
 
 ## Origen y licencia
@@ -19,6 +29,14 @@ La revisión de interfaz, captura, transcripción, edición en vivo, instalació
 ClassScribe adapta [Meeting Transcriber](https://github.com/pasrom/meeting-transcriber), copyright 2025 pasrom, bajo licencia MIT. Se conserva [LICENSE](LICENSE), la atribución y el historial Git. Se reutiliza su biblioteca `AudioTapLib`; los generadores de protocolos, proveedores Claude/OpenAI, resúmenes, RPC y detección automática del producto original están fuera del target ClassScribe y no se compilan.
 
 ## Requisitos
+
+### Windows
+
+- Windows 11 x64 (versión 21H2/build 22000 o posterior).
+- Aproximadamente 2 GB libres para la aplicación, sesiones y modelos.
+- Conexión a Internet para la primera descarga de modelos; luego funciona localmente.
+
+### macOS
 
 - Apple Silicon (probado para M1).
 - macOS 14.2 o posterior; la máquina de desarrollo usa macOS 15.3.2.
@@ -32,7 +50,7 @@ Dependencias:
 - `AudioTapLib`/`CATapDescription` para audio aislado por proceso.
 - FluidAudio 0.15.5, Parakeet TDT v3 multilingüe y OfflineDiarizer/WeSpeaker.
 
-## Compilar y ejecutar
+## Compilar y ejecutar en macOS
 
 Desde el repositorio:
 
@@ -65,11 +83,21 @@ La app aparece como **ClassScribe** en Finder y Launchpad con el icono incluido 
 
 ## Distribución
 
-Las versiones para compartir se publican como assets de GitHub Releases en el repositorio privado. Un tag `vX.Y.Z` que coincida con `VERSION` crea una release ad-hoc con `ClassScribe-vX.Y.Z-arm64.dmg` y su checksum; el propietario puede descargar ese DMG y enviarlo manualmente sin dar acceso al repositorio. No requiere una cuenta de Apple Developer. La guía de creación, instalación y la futura opción de notarización está en [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md).
+Las versiones para compartir se publican como assets de GitHub Releases en el repositorio privado. Un tag `vX.Y.Z` que coincida con `VERSION` compila, prueba y publica el DMG de macOS, el instalador de Windows, un ZIP portable y sus checksums. La guía está en [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md).
+
+### Compilar el paquete de Windows
+
+Desde PowerShell en Windows 11, con el SDK .NET 10 e Inno Setup 6 o posterior:
+
+```powershell
+./scripts/build_windows.ps1
+```
+
+El script restaura dependencias bloqueadas, compila con analizadores, ejecuta pruebas, publica una app autocontenida, valida el ejecutable y crea los cuatro assets bajo `.build/windows/release/`.
 
 ## Modelos
 
-Parakeet TDT v3 y los modelos de diarización se descargan automáticamente en la primera transcripción/diarización mediante FluidAudio. Durante esa carga la interfaz muestra “Preparando transcripción”. Si faltan o falla la descarga, la grabación continúa y la interfaz informa el error sin cerrar la app. Los modelos no se guardan en Git.
+En macOS, Parakeet TDT v3 multilingüe y los modelos de diarización se descargan mediante FluidAudio. En Windows se usa Whisper large-v3-turbo cuantizado, con idioma explícito y vocabulario técnico, más modelos sherpa-onnx para voces. Español, inglés y francés se seleccionan antes de grabar y el idioma queda persistido con la sesión. Las descargas de Windows validan tamaño y SHA-256 antes de cargar código nativo. Si la preparación falla, la grabación se conserva y la interfaz permite reintentar. Los modelos no se guardan en Git.
 
 ## Permisos
 
@@ -83,7 +111,7 @@ Selecciona el micrófono. macOS pedirá permiso; si se negó antes, ve a **Ajust
 
 ## Uso
 
-1. Escribe la materia.
+1. Escribe la materia y elige Español, English o Français.
 2. Elige “Clase online” o “Clase presencial” y la fuente. El único botón principal explica qué dato falta hasta que la configuración sea válida.
 3. Si hace falta, despliega “Agregar vocabulario técnico (opcional)” y escribe términos separados por comas.
 4. Pulsa “Iniciar grabación”. La app no declara una captura activa hasta recibir frames reales; una fuente silenciosa es válida, pero una fuente sin callbacks produce un error recuperable y accionable.
@@ -136,6 +164,8 @@ La app genera automáticamente:
   professor-voice-reference.json   # cuando existe una referencia
   metadata.json
 ```
+
+En Windows, la misma estructura se guarda bajo `%LOCALAPPDATA%\ClassScribe\Classes\AAAA-MM-DD_HHMMSS_Materia-ID\`.
 
 `live-transcript.txt` es UTF-8, legible con TextEdit o VS Code y se actualiza después de cada resultado ASR, pausa, reanudación y stop. JSON y journal son estado interno de recuperación; el usuario no necesita abrirlos.
 
@@ -206,13 +236,13 @@ CLASSSCRIBE_RUN_MIC_CAPTURE_TEST=1 swift test \
   --filter microphoneCaptureFixture
 ```
 
-Resultados observados el 10 de agosto de 2026: 114 pruebas aprobaron con concurrencia estricta de Swift 6; cinco fixtures físicos/de modelos quedaron omitidos en el pase integrado. En pases opt-in separados también aprobaron Parakeet sobre un fixture español, diarización de dos voces y captura CATap audible de `afplay`. El fixture CATap pasó además cuatro veces durante la corrección de su registro transitorio. La prueba física de micrófono no se ejecutó porque graba 60 segundos del ambiente y requiere autorización explícita del host.
+La suite cubre además compatibilidad de metadatos multilingües y sesiones heredadas. Los fixtures físicos/de modelos quedan omitidos salvo activación explícita porque requieren permisos, audio o descargas reales.
 
 ## Limitaciones conocidas del MVP
 
 - La diarización y las tarjetas de varios hablantes se actualizan al detener la clase; durante la grabación se conserva y muestra el texto vivo, pero no se promete diarización verdaderamente streaming.
 - La separación de voces, superposiciones y reconocimiento son de mejor esfuerzo. Los casos inseguros se conservan en Revisar.
-- La primera carga de modelos puede tardar varios minutos y consumir memoria significativa en una Mac de 8 GB.
+- La primera carga de modelos puede tardar varios minutos y consumir memoria significativa; en Windows la descarga de Whisper es de aproximadamente 574 MB.
 - Editar texto no cambia el audio ni los segmentos JSON. TXT/Markdown sí reflejan la edición; SRT conserva tiempos/segmentos finales y lo advierte.
 - En esta máquina no hay Xcode completo. SwiftPM valida localmente y GitHub Actions ejecuta XCTest y builds Xcode Debug/Release.
 - La suite XCTest heredada de `tools/audiotap` tampoco está disponible con estos Command Line Tools (`no such module XCTest`), aunque la biblioteca sí compila y enlaza dentro del target ClassScribe.
@@ -228,7 +258,7 @@ Resultados observados el 10 de agosto de 2026: 114 pruebas aprobaron con concurr
 
 ## GitHub
 
-Los modelos, grabaciones, transcripciones, embeddings, logs, secretos, DerivedData y datos Xcode de usuario están ignorados. El CI automático de ClassScribe resuelve FluidAudio desde el repositorio oficial fijado en `Package.resolved`, hace builds SwiftPM Debug/Release, ejecuta las pruebas unitarias de ClassScribe y AudioTap, y construye el paquete con Xcode. Las pruebas que requieren TCC, micrófono, CATap, audio real o interfaz gráfica quedan solo como pruebas locales opt-in.
+Los modelos, grabaciones, transcripciones, embeddings, logs, secretos y artefactos de build están ignorados. El CI automático valida macOS y Windows: usa revisiones fijas de Actions, dependencias Swift/NuGet bloqueadas, pruebas unitarias, builds Release y un smoke test del ejecutable Windows publicado. Las pruebas que requieren permisos, micrófono, audio real o interfaz gráfica quedan como pruebas físicas opt-in.
 
 Para subir cambios posteriores:
 

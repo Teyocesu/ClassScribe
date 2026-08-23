@@ -15,12 +15,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
-    name: Build and test
+  macos:
+    name: macOS build and test
     runs-on: macos-15
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
 
       - name: Toolchain
         run: |
@@ -65,3 +67,23 @@ jobs:
 
       # Tests requiring TCC, audio hardware, CATap, or UI interaction remain
       # opt-in locally; no GitHub-hosted runner can authorize them reliably.
+
+  windows:
+    name: Windows build, test, and package smoke test
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install fixed .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.302
+          cache: true
+          cache-dependency-path: app/ClassScribe.Windows/**/packages.lock.json
+
+      - name: Build, test, publish, and smoke-test Windows app
+        shell: pwsh
+        run: ./scripts/build_windows.ps1 -SkipInstaller

@@ -230,27 +230,41 @@ actor ParakeetService {
         return manager
     }
 
-    func transcribe(samples: [Float]) async throws -> String {
+    func transcribe(
+        samples: [Float],
+        language: TranscriptionLanguage = .spanish,
+    ) async throws -> String {
         try Task.checkCancellation()
         let manager = try await loadedManager()
         try Task.checkCancellation()
         let result = try await inferenceQueue.run {
             var state = await TdtDecoderState.make(decoderLayers: manager.decoderLayerCount)
             try Task.checkCancellation()
-            return try await manager.transcribe(samples, decoderState: &state, language: .spanish)
+            return try await manager.transcribe(
+                samples,
+                decoderState: &state,
+                language: language.fluidAudioLanguage,
+            )
         }
         try Task.checkCancellation()
         return result.text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    func transcribe(file: URL) async throws -> [TranscriptSegment] {
+    func transcribe(
+        file: URL,
+        language: TranscriptionLanguage = .spanish,
+    ) async throws -> [TranscriptSegment] {
         try Task.checkCancellation()
         let manager = try await loadedManager()
         try Task.checkCancellation()
         let result = try await inferenceQueue.run {
             var state = await TdtDecoderState.make(decoderLayers: manager.decoderLayerCount)
             try Task.checkCancellation()
-            return try await manager.transcribe(file, decoderState: &state, language: .spanish)
+            return try await manager.transcribe(
+                file,
+                decoderState: &state,
+                language: language.fluidAudioLanguage,
+            )
         }
         try Task.checkCancellation()
         var segments = Self.makeSegments(result)
@@ -388,6 +402,7 @@ actor ParakeetService {
 actor FinalProcessor {
     private let parakeet: ParakeetService
     private let diarizationRunner: DiarizationProcessRunner
+    private var language: TranscriptionLanguage = .spanish
 
     init(parakeet: ParakeetService, diarizationRunner: DiarizationProcessRunner = DiarizationProcessRunner()) {
         self.parakeet = parakeet
@@ -396,7 +411,11 @@ actor FinalProcessor {
 
     func transcribe(_ audioURL: URL) async throws -> [TranscriptSegment] {
         try Task.checkCancellation()
-        return try await parakeet.transcribe(file: audioURL)
+        return try await parakeet.transcribe(file: audioURL, language: language)
+    }
+
+    func configureLanguage(_ language: TranscriptionLanguage) {
+        self.language = language
     }
 
     func configureVocabulary(file: URL?) async throws {
@@ -429,12 +448,29 @@ actor FinalProcessor {
 }
 
 protocol FinalProcessingProviding: Sendable {
+    func configureLanguage(_ language: TranscriptionLanguage) async
     func configureVocabulary(file: URL?) async throws
     func transcribe(_ audioURL: URL) async throws -> [TranscriptSegment]
     func diarize(_ audioURL: URL) async throws -> (spans: [DiarizationSpan], embeddings: [String: [Float]])
 }
 
 extension FinalProcessor: FinalProcessingProviding {}
+
+extension FinalProcessingProviding {
+    /// Existing test processors and third-party adapters remain source
+    /// compatible; production's FinalProcessor overrides this actor method.
+    func configureLanguage(_: TranscriptionLanguage) async {}
+}
+
+private extension TranscriptionLanguage {
+    var fluidAudioLanguage: Language {
+        switch self {
+        case .spanish: .spanish
+        case .english: .english
+        case .french: .french
+        }
+    }
+}
 
 enum InferenceError: LocalizedError {
     case modelUnavailable

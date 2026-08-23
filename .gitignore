@@ -54,6 +54,12 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 
+# .NET / Windows build artifacts
+**/bin/
+**/obj/
+app/ClassScribe.Windows/artifacts/
+app/ClassScribe.Windows/publish/
+
 # Release build artifacts
 .build/
 

@@ -54,6 +54,41 @@ func exports() {
     #expect(TranscriptExporter.srt(segments).contains("00:00:01,200 --> 00:00:03,400"))
 }
 
+@Test("Los timecodes inválidos se normalizan sin cerrar la aplicación")
+func invalidTimecodesAreClamped() {
+    #expect(Timecode.display(.nan) == "00:00")
+    #expect(Timecode.display(-.infinity) == "00:00")
+    #expect(Timecode.srt(.infinity) == "00:00:00,000")
+}
+
+@Test("Los tres idiomas se persisten y las sesiones antiguas conservan español")
+func transcriptionLanguagesRoundTripAndRemainBackwardCompatible() throws {
+    #expect(TranscriptionLanguage.allCases.map(\.rawValue) == ["es", "en", "fr"])
+    #expect(TranscriptionLanguage.french.displayName == "Français")
+
+    let legacy = ClassMetadata(
+        id: UUID(),
+        subject: "Historia",
+        startedAt: Date(timeIntervalSince1970: 0),
+        duration: 1,
+        mode: .inPerson,
+        source: "Micrófono",
+        professorSpeakerID: nil,
+        professorSelectionIsAutomatic: true,
+        speakerCount: 0,
+        state: .complete,
+        folderPath: "/tmp/example",
+        technicalVocabulary: "",
+    )
+    let legacyData = try JSONEncoder().encode(legacy)
+    #expect(try JSONDecoder().decode(ClassMetadata.self, from: legacyData).language == nil)
+
+    var multilingual = legacy
+    multilingual.language = .french
+    let multilingualData = try JSONEncoder().encode(multilingual)
+    #expect(try JSONDecoder().decode(ClassMetadata.self, from: multilingualData).language == .french)
+}
+
 @Test("La transcripción final agrupa pausas naturales y separa cambios claros")
 func finalTranscriptParagraphs() {
     let segments = [

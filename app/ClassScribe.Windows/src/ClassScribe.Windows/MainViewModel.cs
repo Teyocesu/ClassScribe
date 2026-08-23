@@ -1,0 +1,1247 @@
+using System.Collections.ObjectModel;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Windows;
+using ClassScribe.Core;
+
+namespace ClassScribe.Windows;
+
+internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
+{
+    private const long MaximumReadableDocumentBytes = 64 * 1_024 * 1_024;
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
+    private readonly SessionStore sessionStore = new();
+    private readonly LocalModelProvisioner modelProvisioner = new();
+    private readonly WindowsAudioCapture audioCapture = new();
+    private readonly WhisperTranscriber transcriber;
+    private readonly List<TranscriptSegment> segments = [];
+    private CancellationTokenSource? liveCancellation;
+    private CancellationTokenSource? timerCancellation;
+    private CancellationTokenSource? processingCancellation;
+    private TaskCompletionSource? activeOperation;
+    private Task? liveTask;
+    private Task? timerTask;
+    private CaptureModeChoice selectedMode;
+    private LanguageChoice selectedLanguage;
+    private AudioSourceOption? selectedSource;
+    private HistoryRow? selectedHistory;
+    private SpeakerRecord? selectedProfessor;
+    private ClassMetadata? currentMetadata;
+    private string? currentFolder;
+    private string subject = string.Empty;
+    private string vocabulary = string.Empty;
+    private string liveText = string.Empty;
+    private string allText = string.Empty;
+    private string professorText = string.Empty;
+    private string automaticLiveText = string.Empty;
+    private string statusText = "Lista para grabar";
+    private string warningText = string.Empty;
+    private string elapsedText = "00:00";
+    private double audioLevel;
+    private double modelProgress;
+    private bool isRecording;
+    private bool isBusy;
+    private bool isPaused;
+    private bool liveWasEdited;
+    private bool settingLiveProgrammatically;
+    private bool disposed;
+
+    public MainViewModel()
+    {
+        CaptureModes =
+        [
+            new CaptureModeChoice(CaptureMode.Online, "Clase online · audio de una aplicación"),
+            new CaptureModeChoice(CaptureMode.InPerson, "Clase presencial · micrófono"),
+        ];
+        Languages =
+        [
+            new LanguageChoice("es", "Español"),
+            new LanguageChoice("en", "English"),
+            new LanguageChoice("fr", "Français"),
+        ];
+        selectedMode = CaptureModes[0];
+        selectedLanguage = Languages[0];
+        transcriber = new WhisperTranscriber(modelProvisioner);
+        audioCapture.LevelChanged += HandleAudioLevel;
+        audioCapture.CaptureFaulted += HandleCaptureFault;
+    }
+
+    public IReadOnlyList<CaptureModeChoice> CaptureModes { get; }
+
+    public IReadOnlyList<LanguageChoice> Languages { get; }
+
+    public ObservableCollection<AudioSourceOption> Sources { get; } = [];
+
+    public ObservableCollection<HistoryRow> History { get; } = [];
+
+    public ObservableCollection<SpeakerRecord> Speakers { get; } = [];
+
+    public ObservableCollection<ReviewRow> ReviewRows { get; } = [];
+
+    public CaptureModeChoice SelectedMode
+    {
+        get => selectedMode;
+        set
+        {
+            if (SetProperty(ref selectedMode, value))
+            {
+                SelectedSource = null;
+                NotifyAvailability();
+            }
+        }
+    }
+
+    public LanguageChoice SelectedLanguage
+    {
+        get => selectedLanguage;
+        set => SetProperty(ref selectedLanguage, value);
+    }
+
+    public AudioSourceOption? SelectedSource
+    {
+        get => selectedSource;
+        set
+        {
+            if (SetProperty(ref selectedSource, value))
+            {
+                NotifyAvailability();
+            }
+        }
+    }
+
+    public HistoryRow? SelectedHistory
+    {
+        get => selectedHistory;
+        set => SetProperty(ref selectedHistory, value);
+    }
+
+    public SpeakerRecord? SelectedProfessor
+    {
+        get => selectedProfessor;
+        set => SetProperty(ref selectedProfessor, value);
+    }
+
+    public string Subject
+    {
+        get => subject;
+        set
+        {
+            if (SetProperty(ref subject, value))
+            {
+                NotifyAvailability();
+            }
+        }
+    }
+
+    public string Vocabulary
+    {
+        get => vocabulary;
+        set => SetProperty(ref vocabulary, value);
+    }
+
+    public string LiveText
+    {
+        get => liveText;
+        set
+        {
+            if (SetProperty(ref liveText, value)
+                && IsRecording
+                && !settingLiveProgrammatically)
+            {
+                liveWasEdited = true;
+            }
+        }
+    }
+
+    public string AllText
+    {
+        get => allText;
+        set => SetProperty(ref allText, value);
+    }
+
+    public string ProfessorText
+    {
+        get => professorText;
+        set => SetProperty(ref professorText, value);
+    }
+
+    public string StatusText
+    {
+        get => statusText;
+        private set => SetProperty(ref statusText, value);
+    }
+
+    public string WarningText
+    {
+        get => warningText;
+        private set
+        {
+            if (SetProperty(ref warningText, value))
+            {
+                OnPropertyChanged(nameof(HasWarning));
+            }
+        }
+    }
+
+    public bool HasWarning => !string.IsNullOrWhiteSpace(WarningText);
+
+    public string ElapsedText
+    {
+        get => elapsedText;
+        private set => SetProperty(ref elapsedText, value);
+    }
+
+    public double AudioLevel
+    {
+        get => audioLevel;
+        private set => SetProperty(ref audioLevel, value);
+    }
+
+    public double ModelProgress
+    {
+        get => modelProgress;
+        private set => SetProperty(ref modelProgress, value);
+    }
+
+    public bool IsRecording
+    {
+        get => isRecording;
+        private set
+        {
+            if (SetProperty(ref isRecording, value))
+            {
+                NotifyAvailability();
+            }
+        }
+    }
+
+    public bool IsBusy
+    {
+        get => isBusy;
+        private set
+        {
+            if (SetProperty(ref isBusy, value))
+            {
+                NotifyAvailability();
+            }
+        }
+    }
+
+    public bool IsPaused
+    {
+        get => isPaused;
+        private set
+        {
+            if (SetProperty(ref isPaused, value))
+            {
+                OnPropertyChanged(nameof(PauseButtonText));
+            }
+        }
+    }
+
+    public string PauseButtonText => IsPaused ? "Reanudar texto" : "Pausar texto";
+
+    public bool CanStart => !IsBusy
+        && !IsRecording
+        && SelectedSource is not null
+        && !string.IsNullOrWhiteSpace(Subject);
+
+    public bool CanStop => IsRecording && !IsBusy;
+
+    public bool CanPause => IsRecording && !IsBusy;
+
+    public bool CanCancel => IsBusy && processingCancellation is not null;
+
+    public bool HasCurrentSession => currentFolder is not null;
+
+    public string CurrentFolderLabel => currentFolder is null
+        ? "Todavía no hay una sesión abierta"
+        : Path.GetFileName(currentFolder);
+
+    public bool CanReprocess => !IsBusy
+        && !IsRecording
+        && currentFolder is not null
+        && (File.Exists(Path.Combine(currentFolder, "source.wav"))
+            || File.Exists(Path.Combine(currentFolder, "source.raw")));
+
+    public async Task InitializeAsync()
+    {
+        await RefreshHistoryAsync().ConfigureAwait(true);
+        await RefreshSourcesAsync().ConfigureAwait(true);
+    }
+
+    public async Task RefreshSourcesAsync()
+    {
+        if (IsRecording || IsBusy)
+        {
+            return;
+        }
+
+        StatusText = SelectedMode.Value == CaptureMode.Online
+            ? "Buscando aplicaciones abiertas…"
+            : "Buscando micrófonos…";
+        WarningText = string.Empty;
+        try
+        {
+            var mode = SelectedMode.Value;
+            var found = await Task.Run(() => mode == CaptureMode.Online
+                    ? WindowsAudioCapture.EnumerateApplications()
+                    : WindowsAudioCapture.EnumerateMicrophones())
+                .ConfigureAwait(true);
+            Sources.Clear();
+            foreach (var source in found)
+            {
+                Sources.Add(source);
+            }
+
+            SelectedSource = Sources.FirstOrDefault();
+            StatusText = Sources.Count == 0
+                ? mode == CaptureMode.Online
+                    ? "No hay aplicaciones con ventana abierta"
+                    : "No se encontraron micrófonos activos"
+                : "Lista para grabar";
+        }
+        catch (Exception error) when (error is InvalidOperationException
+                                           or System.ComponentModel.Win32Exception
+                                           or UnauthorizedAccessException)
+        {
+            Sources.Clear();
+            SelectedSource = null;
+            WarningText = $"No se pudieron leer las fuentes de audio: {error.Message}";
+            StatusText = "Revisa los permisos de micrófono de Windows";
+        }
+    }
+
+    public async Task StartAsync()
+    {
+        if (!CanStart || SelectedSource is null)
+        {
+            WarningText = "Completa la materia y selecciona una fuente de audio.";
+            return;
+        }
+
+        var operation = BeginOperation();
+        IsBusy = true;
+        WarningText = string.Empty;
+        ModelProgress = 0;
+        segments.Clear();
+        Speakers.Clear();
+        ReviewRows.Clear();
+        SelectedProfessor = null;
+        automaticLiveText = string.Empty;
+        liveWasEdited = false;
+        SetLiveProgrammatically(string.Empty);
+        AllText = string.Empty;
+        ProfessorText = string.Empty;
+        processingCancellation = new CancellationTokenSource();
+        NotifyAvailability();
+        var cancellationToken = processingCancellation.Token;
+        var startedAt = DateTimeOffset.Now;
+
+        try
+        {
+            currentFolder = sessionStore.CreateFolder(Subject.Trim(), startedAt);
+            currentMetadata = new ClassMetadata
+            {
+                Subject = Subject.Trim(),
+                StartedAt = startedAt,
+                Mode = SelectedMode.Value,
+                Source = SelectedSource.DisplayName,
+                TechnicalVocabulary = Vocabulary.Trim(),
+                Language = SelectedLanguage.Code,
+                State = ProcessingState.StartingCapture,
+                FolderPath = currentFolder,
+            };
+            NotifyCurrentSessionChanged();
+            await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, cancellationToken)
+                .ConfigureAwait(true);
+
+            StatusText = "Esperando la primera muestra de audio…";
+            await audioCapture.StartAsync(SelectedSource, currentFolder, cancellationToken).ConfigureAwait(true);
+            IsRecording = true;
+            currentMetadata = currentMetadata with { State = ProcessingState.Recording };
+            await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, cancellationToken)
+                .ConfigureAwait(true);
+            StatusText = "Grabando y guardando audio localmente";
+            StartBackgroundLoops();
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText = "Inicio cancelado; cualquier audio recibido quedó guardado";
+            await MarkCurrentStateAsync(ProcessingState.Cancelled).ConfigureAwait(true);
+        }
+        catch (Exception error)
+        {
+            WarningText = error.Message;
+            StatusText = "No se pudo iniciar la grabación";
+            await MarkCurrentStateAsync(ProcessingState.Failed).ConfigureAwait(true);
+        }
+        finally
+        {
+            try
+            {
+                processingCancellation?.Dispose();
+                processingCancellation = null;
+                IsBusy = false;
+                NotifyAvailability();
+                await RefreshHistoryAsync().ConfigureAwait(true);
+            }
+            finally
+            {
+                CompleteOperation(operation);
+            }
+        }
+    }
+
+    public void TogglePause()
+    {
+        if (!CanPause)
+        {
+            return;
+        }
+
+        IsPaused = !IsPaused;
+        StatusText = IsPaused
+            ? "Grabando audio · transcripción en vivo pausada"
+            : "Grabando y transcribiendo";
+    }
+
+    public Task StopAsync() => StopAsync(processAfterStop: true);
+
+    public Task StopForExitAsync() => StopAsync(processAfterStop: false);
+
+    private async Task StopAsync(bool processAfterStop)
+    {
+        if (!CanStop)
+        {
+            return;
+        }
+
+        var operation = BeginOperation();
+        IsBusy = true;
+        IsPaused = false;
+        WarningText = string.Empty;
+        StatusText = "Cerrando y validando el audio…";
+        processingCancellation = new CancellationTokenSource();
+        NotifyAvailability();
+
+        try
+        {
+            await StopBackgroundLoopsAsync().ConfigureAwait(true);
+            var wavePath = await audioCapture.StopAsync(CancellationToken.None).ConfigureAwait(true);
+            IsRecording = false;
+            if (audioCapture.LastWarning is { } captureWarning)
+            {
+                WarningText = captureWarning;
+            }
+            var duration = PcmWaveFile.Validate(wavePath);
+            if (currentMetadata is null || currentFolder is null)
+            {
+                throw new InvalidOperationException("La sesión activa perdió sus metadatos.");
+            }
+
+            currentMetadata = currentMetadata with
+            {
+                Duration = duration,
+                State = ProcessingState.FinalizingAudio,
+            };
+            await sessionStore.SaveLiveAsync(
+                    LiveText,
+                    currentMetadata,
+                    currentFolder,
+                    "audio-finalized",
+                    CancellationToken.None)
+                .ConfigureAwait(true);
+            await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, CancellationToken.None)
+                .ConfigureAwait(true);
+
+            if (processAfterStop)
+            {
+                await ProcessWaveAsync(wavePath, processingCancellation.Token).ConfigureAwait(true);
+            }
+            else
+            {
+                currentMetadata = currentMetadata with { State = ProcessingState.Recoverable };
+                await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, CancellationToken.None)
+                    .ConfigureAwait(true);
+                StatusText = "Audio y texto guardados para reprocesar en el próximo inicio";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            IsRecording = false;
+            StatusText = "Procesamiento cancelado; la grabación y el texto parcial se conservaron";
+            await MarkCurrentStateAsync(ProcessingState.Cancelled).ConfigureAwait(true);
+        }
+        catch (Exception error)
+        {
+            IsRecording = false;
+            WarningText = error.Message;
+            StatusText = "La sesión quedó guardada para reintentar";
+            await MarkCurrentStateAsync(ProcessingState.Failed).ConfigureAwait(true);
+        }
+        finally
+        {
+            try
+            {
+                await StopBackgroundLoopsAsync().ConfigureAwait(true);
+                processingCancellation?.Dispose();
+                processingCancellation = null;
+                IsBusy = false;
+                ModelProgress = 0;
+                NotifyAvailability();
+                await RefreshHistoryAsync().ConfigureAwait(true);
+            }
+            finally
+            {
+                CompleteOperation(operation);
+            }
+        }
+    }
+
+    public void CancelCurrentOperation()
+    {
+        processingCancellation?.Cancel();
+        StatusText = "Cancelando de forma segura…";
+    }
+
+    public async Task LoadSelectedHistoryAsync()
+    {
+        if (SelectedHistory is null || IsRecording || IsBusy)
+        {
+            return;
+        }
+
+        await LoadSessionAsync(SelectedHistory.Session).ConfigureAwait(true);
+    }
+
+    public async Task ReprocessCurrentAsync()
+    {
+        if (!CanReprocess || currentFolder is null || currentMetadata is null)
+        {
+            WarningText = "Esta sesión no conserva audio suficiente para reprocesar.";
+            return;
+        }
+
+        var operation = BeginOperation();
+        IsBusy = true;
+        WarningText = string.Empty;
+        processingCancellation = new CancellationTokenSource();
+        NotifyAvailability();
+        try
+        {
+            var wavePath = await sessionStore.RecoverRawAudioAsync(
+                    currentFolder,
+                    processingCancellation.Token)
+                .ConfigureAwait(true);
+            currentMetadata = currentMetadata with
+            {
+                Duration = PcmWaveFile.Validate(wavePath),
+                State = ProcessingState.FinalTranscription,
+            };
+            await ProcessWaveAsync(wavePath, processingCancellation.Token).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText = "Reprocesado cancelado; los archivos existentes no cambiaron";
+            await MarkCurrentStateAsync(ProcessingState.Cancelled).ConfigureAwait(true);
+        }
+        catch (Exception error)
+        {
+            WarningText = error.Message;
+            StatusText = "No se pudo reprocesar; los archivos anteriores siguen disponibles";
+            await MarkCurrentStateAsync(ProcessingState.Failed).ConfigureAwait(true);
+        }
+        finally
+        {
+            try
+            {
+                processingCancellation?.Dispose();
+                processingCancellation = null;
+                IsBusy = false;
+                ModelProgress = 0;
+                NotifyAvailability();
+                await RefreshHistoryAsync().ConfigureAwait(true);
+            }
+            finally
+            {
+                CompleteOperation(operation);
+            }
+        }
+    }
+
+    public async Task ApplyProfessorSelectionAsync()
+    {
+        if (currentMetadata is null || currentFolder is null || segments.Count == 0)
+        {
+            return;
+        }
+
+        var review = ReviewRows.Select(static row => row.ToModel()).ToArray();
+        var professor = SpeakerAssignment.ProfessorSegments(
+            segments,
+            SelectedProfessor?.Id,
+            review);
+        ProfessorText = TranscriptExporter.PlainText(professor);
+        currentMetadata = currentMetadata with
+        {
+            ProfessorSpeakerID = SelectedProfessor?.Id,
+            ProfessorSelectionIsAutomatic = false,
+            State = ProcessingState.Complete,
+        };
+        await sessionStore.SaveFinalAsync(
+                currentMetadata,
+                segments,
+                professor,
+                review,
+                Speakers.ToArray(),
+                currentFolder,
+                AllText,
+                ProfessorText)
+            .ConfigureAwait(true);
+        StatusText = "Selección de profesor guardada";
+    }
+
+    public async Task SaveEditsAsync()
+    {
+        if (currentMetadata is null || currentFolder is null)
+        {
+            return;
+        }
+
+        if (segments.Count == 0)
+        {
+            await sessionStore.SaveEditedDocumentsAsync(
+                    currentMetadata,
+                    currentFolder,
+                    AllText,
+                    ProfessorText)
+                .ConfigureAwait(true);
+        }
+        else
+        {
+            var review = ReviewRows.Select(static row => row.ToModel()).ToArray();
+            var professor = SpeakerAssignment.ProfessorSegments(
+                segments,
+                SelectedProfessor?.Id ?? currentMetadata.ProfessorSpeakerID,
+                review);
+            await sessionStore.SaveFinalAsync(
+                    currentMetadata,
+                    segments,
+                    professor,
+                    review,
+                    Speakers.ToArray(),
+                    currentFolder,
+                    AllText,
+                    ProfessorText)
+                .ConfigureAwait(true);
+        }
+
+        StatusText = "Cambios guardados";
+        await RefreshHistoryAsync().ConfigureAwait(true);
+    }
+
+    public string ChatEnvelope() => currentMetadata is null
+        ? AllText
+        : TranscriptActions.ChatEnvelope(
+            currentMetadata.Subject,
+            currentMetadata.StartedAt,
+            currentMetadata.Duration,
+            currentMetadata.Mode,
+            currentMetadata.Source,
+            TranscriptActions.BestAvailable(ProfessorText, AllText, LiveText));
+
+    public string? CurrentFolder => currentFolder;
+
+    public DateTimeOffset CurrentStartedAt => currentMetadata?.StartedAt ?? DateTimeOffset.Now;
+
+    public async ValueTask DisposeAsync()
+    {
+        if (disposed)
+        {
+            return;
+        }
+
+        disposed = true;
+        liveCancellation?.Cancel();
+        timerCancellation?.Cancel();
+        processingCancellation?.Cancel();
+        if (activeOperation?.Task is { } operation)
+        {
+            await operation.ConfigureAwait(false);
+        }
+        await StopBackgroundLoopsAsync().ConfigureAwait(false);
+        audioCapture.LevelChanged -= HandleAudioLevel;
+        audioCapture.CaptureFaulted -= HandleCaptureFault;
+        await audioCapture.DisposeAsync().ConfigureAwait(false);
+        await transcriber.DisposeAsync().ConfigureAwait(false);
+        modelProvisioner.Dispose();
+        liveCancellation?.Dispose();
+        timerCancellation?.Dispose();
+        processingCancellation?.Dispose();
+    }
+
+    public void ReportUiError(Exception error)
+    {
+        CrashLog.Write(error);
+        WarningText = error.Message;
+        StatusText = "La operación no pudo completarse";
+    }
+
+    private void StartBackgroundLoops()
+    {
+        liveCancellation?.Dispose();
+        timerCancellation?.Dispose();
+        liveCancellation = new CancellationTokenSource();
+        timerCancellation = new CancellationTokenSource();
+        liveTask = RunLiveTranscriptionAsync(liveCancellation.Token);
+        timerTask = RunElapsedTimerAsync(timerCancellation.Token);
+    }
+
+    private async Task StopBackgroundLoopsAsync()
+    {
+        liveCancellation?.Cancel();
+        timerCancellation?.Cancel();
+        await IgnoreCancellationAsync(liveTask).ConfigureAwait(true);
+        await IgnoreCancellationAsync(timerTask).ConfigureAwait(true);
+        liveTask = null;
+        timerTask = null;
+    }
+
+    private async Task RunElapsedTimerAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+        while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var duration = audioCapture.DurationSeconds;
+            RunOnUi(() => ElapsedText = Timecode.Display(duration));
+        }
+    }
+
+    private async Task RunLiveTranscriptionAsync(CancellationToken cancellationToken)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(6), cancellationToken).ConfigureAwait(false);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (!IsPaused)
+            {
+                try
+                {
+                    var pcm = audioCapture.Snapshot(TimeSpan.FromSeconds(25));
+                    if (pcm.Length >= PcmWaveFile.SampleRate * 2)
+                    {
+                        var duration = audioCapture.DurationSeconds;
+                        var offset = Math.Max(0, duration - (pcm.Length / 32_000d));
+                        var progress = new Progress<ModelDownloadProgress>(UpdateModelProgress);
+                        var sessionVocabulary = currentMetadata?.TechnicalVocabulary ?? string.Empty;
+                        var sessionLanguage = NormalizeLanguage(currentMetadata?.Language);
+                        var provisional = await transcriber.TranscribePcmAsync(
+                                pcm,
+                                sessionVocabulary,
+                                sessionLanguage,
+                                offset,
+                                progress,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        var incoming = string.Join(' ', provisional.Select(static segment => segment.Text));
+                        if (incoming.Length > 0)
+                        {
+                            var visibleText = string.Empty;
+                            await RunOnUiAsync(() =>
+                                {
+                                    PublishLiveText(incoming);
+                                    visibleText = LiveText;
+                                })
+                                .ConfigureAwait(false);
+                            var metadata = currentMetadata;
+                            var folder = currentFolder;
+                            if (metadata is not null && folder is not null)
+                            {
+                                metadata = metadata with
+                                {
+                                    Duration = duration,
+                                    State = IsPaused
+                                        ? ProcessingState.TranscriptionPaused
+                                        : ProcessingState.Recording,
+                                };
+                                await sessionStore.SaveLiveAsync(
+                                        visibleText,
+                                        metadata,
+                                        folder,
+                                        $"live-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}",
+                                        cancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception error) when (error is not OutOfMemoryException)
+                {
+                    CrashLog.Write(error);
+                    RunOnUi(() =>
+                    {
+                        WarningText = $"El texto en vivo se reintentará: {error.Message}";
+                        StatusText = "El audio sigue grabándose de forma segura";
+                    });
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(9), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task ProcessWaveAsync(string wavePath, CancellationToken cancellationToken)
+    {
+        if (currentMetadata is null || currentFolder is null)
+        {
+            throw new InvalidOperationException("No hay una sesión preparada para procesar.");
+        }
+
+        currentMetadata = currentMetadata with { State = ProcessingState.FinalTranscription };
+        await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, CancellationToken.None)
+            .ConfigureAwait(true);
+        StatusText = "Transcribiendo toda la clase con máxima calidad…";
+        ModelProgress = 0;
+        var progress = new Progress<ModelDownloadProgress>(UpdateModelProgress);
+        var finalSegments = await transcriber.TranscribeFileAsync(
+                wavePath,
+                currentMetadata.TechnicalVocabulary,
+                NormalizeLanguage(currentMetadata.Language),
+                progress,
+                cancellationToken)
+            .ConfigureAwait(true);
+        if (finalSegments.Count == 0)
+        {
+            throw new InvalidDataException("No se detectó voz suficiente en la grabación.");
+        }
+
+        segments.Clear();
+        segments.AddRange(finalSegments);
+        AllText = TranscriptExporter.PlainText(segments);
+        ProfessorText = string.Empty;
+        currentMetadata = currentMetadata with
+        {
+            State = ProcessingState.Diarizing,
+            SpeakerCount = 0,
+            ProfessorSpeakerID = null,
+        };
+
+        // Commit the complete transcript before invoking any native diarization code.
+        await sessionStore.SaveFinalAsync(
+                currentMetadata,
+                segments,
+                [],
+                [],
+                [],
+                currentFolder,
+                AllText,
+                string.Empty,
+                CancellationToken.None)
+            .ConfigureAwait(true);
+
+        IReadOnlyList<TranscriptSegment> assigned = segments.ToArray();
+        IReadOnlyList<ReviewItem> review = [];
+        IReadOnlyList<SpeakerRecord> speakers = [];
+        string? diarizationWarning = null;
+        try
+        {
+            StatusText = "Preparando e identificando hablantes…";
+            var diarizationModels = await modelProvisioner.EnsureDiarizationAsync(progress, cancellationToken)
+                .ConfigureAwait(true);
+            var spans = await DiarizationWorker.RunIsolatedAsync(
+                    wavePath,
+                    diarizationModels,
+                    cancellationToken)
+                .ConfigureAwait(true);
+            (assigned, review) = SpeakerAssignment.Assign(segments, spans);
+            speakers = SpeakerAssignment.BuildSpeakers(assigned);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            diarizationWarning = error.Message;
+            (assigned, review) = SpeakerAssignment.Assign(segments, []);
+        }
+
+        segments.Clear();
+        segments.AddRange(assigned);
+        var professorId = SpeakerAssignment.ProvisionalProfessor(speakers);
+        var professor = SpeakerAssignment.ProfessorSegments(segments, professorId, review);
+        AllText = TranscriptExporter.PlainText(segments);
+        ProfessorText = TranscriptExporter.PlainText(professor);
+        Speakers.Clear();
+        foreach (var speaker in speakers)
+        {
+            Speakers.Add(speaker);
+        }
+
+        ReviewRows.Clear();
+        foreach (var item in review)
+        {
+            ReviewRows.Add(new ReviewRow(item));
+        }
+
+        SelectedProfessor = Speakers.FirstOrDefault(speaker => speaker.Id == professorId);
+        currentMetadata = currentMetadata with
+        {
+            State = ProcessingState.Complete,
+            SpeakerCount = Speakers.Count,
+            ProfessorSpeakerID = professorId,
+            ProfessorSelectionIsAutomatic = true,
+        };
+        await sessionStore.SaveFinalAsync(
+                currentMetadata,
+                segments,
+                professor,
+                review,
+                speakers,
+                currentFolder,
+                AllText,
+                ProfessorText,
+                CancellationToken.None)
+            .ConfigureAwait(true);
+        ModelProgress = 1;
+        if (diarizationWarning is null)
+        {
+            WarningText = string.Empty;
+            StatusText = "Transcripción final lista";
+        }
+        else
+        {
+            WarningText = $"La transcripción está completa, pero faltó separar hablantes: {diarizationWarning}";
+            StatusText = "Transcripción lista para editar o reprocesar";
+        }
+
+        NotifyCurrentSessionChanged();
+        await RefreshHistoryAsync().ConfigureAwait(true);
+    }
+
+    private async Task LoadSessionAsync(SessionSummary summary)
+    {
+        IsBusy = true;
+        NotifyAvailability();
+        try
+        {
+            currentFolder = summary.Folder;
+            currentMetadata = summary.Metadata;
+            Subject = summary.Metadata.Subject;
+            Vocabulary = summary.Metadata.TechnicalVocabulary;
+            SelectedLanguage = Languages.FirstOrDefault(language =>
+                    language.Code == NormalizeLanguage(summary.Metadata.Language))
+                ?? Languages[0];
+            SelectedMode = CaptureModes.FirstOrDefault(mode => mode.Value == summary.Metadata.Mode)
+                ?? CaptureModes[0];
+
+            var loadedSegments = await ReadJsonAsync<TranscriptSegment[]>(
+                    Path.Combine(summary.Folder, "all-speakers.json"))
+                .ConfigureAwait(true) ?? [];
+            var loadedSpeakers = await ReadJsonAsync<SpeakerRecord[]>(
+                    Path.Combine(summary.Folder, "speakers.json"))
+                .ConfigureAwait(true) ?? [];
+            var loadedReview = await ReadJsonAsync<ReviewItem[]>(Path.Combine(summary.Folder, "review.json"))
+                .ConfigureAwait(true) ?? [];
+            var loadedAll = await ReadTextAsync(Path.Combine(summary.Folder, "all-speakers.txt"))
+                .ConfigureAwait(true);
+            var loadedProfessor = await ReadTextAsync(Path.Combine(summary.Folder, "professor.txt"))
+                .ConfigureAwait(true);
+            var loadedLive = await ReadLiveTextAsync(summary.Folder).ConfigureAwait(true);
+
+            segments.Clear();
+            segments.AddRange(loadedSegments);
+            AllText = TranscriptActions.BestAvailable(
+                loadedAll,
+                loadedSegments.Length > 0 ? TranscriptExporter.PlainText(loadedSegments) : null,
+                loadedLive);
+            ProfessorText = loadedProfessor ?? string.Empty;
+            SetLiveProgrammatically(loadedLive ?? string.Empty);
+            Speakers.Clear();
+            foreach (var speaker in loadedSpeakers)
+            {
+                Speakers.Add(speaker);
+            }
+
+            ReviewRows.Clear();
+            foreach (var item in loadedReview)
+            {
+                ReviewRows.Add(new ReviewRow(item));
+            }
+
+            SelectedProfessor = Speakers.FirstOrDefault(speaker =>
+                speaker.Id == summary.Metadata.ProfessorSpeakerID);
+            WarningText = summary.RecoveryReason ?? string.Empty;
+            StatusText = summary.IsRecoverable ? "Sesión recuperable abierta" : "Sesión abierta";
+            ElapsedText = Timecode.Display(summary.Metadata.Duration);
+            NotifyCurrentSessionChanged();
+        }
+        finally
+        {
+            IsBusy = false;
+            NotifyAvailability();
+        }
+    }
+
+    private async Task RefreshHistoryAsync()
+    {
+        var selectedFolder = SelectedHistory?.Session.Folder;
+        var sessions = await Task.Run(sessionStore.ScanSessions).ConfigureAwait(true);
+        History.Clear();
+        foreach (var session in sessions)
+        {
+            History.Add(new HistoryRow(session));
+        }
+
+        SelectedHistory = History.FirstOrDefault(row => row.Session.Folder == selectedFolder)
+            ?? History.FirstOrDefault();
+    }
+
+    private async Task MarkCurrentStateAsync(ProcessingState state)
+    {
+        if (currentMetadata is null || currentFolder is null)
+        {
+            return;
+        }
+
+        currentMetadata = currentMetadata with
+        {
+            State = state,
+            Duration = Math.Max(currentMetadata.Duration, audioCapture.DurationSeconds),
+        };
+        try
+        {
+            await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, CancellationToken.None)
+                .ConfigureAwait(true);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            CrashLog.Write(error);
+        }
+    }
+
+    private void PublishLiveText(string incoming)
+    {
+        var novel = OverlapDeduplicator.NovelText(automaticLiveText, incoming);
+        automaticLiveText = OverlapDeduplicator.Merge(automaticLiveText, incoming);
+        if (!liveWasEdited)
+        {
+            SetLiveProgrammatically(automaticLiveText);
+        }
+        else if (novel.Length > 0)
+        {
+            SetLiveProgrammatically(LiveText.Length == 0 ? novel : $"{LiveText.TrimEnd()} {novel}");
+        }
+
+        StatusText = IsPaused ? "Grabando · texto en vivo pausado" : "Grabando y transcribiendo";
+        WarningText = string.Empty;
+    }
+
+    private void SetLiveProgrammatically(string value)
+    {
+        settingLiveProgrammatically = true;
+        try
+        {
+            LiveText = value;
+        }
+        finally
+        {
+            settingLiveProgrammatically = false;
+        }
+    }
+
+    private void UpdateModelProgress(ModelDownloadProgress progress)
+    {
+        RunOnUi(() =>
+        {
+            ModelProgress = progress.Fraction;
+            StatusText = progress.ReceivedBytes < progress.TotalBytes
+                ? $"Descargando {progress.Name}: {progress.Fraction:P0}"
+                : $"{progress.Name} listo";
+        });
+    }
+
+    private void HandleAudioLevel(double level)
+    {
+        RunOnUi(() => AudioLevel = level);
+    }
+
+    private void HandleCaptureFault(Exception error)
+    {
+        RunOnUi(() =>
+        {
+            WarningText = $"La fuente de audio se interrumpió: {error.Message}";
+            StatusText = "Detén la sesión para validar y recuperar el audio recibido";
+        });
+    }
+
+    private void NotifyAvailability()
+    {
+        OnPropertyChanged(nameof(CanStart));
+        OnPropertyChanged(nameof(CanStop));
+        OnPropertyChanged(nameof(CanPause));
+        OnPropertyChanged(nameof(CanCancel));
+        OnPropertyChanged(nameof(CanReprocess));
+    }
+
+    private TaskCompletionSource BeginOperation()
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (Interlocked.CompareExchange(ref activeOperation, completion, null) is not null)
+        {
+            throw new InvalidOperationException("Ya hay una operación principal en curso.");
+        }
+
+        return completion;
+    }
+
+    private void CompleteOperation(TaskCompletionSource completion)
+    {
+        completion.TrySetResult();
+        _ = Interlocked.CompareExchange(ref activeOperation, null, completion);
+    }
+
+    private void NotifyCurrentSessionChanged()
+    {
+        OnPropertyChanged(nameof(HasCurrentSession));
+        OnPropertyChanged(nameof(CurrentFolderLabel));
+        OnPropertyChanged(nameof(CanReprocess));
+        OnPropertyChanged(nameof(CurrentFolder));
+        OnPropertyChanged(nameof(CurrentStartedAt));
+    }
+
+    private static string NormalizeLanguage(string? language) => language switch
+    {
+        "en" => "en",
+        "fr" => "fr",
+        _ => "es",
+    };
+
+    private static async Task<T?> ReadJsonAsync<T>(string path)
+    {
+        try
+        {
+            if (!IsReadableRegularFile(path))
+            {
+                return default;
+            }
+
+            await using var stream = File.OpenRead(path);
+            return await JsonSerializer.DeserializeAsync<T>(stream, JsonOptions).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return default;
+        }
+    }
+
+    private static async Task<string?> ReadTextAsync(string path)
+    {
+        try
+        {
+            return IsReadableRegularFile(path) ? await File.ReadAllTextAsync(path).ConfigureAwait(false) : null;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static async Task<string?> ReadLiveTextAsync(string folder)
+    {
+        try
+        {
+            var jsonPath = Path.Combine(folder, "live-transcript.json");
+            if (IsReadableRegularFile(jsonPath))
+            {
+                await using var stream = File.OpenRead(jsonPath);
+                using var document = await JsonDocument.ParseAsync(stream).ConfigureAwait(false);
+                if (document.RootElement.TryGetProperty("text", out var text))
+                {
+                    return text.GetString();
+                }
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
+        {
+            // Fall back to the readable checkpoint below.
+        }
+
+        return await ReadTextAsync(Path.Combine(folder, "live-transcript.txt")).ConfigureAwait(false);
+    }
+
+    private static bool IsReadableRegularFile(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return false;
+            }
+
+            var attributes = File.GetAttributes(path);
+            return (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0
+                && new FileInfo(path).Length <= MaximumReadableDocumentBytes;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task IgnoreCancellationAsync(Task? task)
+    {
+        if (task is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when a recording or window closes.
+        }
+        catch (Exception error)
+        {
+            // Live ASR and the elapsed indicator are secondary to the durable
+            // capture. Their failure must never prevent Stop from finalizing WAV.
+            CrashLog.Write(error);
+        }
+    }
+
+    private static void RunOnUi(Action action)
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess())
+        {
+            action();
+        }
+        else
+        {
+            _ = dispatcher.BeginInvoke(action);
+        }
+    }
+
+    private static Task RunOnUiAsync(Action action)
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess())
+        {
+            action();
+            return Task.CompletedTask;
+        }
+
+        return dispatcher.InvokeAsync(action).Task;
+    }
+}

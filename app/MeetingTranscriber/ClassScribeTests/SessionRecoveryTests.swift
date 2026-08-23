@@ -2,6 +2,20 @@
 import Foundation
 import Testing
 
+@Test
+func sessionsCreatedInTheSameSecondUseUniqueFolders() throws {
+    let root = try makeSessionTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = SessionStore(root: root)
+    let started = Date(timeIntervalSince1970: 1_750_000_000)
+
+    let first = try store.createFolder(subject: "Álgebra", date: started)
+    let second = try store.createFolder(subject: "Álgebra", date: started)
+
+    #expect(first != second)
+    #expect(second.lastPathComponent.hasSuffix("-2"))
+}
+
 @Test(
     .enabled(if: ProcessInfo.processInfo.environment["CLASSSCRIBE_RUN_PRIVATE_RECOVERY_AUDIT"] == "1"),
 )

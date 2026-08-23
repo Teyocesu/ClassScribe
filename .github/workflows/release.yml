@@ -18,8 +18,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  build-macos:
+    name: Build macOS ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
     runs-on: macos-15
     timeout-minutes: 90
     permissions:
@@ -27,9 +27,8 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
       RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
-      ARTIFACT_NAME: ${{ github.event_name == 'push' && format('ClassScribe-release-{0}', github.ref_name) || format('ClassScribe-ad-hoc-{0}', inputs.tag) }}
+      ARTIFACT_NAME: ${{ github.event_name == 'push' && format('ClassScribe-macos-release-{0}', github.ref_name) || format('ClassScribe-macos-ad-hoc-{0}', inputs.tag) }}
     steps:
-      # Pinned v4 action revisions; the release path has no Apple secrets.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
@@ -45,7 +44,7 @@ jobs:
           tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
           test "$(git rev-parse HEAD)" = "$tag_commit"
           git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main || {
-            echo "ERROR: official and ad-hoc release tags must point to a commit already in origin/main." >&2
+            echo "ERROR: release tags must point to a commit already in origin/main." >&2
             exit 1
           }
 
@@ -63,13 +62,13 @@ jobs:
           swift build --package-path app/MeetingTranscriber -c release --arch arm64 -j 2 -Xswiftc -strict-concurrency=complete
           swift test --package-path app/MeetingTranscriber -j 2 --enable-swift-testing --enable-xctest -Xswiftc -strict-concurrency=complete
 
-      - name: Assemble verified distributable
+      - name: Assemble verified macOS distributable
         run: |
           set -euo pipefail
           version="$(tr -d '[:space:]' < VERSION)"
           ./scripts/build_release.sh --version="$version" --signing-mode=adhoc
 
-      - name: Upload final release assets
+      - name: Upload macOS release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ env.ARTIFACT_NAME }}
@@ -79,10 +78,74 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-windows:
+    name: Build Windows ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      ARTIFACT_NAME: ${{ github.event_name == 'push' && format('ClassScribe-windows-release-{0}', github.ref_name) || format('ClassScribe-windows-ad-hoc-{0}', inputs.tag) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag, source commit, and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$RELEASE_TAG" = "v$version"
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          test "$(git rev-parse HEAD)" = "$tag_commit"
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main || {
+            echo "ERROR: release tags must point to a commit already in origin/main." >&2
+            exit 1
+          }
+
+      - name: Install fixed .NET SDK
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.302
+          cache: true
+          cache-dependency-path: app/ClassScribe.Windows/**/packages.lock.json
+
+      - name: Build, test, package, and smoke-test Windows app
+        shell: pwsh
+        run: ./scripts/build_windows.ps1
+
+      - name: Validate Windows release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          release_dir=".build/windows/release"
+          setup="ClassScribe-v${version}-windows-x64-setup.exe"
+          portable="ClassScribe-v${version}-windows-x64-portable.zip"
+          test -f "$release_dir/$setup"
+          test -f "$release_dir/$setup.sha256"
+          test -f "$release_dir/$portable"
+          test -f "$release_dir/$portable.sha256"
+          test "$(find "$release_dir" -maxdepth 1 -type f | wc -l)" -eq 4
+          (cd "$release_dir" && sha256sum -c "$setup.sha256" && sha256sum -c "$portable.sha256")
+
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: .build/windows/release/*
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub Release
     if: github.event_name == 'push'
-    needs: build
+    needs: [build-macos, build-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -90,43 +153,62 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ github.ref_name }}
-      ARTIFACT_NAME: ClassScribe-release-${{ github.ref_name }}
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - name: Download macOS assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: ClassScribe-macos-release-${{ github.ref_name }}
           path: release-assets
 
-      - name: Validate final assets
+      - name: Download Windows assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ClassScribe-windows-release-${{ github.ref_name }}
+          path: release-assets
+
+      - name: Validate the exact final asset set
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           dmg="ClassScribe-v${version}-arm64.dmg"
-          checksum="${dmg}.sha256"
-          test -f "release-assets/$dmg"
-          test -f "release-assets/$checksum"
-          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 2
-          (cd release-assets && sha256sum -c "$checksum")
+          setup="ClassScribe-v${version}-windows-x64-setup.exe"
+          portable="ClassScribe-v${version}-windows-x64-portable.zip"
+          for asset in "$dmg" "$setup" "$portable"; do
+            test -f "release-assets/$asset"
+            test -f "release-assets/$asset.sha256"
+            (cd release-assets && sha256sum -c "$asset.sha256")
+          done
+          printf '%s\n' \
+            "$dmg" "$dmg.sha256" \
+            "$portable" "$portable.sha256" \
+            "$setup" "$setup.sha256" | sort > /tmp/expected-assets.txt
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/actual-assets.txt
+          diff -u /tmp/expected-assets.txt /tmp/actual-assets.txt
 
       - name: Create and publish GitHub Release
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
-          dmg="release-assets/ClassScribe-v${version}-arm64.dmg"
-          checksum="${dmg}.sha256"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "ERROR: a release for $RELEASE_TAG already exists; refusing to replace it." >&2
             exit 1
           fi
-          gh release create "$RELEASE_TAG" "$dmg" "$checksum" \
+          cat > /tmp/release-notes.md <<EOF
+          ClassScribe ${version} para macOS y Windows, con transcripción local en español, inglés y francés.
+
+          Windows 11 (x64): descarga el archivo que termina en windows-x64-setup.exe y sigue el asistente. No requiere instalar .NET. También se incluye un ZIP portable. El instalador no tiene firma Authenticode; Windows SmartScreen puede pedir confirmación.
+
+          macOS 14.2 o posterior (Apple Silicon): abre el DMG y arrastra ClassScribe a Applications. La build está firmada ad-hoc y no está notarizada; usa Abrir desde el menú contextual si Gatekeeper solicita confirmación.
+
+          En ambos sistemas, los modelos se descargan en el primer uso y luego la transcripción funciona localmente; Windows valida tamaño y SHA-256 antes de cargarlos. Comprueba el archivo .sha256 correspondiente antes de instalar.
+          EOF
+          gh release create "$RELEASE_TAG" release-assets/* \
             --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
             --title "ClassScribe v${version}" \
-            --notes $'Distribución privada para Apple Silicon (macOS 14.2 o posterior).\n\nEsta build está firmada ad-hoc. No usa Developer ID y no está notarizada por Apple.\n\nPara instalarla: abre el DMG, arrastra ClassScribe a Applications y, si macOS muestra una advertencia y confías en quien te envió el archivo, haz clic con control en la app, selecciona Abrir y confirma el diálogo. No desactives Gatekeeper.'
+            --notes-file /tmp/release-notes.md
           release_json="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,tagName,assets)"
           test "$(jq -r '.isDraft' <<<"$release_json")" = true
           test "$(jq -r '.tagName' <<<"$release_json")" = "$RELEASE_TAG"
-          expected_assets="ClassScribe-v${version}-arm64.dmg
-          ClassScribe-v${version}-arm64.dmg.sha256"
-          actual_assets="$(jq -r '.assets[].name' <<<"$release_json" | sort)"
-          test "$actual_assets" = "$expected_assets"
+          jq -r '.assets[].name' <<<"$release_json" | sort > /tmp/release-assets.txt
+          diff -u /tmp/expected-assets.txt /tmp/release-assets.txt
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
