@@ -49,6 +49,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private bool liveWasEdited;
     private bool settingLiveProgrammatically;
     private bool disposed;
+    private long attemptGeneration;
+    private SessionAttemptID? activeAttempt;
+    private SessionAttemptCallbackLease? captureCallbackLease;
+    private Action<SessionAttemptID, double>? captureLevelHandler;
+    private Action<SessionAttemptID, Exception>? captureFaultHandler;
+    private ASRTranscriptReference? asrOriginalReference;
+    private DiarizationProposal? activeDiarizationProposal;
+    private HumanCorrectionOverlay? activeHumanCorrectionOverlay;
 
     public MainViewModel()
     {
@@ -66,8 +74,6 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         selectedMode = CaptureModes[0];
         selectedLanguage = Languages[0];
         transcriber = new WhisperTranscriber(modelProvisioner);
-        audioCapture.LevelChanged += HandleAudioLevel;
-        audioCapture.CaptureFaulted += HandleCaptureFault;
     }
 
     public IReadOnlyList<CaptureModeChoice> CaptureModes { get; }
@@ -341,44 +347,90 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         NotifyAvailability();
         var cancellationToken = processingCancellation.Token;
         var startedAt = DateTimeOffset.Now;
+        var sessionID = Guid.NewGuid();
+        var attempt = BeginAttempt(sessionID);
+        RegisterCaptureCallbacks(attempt);
+        var captureStarted = false;
+        asrOriginalReference = null;
+        activeDiarizationProposal = null;
+        activeHumanCorrectionOverlay = null;
 
         try
         {
             currentFolder = sessionStore.CreateFolder(Subject.Trim(), startedAt);
             currentMetadata = new ClassMetadata
             {
+                Id = sessionID,
                 Subject = Subject.Trim(),
                 StartedAt = startedAt,
                 Mode = SelectedMode.Value,
+                CaptureScope = SelectedMode.Value == CaptureMode.Online
+                    ? CaptureScope.Application
+                    : CaptureScope.Microphone,
                 Source = SelectedSource.DisplayName,
                 TechnicalVocabulary = Vocabulary.Trim(),
                 Language = SelectedLanguage.Code,
                 State = ProcessingState.StartingCapture,
+                SessionPhase = ClassScribe.Core.SessionPhase.Starting,
+                CapturePhase = ClassScribe.Core.CapturePhase.Connecting,
+                AsrPhase = ClassScribe.Core.AsrPhase.Idle,
+                AttemptID = attempt,
                 FolderPath = currentFolder,
             };
             NotifyCurrentSessionChanged();
             await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, cancellationToken)
                 .ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
 
             StatusText = "Esperando la primera muestra de audio…";
-            await audioCapture.StartAsync(SelectedSource, currentFolder, cancellationToken).ConfigureAwait(true);
+            await audioCapture.StartAsync(SelectedSource, currentFolder, attempt, cancellationToken).ConfigureAwait(true);
+            captureStarted = true;
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             IsRecording = true;
-            currentMetadata = currentMetadata with { State = ProcessingState.Recording };
+            currentMetadata = currentMetadata with
+            {
+                State = ProcessingState.Recording,
+                SessionPhase = ClassScribe.Core.SessionPhase.Recording,
+                CapturePhase = ClassScribe.Core.CapturePhase.Recording,
+                AsrPhase = ClassScribe.Core.AsrPhase.WaitingForSpeech,
+            };
             await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, cancellationToken)
                 .ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             StatusText = "Grabando y guardando audio localmente";
             StartBackgroundLoops();
         }
         catch (OperationCanceledException)
         {
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             StatusText = "Inicio cancelado; cualquier audio recibido quedó guardado";
-            await MarkCurrentStateAsync(ProcessingState.Cancelled).ConfigureAwait(true);
+            await MarkCurrentStateAsync(ProcessingState.Cancelled, attempt).ConfigureAwait(true);
         }
         catch (Exception error)
         {
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             WarningText = error.Message;
             StatusText = "No se pudo iniciar la grabación";
-            await MarkCurrentStateAsync(ProcessingState.Failed).ConfigureAwait(true);
+            await MarkCurrentStateAsync(ProcessingState.Failed, attempt).ConfigureAwait(true);
         }
         finally
         {
@@ -388,10 +440,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 processingCancellation = null;
                 IsBusy = false;
                 NotifyAvailability();
-                await RefreshHistoryAsync().ConfigureAwait(true);
+                await RefreshHistoryAsync(attempt).ConfigureAwait(true);
             }
             finally
             {
+                if (!captureStarted)
+                {
+                    UnregisterCaptureCallbacks(attempt);
+                }
                 CompleteOperation(operation);
             }
         }
@@ -422,6 +478,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         var operation = BeginOperation();
+        var attempt = activeAttempt;
         IsBusy = true;
         IsPaused = false;
         WarningText = string.Empty;
@@ -432,7 +489,18 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         try
         {
             await StopBackgroundLoopsAsync().ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             var wavePath = await audioCapture.StopAsync(CancellationToken.None).ConfigureAwait(true);
+            UnregisterCaptureCallbacks(attempt);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             IsRecording = false;
             if (audioCapture.LastWarning is { } captureWarning)
             {
@@ -448,6 +516,9 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             {
                 Duration = duration,
                 State = ProcessingState.FinalizingAudio,
+                SessionPhase = ClassScribe.Core.SessionPhase.Stopping,
+                CapturePhase = ClassScribe.Core.CapturePhase.Stopping,
+                AsrPhase = ClassScribe.Core.AsrPhase.Idle,
             };
             await sessionStore.SaveLiveAsync(
                     LiveText,
@@ -456,33 +527,67 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                     "audio-finalized",
                     CancellationToken.None)
                 .ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, CancellationToken.None)
                 .ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
 
             if (processAfterStop)
             {
                 await ProcessWaveAsync(wavePath, processingCancellation.Token).ConfigureAwait(true);
+                if (!IsCurrent(attempt))
+                {
+                    return;
+                }
             }
             else
             {
-                currentMetadata = currentMetadata with { State = ProcessingState.Recoverable };
+                currentMetadata = currentMetadata with
+                {
+                    State = ProcessingState.Recoverable,
+                    SessionPhase = ClassScribe.Core.SessionPhase.Recoverable,
+                    CapturePhase = ClassScribe.Core.CapturePhase.FailedRecoverable,
+                    AsrPhase = ClassScribe.Core.AsrPhase.FailedRecoverable,
+                };
                 await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, CancellationToken.None)
                     .ConfigureAwait(true);
+                if (!IsCurrent(attempt))
+                {
+                    return;
+                }
+
                 StatusText = "Audio y texto guardados para reprocesar en el próximo inicio";
             }
         }
         catch (OperationCanceledException)
         {
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             IsRecording = false;
             StatusText = "Procesamiento cancelado; la grabación y el texto parcial se conservaron";
-            await MarkCurrentStateAsync(ProcessingState.Cancelled).ConfigureAwait(true);
+            await MarkCurrentStateAsync(ProcessingState.Cancelled, attempt).ConfigureAwait(true);
         }
         catch (Exception error)
         {
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             IsRecording = false;
             WarningText = error.Message;
             StatusText = "La sesión quedó guardada para reintentar";
-            await MarkCurrentStateAsync(ProcessingState.Failed).ConfigureAwait(true);
+            await MarkCurrentStateAsync(ProcessingState.Failed, attempt).ConfigureAwait(true);
         }
         finally
         {
@@ -494,10 +599,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 IsBusy = false;
                 ModelProgress = 0;
                 NotifyAvailability();
-                await RefreshHistoryAsync().ConfigureAwait(true);
+                await RefreshHistoryAsync(attempt).ConfigureAwait(true);
             }
             finally
             {
+                UnregisterCaptureCallbacks(attempt);
                 CompleteOperation(operation);
             }
         }
@@ -528,6 +634,10 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         var operation = BeginOperation();
+        var attempt = BeginAttempt(currentMetadata.Id);
+        currentMetadata = currentMetadata with { AttemptID = attempt };
+        asrOriginalReference = null;
+        activeDiarizationProposal = null;
         IsBusy = true;
         WarningText = string.Empty;
         processingCancellation = new CancellationTokenSource();
@@ -538,23 +648,41 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                     currentFolder,
                     processingCancellation.Token)
                 .ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             currentMetadata = currentMetadata with
             {
                 Duration = PcmWaveFile.Validate(wavePath),
                 State = ProcessingState.FinalTranscription,
+                SessionPhase = ClassScribe.Core.SessionPhase.Processing,
+                CapturePhase = ClassScribe.Core.CapturePhase.Idle,
+                AsrPhase = ClassScribe.Core.AsrPhase.PreparingLoad,
             };
             await ProcessWaveAsync(wavePath, processingCancellation.Token).ConfigureAwait(true);
         }
         catch (OperationCanceledException)
         {
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             StatusText = "Reprocesado cancelado; los archivos existentes no cambiaron";
-            await MarkCurrentStateAsync(ProcessingState.Cancelled).ConfigureAwait(true);
+            await MarkCurrentStateAsync(ProcessingState.Cancelled, attempt).ConfigureAwait(true);
         }
         catch (Exception error)
         {
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             WarningText = error.Message;
             StatusText = "No se pudo reprocesar; los archivos anteriores siguen disponibles";
-            await MarkCurrentStateAsync(ProcessingState.Failed).ConfigureAwait(true);
+            await MarkCurrentStateAsync(ProcessingState.Failed, attempt).ConfigureAwait(true);
         }
         finally
         {
@@ -565,7 +693,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 IsBusy = false;
                 ModelProgress = 0;
                 NotifyAvailability();
-                await RefreshHistoryAsync().ConfigureAwait(true);
+                await RefreshHistoryAsync(attempt).ConfigureAwait(true);
             }
             finally
             {
@@ -581,28 +709,66 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
+        var attempt = activeAttempt;
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
+        var metadata = currentMetadata;
+        var folder = currentFolder;
+        var allSegments = segments.ToArray();
         var review = ReviewRows.Select(static row => row.ToModel()).ToArray();
+        var selectedProfessorID = SelectedProfessor?.Id;
         var professor = SpeakerAssignment.ProfessorSegments(
-            segments,
-            SelectedProfessor?.Id,
+            allSegments,
+            selectedProfessorID,
             review);
         ProfessorText = TranscriptExporter.PlainText(professor);
-        currentMetadata = currentMetadata with
+        metadata = metadata with
         {
-            ProfessorSpeakerID = SelectedProfessor?.Id,
+            ProfessorSpeakerID = selectedProfessorID,
             ProfessorSelectionIsAutomatic = false,
             State = ProcessingState.Complete,
+            SessionPhase = ClassScribe.Core.SessionPhase.Complete,
+            CapturePhase = ClassScribe.Core.CapturePhase.Idle,
+            AsrPhase = ClassScribe.Core.AsrPhase.Idle,
         };
+        var humanCorrection = new HumanCorrectionUpdate
+        {
+            Operations =
+            [
+                new SpeakerCorrectionOperation
+                {
+                    Id = Guid.NewGuid(),
+                    Kind = SpeakerCorrectionKind.ProfessorConfirmation,
+                    SpeakerID = selectedProfessorID,
+                    SegmentIDs = [],
+                    CreatedAt = DateTimeOffset.UtcNow,
+                },
+            ],
+        };
+        var speakers = Speakers.ToArray();
+        var diarizationProposal = activeDiarizationProposal;
         await sessionStore.SaveFinalAsync(
-                currentMetadata,
-                segments,
+                metadata,
+                allSegments,
                 professor,
                 review,
-                Speakers.ToArray(),
-                currentFolder,
-                AllText,
-                ProfessorText)
+                speakers,
+                folder,
+                humanCorrection: humanCorrection,
+                diarizationProposal: diarizationProposal)
             .ConfigureAwait(true);
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
+        currentMetadata = metadata;
+        RememberHumanCorrection(humanCorrection);
+        ApplyActiveHumanCorrection();
+
         StatusText = "Selección de profesor guardada";
     }
 
@@ -613,36 +779,63 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
+        var attempt = activeAttempt;
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
+        var metadata = currentMetadata;
+        var folder = currentFolder;
+        var humanCorrection = new HumanCorrectionUpdate
+        {
+            AllText = AllText,
+            ProfessorText = ProfessorText,
+        };
+
         if (segments.Count == 0)
         {
             await sessionStore.SaveEditedDocumentsAsync(
-                    currentMetadata,
-                    currentFolder,
-                    AllText,
-                    ProfessorText)
+                    metadata,
+                    folder,
+                    humanCorrection.AllText!,
+                    humanCorrection.ProfessorText!)
                 .ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
         }
         else
         {
+            var allSegments = segments.ToArray();
             var review = ReviewRows.Select(static row => row.ToModel()).ToArray();
+            var selectedProfessorID = SelectedProfessor?.Id ?? metadata.ProfessorSpeakerID;
             var professor = SpeakerAssignment.ProfessorSegments(
-                segments,
-                SelectedProfessor?.Id ?? currentMetadata.ProfessorSpeakerID,
+                allSegments,
+                selectedProfessorID,
                 review);
+            var speakers = Speakers.ToArray();
+            var diarizationProposal = activeDiarizationProposal;
             await sessionStore.SaveFinalAsync(
-                    currentMetadata,
-                    segments,
+                    metadata,
+                    allSegments,
                     professor,
                     review,
-                    Speakers.ToArray(),
-                    currentFolder,
-                    AllText,
-                    ProfessorText)
+                    speakers,
+                    folder,
+                    humanCorrection: humanCorrection,
+                    diarizationProposal: diarizationProposal)
                 .ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
         }
 
+        RememberHumanCorrection(humanCorrection);
         StatusText = "Cambios guardados";
-        await RefreshHistoryAsync().ConfigureAwait(true);
+        await RefreshHistoryAsync(attempt).ConfigureAwait(true);
     }
 
     public string ChatEnvelope() => currentMetadata is null
@@ -675,8 +868,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             await operation.ConfigureAwait(false);
         }
         await StopBackgroundLoopsAsync().ConfigureAwait(false);
-        audioCapture.LevelChanged -= HandleAudioLevel;
-        audioCapture.CaptureFaulted -= HandleCaptureFault;
+        UnregisterCaptureCallbacks();
+        activeAttempt = null;
         await audioCapture.DisposeAsync().ConfigureAwait(false);
         await transcriber.DisposeAsync().ConfigureAwait(false);
         modelProvisioner.Dispose();
@@ -714,19 +907,42 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     private async Task RunElapsedTimerAsync(CancellationToken cancellationToken)
     {
+        var attempt = activeAttempt;
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
         {
+            if (!IsCurrent(attempt))
+            {
+                break;
+            }
+
             var duration = audioCapture.DurationSeconds;
-            RunOnUi(() => ElapsedText = Timecode.Display(duration));
+            RunOnUi(() =>
+            {
+                if (IsCurrent(attempt))
+                {
+                    ElapsedText = Timecode.Display(duration);
+                }
+            });
         }
     }
 
     private async Task RunLiveTranscriptionAsync(CancellationToken cancellationToken)
     {
+        var attempt = activeAttempt;
         await Task.Delay(TimeSpan.FromSeconds(6), cancellationToken).ConfigureAwait(false);
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
         while (!cancellationToken.IsCancellationRequested)
         {
+            if (!IsCurrent(attempt))
+            {
+                break;
+            }
+
             if (!IsPaused)
             {
                 try
@@ -736,7 +952,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                     {
                         var duration = audioCapture.DurationSeconds;
                         var offset = Math.Max(0, duration - (pcm.Length / 32_000d));
-                        var progress = new Progress<ModelDownloadProgress>(UpdateModelProgress);
+                        var progress = new Progress<ModelDownloadProgress>(
+                            value => UpdateModelProgress(value, attempt));
                         var sessionVocabulary = currentMetadata?.TechnicalVocabulary ?? string.Empty;
                         var sessionLanguage = NormalizeLanguage(currentMetadata?.Language);
                         var provisional = await transcriber.TranscribePcmAsync(
@@ -745,18 +962,31 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                                 sessionLanguage,
                                 offset,
                                 progress,
-                                cancellationToken)
+                            cancellationToken)
                             .ConfigureAwait(false);
+                        if (!IsCurrent(attempt))
+                        {
+                            break;
+                        }
+
                         var incoming = string.Join(' ', provisional.Select(static segment => segment.Text));
                         if (incoming.Length > 0)
                         {
                             var visibleText = string.Empty;
                             await RunOnUiAsync(() =>
                                 {
-                                    PublishLiveText(incoming);
-                                    visibleText = LiveText;
+                                    if (IsCurrent(attempt))
+                                    {
+                                        PublishLiveText(incoming);
+                                        visibleText = LiveText;
+                                    }
                                 })
                                 .ConfigureAwait(false);
+                            if (!IsCurrent(attempt))
+                            {
+                                break;
+                            }
+
                             var metadata = currentMetadata;
                             var folder = currentFolder;
                             if (metadata is not null && folder is not null)
@@ -767,6 +997,9 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                                     State = IsPaused
                                         ? ProcessingState.TranscriptionPaused
                                         : ProcessingState.Recording,
+                                    SessionPhase = ClassScribe.Core.SessionPhase.Recording,
+                                    CapturePhase = ClassScribe.Core.CapturePhase.Recording,
+                                    AsrPhase = ClassScribe.Core.AsrPhase.Transcribing,
                                 };
                                 await sessionStore.SaveLiveAsync(
                                         visibleText,
@@ -775,6 +1008,10 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                                         $"live-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}",
                                         cancellationToken)
                                     .ConfigureAwait(false);
+                                if (!IsCurrent(attempt))
+                                {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -788,8 +1025,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                     CrashLog.Write(error);
                     RunOnUi(() =>
                     {
-                        WarningText = $"El texto en vivo se reintentará: {error.Message}";
-                        StatusText = "El audio sigue grabándose de forma segura";
+                        if (IsCurrent(attempt))
+                        {
+                            WarningText = $"El texto en vivo se reintentará: {error.Message}";
+                            StatusText = "El audio sigue grabándose de forma segura";
+                        }
                     });
                 }
             }
@@ -805,19 +1045,42 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             throw new InvalidOperationException("No hay una sesión preparada para procesar.");
         }
 
-        currentMetadata = currentMetadata with { State = ProcessingState.FinalTranscription };
+        var attempt = activeAttempt;
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
+        currentMetadata = currentMetadata with
+        {
+            State = ProcessingState.FinalTranscription,
+            SessionPhase = ClassScribe.Core.SessionPhase.Processing,
+            CapturePhase = ClassScribe.Core.CapturePhase.Idle,
+            AsrPhase = ClassScribe.Core.AsrPhase.PreparingLoad,
+        };
         await sessionStore.SaveMetadataAsync(currentMetadata, currentFolder, CancellationToken.None)
             .ConfigureAwait(true);
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
         StatusText = "Transcribiendo toda la clase con máxima calidad…";
         ModelProgress = 0;
-        var progress = new Progress<ModelDownloadProgress>(UpdateModelProgress);
+        var progress = new Progress<ModelDownloadProgress>(
+            value => UpdateModelProgress(value, attempt));
         var finalSegments = await transcriber.TranscribeFileAsync(
                 wavePath,
                 currentMetadata.TechnicalVocabulary,
                 NormalizeLanguage(currentMetadata.Language),
                 progress,
-                cancellationToken)
+            cancellationToken)
             .ConfigureAwait(true);
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
         if (finalSegments.Count == 0)
         {
             throw new InvalidDataException("No se detectó voz suficiente en la grabación.");
@@ -827,25 +1090,51 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         segments.AddRange(finalSegments);
         AllText = TranscriptExporter.PlainText(segments);
         ProfessorText = string.Empty;
+        var humanProfessorSelection = !currentMetadata.ProfessorSelectionIsAutomatic;
+        var humanProfessorSpeakerID = humanProfessorSelection
+            ? currentMetadata.ProfessorSpeakerID
+            : null;
         currentMetadata = currentMetadata with
         {
             State = ProcessingState.Diarizing,
+            SessionPhase = ClassScribe.Core.SessionPhase.Processing,
+            CapturePhase = ClassScribe.Core.CapturePhase.Idle,
+            AsrPhase = ClassScribe.Core.AsrPhase.Idle,
             SpeakerCount = 0,
-            ProfessorSpeakerID = null,
+            ProfessorSpeakerID = humanProfessorSpeakerID,
         };
 
+        asrOriginalReference = await sessionStore.SaveAsrOriginalAsync(
+                currentMetadata,
+                segments,
+                currentFolder,
+                CancellationToken.None)
+            .ConfigureAwait(true);
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
+        currentMetadata = currentMetadata with { AsrOriginalReference = asrOriginalReference };
+
         // Commit the complete transcript before invoking any native diarization code.
-        await sessionStore.SaveFinalAsync(
+        await sessionStore.SaveAutomaticProjectionAsync(
                 currentMetadata,
                 segments,
                 [],
                 [],
                 [],
                 currentFolder,
-                AllText,
-                string.Empty,
-                CancellationToken.None)
+                automaticAllText: AllText,
+                automaticProfessorText: string.Empty,
+                cancellationToken: CancellationToken.None)
             .ConfigureAwait(true);
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
+        ApplyActiveHumanCorrection();
 
         IReadOnlyList<TranscriptSegment> assigned = segments.ToArray();
         IReadOnlyList<ReviewItem> review = [];
@@ -856,13 +1145,31 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             StatusText = "Preparando e identificando hablantes…";
             var diarizationModels = await modelProvisioner.EnsureDiarizationAsync(progress, cancellationToken)
                 .ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             var spans = await DiarizationWorker.RunIsolatedAsync(
                     wavePath,
                     diarizationModels,
-                    cancellationToken)
+                cancellationToken)
                 .ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             (assigned, review) = SpeakerAssignment.Assign(segments, spans);
             speakers = SpeakerAssignment.BuildSpeakers(assigned);
+            activeDiarizationProposal = new DiarizationProposal
+            {
+                ProposalID = Guid.NewGuid(),
+                CreatedAt = DateTimeOffset.UtcNow,
+                EngineVersion = "windows-current",
+                AsrRunID = asrOriginalReference?.RunID,
+                Spans = spans,
+            };
         }
         catch (OperationCanceledException)
         {
@@ -870,13 +1177,25 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
             diarizationWarning = error.Message;
             (assigned, review) = SpeakerAssignment.Assign(segments, []);
         }
 
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
         segments.Clear();
         segments.AddRange(assigned);
-        var professorId = SpeakerAssignment.ProvisionalProfessor(speakers);
+        var professorId = humanProfessorSelection
+            ? humanProfessorSpeakerID
+            : SpeakerAssignment.ProvisionalProfessor(speakers);
         var professor = SpeakerAssignment.ProfessorSegments(segments, professorId, review);
         AllText = TranscriptExporter.PlainText(segments);
         ProfessorText = TranscriptExporter.PlainText(professor);
@@ -896,21 +1215,32 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         currentMetadata = currentMetadata with
         {
             State = ProcessingState.Complete,
+            SessionPhase = ClassScribe.Core.SessionPhase.Complete,
+            CapturePhase = ClassScribe.Core.CapturePhase.Idle,
+            AsrPhase = ClassScribe.Core.AsrPhase.Idle,
             SpeakerCount = Speakers.Count,
             ProfessorSpeakerID = professorId,
-            ProfessorSelectionIsAutomatic = true,
+            ProfessorSelectionIsAutomatic = !humanProfessorSelection,
         };
-        await sessionStore.SaveFinalAsync(
+        await sessionStore.SaveAutomaticProjectionAsync(
                 currentMetadata,
                 segments,
                 professor,
                 review,
                 speakers,
                 currentFolder,
-                AllText,
-                ProfessorText,
-                CancellationToken.None)
+                automaticAllText: AllText,
+                automaticProfessorText: ProfessorText,
+                cancellationToken: CancellationToken.None,
+                diarizationProposal: activeDiarizationProposal)
             .ConfigureAwait(true);
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
+        ApplyActiveHumanCorrection();
+
         ModelProgress = 1;
         if (diarizationWarning is null)
         {
@@ -924,7 +1254,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         NotifyCurrentSessionChanged();
-        await RefreshHistoryAsync().ConfigureAwait(true);
+        await RefreshHistoryAsync(attempt).ConfigureAwait(true);
     }
 
     private async Task LoadSessionAsync(SessionSummary summary)
@@ -935,6 +1265,20 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             currentFolder = summary.Folder;
             currentMetadata = summary.Metadata;
+            var attempt = BeginAttempt(summary.Metadata.Id);
+            currentMetadata = currentMetadata with { AttemptID = attempt };
+            if (summary.IsRecoverable)
+            {
+                currentMetadata = currentMetadata with
+                {
+                    State = ProcessingState.Recoverable,
+                    SessionPhase = ClassScribe.Core.SessionPhase.Recoverable,
+                    CapturePhase = ClassScribe.Core.CapturePhase.FailedRecoverable,
+                    AsrPhase = ClassScribe.Core.AsrPhase.FailedRecoverable,
+                };
+            }
+            asrOriginalReference = summary.Metadata.AsrOriginalReference;
+            activeDiarizationProposal = null;
             Subject = summary.Metadata.Subject;
             Vocabulary = summary.Metadata.TechnicalVocabulary;
             SelectedLanguage = Languages.FirstOrDefault(language =>
@@ -955,15 +1299,23 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 .ConfigureAwait(true);
             var loadedProfessor = await ReadTextAsync(Path.Combine(summary.Folder, "professor.txt"))
                 .ConfigureAwait(true);
+            var loadedOverlay = await ReadJsonAsync<HumanCorrectionOverlay>(
+                    Path.Combine(summary.Folder, "human-correction-overlay.json"))
+                .ConfigureAwait(true);
             var loadedLive = await ReadLiveTextAsync(summary.Folder).ConfigureAwait(true);
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
 
             segments.Clear();
             segments.AddRange(loadedSegments);
-            AllText = TranscriptActions.BestAvailable(
+            activeHumanCorrectionOverlay = loadedOverlay;
+            AllText = loadedOverlay?.EditedAllText ?? TranscriptActions.BestAvailable(
                 loadedAll,
                 loadedSegments.Length > 0 ? TranscriptExporter.PlainText(loadedSegments) : null,
                 loadedLive);
-            ProfessorText = loadedProfessor ?? string.Empty;
+            ProfessorText = loadedOverlay?.EditedProfessorText ?? loadedProfessor ?? string.Empty;
             SetLiveProgrammatically(loadedLive ?? string.Empty);
             Speakers.Clear();
             foreach (var speaker in loadedSpeakers)
@@ -991,10 +1343,20 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    private async Task RefreshHistoryAsync()
+    private async Task RefreshHistoryAsync(SessionAttemptID? expectedAttempt = null)
     {
+        if (expectedAttempt is not null && !IsCurrent(expectedAttempt))
+        {
+            return;
+        }
+
         var selectedFolder = SelectedHistory?.Session.Folder;
         var sessions = await Task.Run(sessionStore.ScanSessions).ConfigureAwait(true);
+        if (expectedAttempt is not null && !IsCurrent(expectedAttempt))
+        {
+            return;
+        }
+
         History.Clear();
         foreach (var session in sessions)
         {
@@ -1005,8 +1367,13 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             ?? History.FirstOrDefault();
     }
 
-    private async Task MarkCurrentStateAsync(ProcessingState state)
+    private async Task MarkCurrentStateAsync(ProcessingState state, SessionAttemptID? expectedAttempt = null)
     {
+        if (expectedAttempt is not null && !IsCurrent(expectedAttempt))
+        {
+            return;
+        }
+
         if (currentMetadata is null || currentFolder is null)
         {
             return;
@@ -1015,6 +1382,10 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         currentMetadata = currentMetadata with
         {
             State = state,
+            SessionPhase = state.ToSessionPhase(),
+            CapturePhase = state.ToCapturePhase(),
+            AsrPhase = state.ToAsrPhase(),
+            AttemptID = activeAttempt ?? currentMetadata.AttemptID,
             Duration = Math.Max(currentMetadata.Duration, audioCapture.DurationSeconds),
         };
         try
@@ -1058,10 +1429,15 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    private void UpdateModelProgress(ModelDownloadProgress progress)
+    private void UpdateModelProgress(ModelDownloadProgress progress, SessionAttemptID? expectedAttempt)
     {
         RunOnUi(() =>
         {
+            if (!IsCurrent(expectedAttempt))
+            {
+                return;
+            }
+
             ModelProgress = progress.Fraction;
             StatusText = progress.ReceivedBytes < progress.TotalBytes
                 ? $"Descargando {progress.Name}: {progress.Fraction:P0}"
@@ -1069,18 +1445,89 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         });
     }
 
-    private void HandleAudioLevel(double level)
+    private void ApplyActiveHumanCorrection()
     {
-        RunOnUi(() => AudioLevel = level);
+        if (activeHumanCorrectionOverlay?.EditedAllText is { } editedAllText)
+        {
+            AllText = editedAllText;
+        }
+
+        if (activeHumanCorrectionOverlay?.EditedProfessorText is { } editedProfessorText)
+        {
+            ProfessorText = editedProfessorText;
+        }
     }
 
-    private void HandleCaptureFault(Exception error)
+    private void RememberHumanCorrection(HumanCorrectionUpdate correction)
     {
-        RunOnUi(() =>
+        var existing = activeHumanCorrectionOverlay ?? new HumanCorrectionOverlay();
+        activeHumanCorrectionOverlay = existing with
         {
-            WarningText = $"La fuente de audio se interrumpió: {error.Message}";
-            StatusText = "Detén la sesión para validar y recuperar el audio recibido";
-        });
+            Operations = existing.Operations
+                .Concat(correction.Operations.Where(operation =>
+                    existing.Operations.All(previous => previous.Id != operation.Id)))
+                .ToArray(),
+            EditedAllText = correction.AllText ?? existing.EditedAllText,
+            EditedProfessorText = correction.ProfessorText ?? existing.EditedProfessorText,
+        };
+    }
+
+    private void RegisterCaptureCallbacks(SessionAttemptID attempt)
+    {
+        UnregisterCaptureCallbacks();
+        var lease = new SessionAttemptCallbackLease(attempt, candidate => IsCurrent(candidate));
+        Action<SessionAttemptID, double> levelHandler = (eventAttempt, level) =>
+        {
+            if (eventAttempt != lease.Attempt)
+            {
+                return;
+            }
+
+            lease.TryAccept(() => RunOnUi(() => lease.TryAccept(() => AudioLevel = level)));
+        };
+        Action<SessionAttemptID, Exception> faultHandler = (eventAttempt, error) =>
+        {
+            if (eventAttempt != lease.Attempt)
+            {
+                return;
+            }
+
+            lease.TryAccept(() => RunOnUi(() => lease.TryAccept(() =>
+            {
+                WarningText = $"La fuente de audio se interrumpió: {error.Message}";
+                StatusText = "Detén la sesión para validar y recuperar el audio recibido";
+            })));
+        };
+        captureCallbackLease = lease;
+        captureLevelHandler = levelHandler;
+        captureFaultHandler = faultHandler;
+        audioCapture.LevelChanged += levelHandler;
+        audioCapture.CaptureFaulted += faultHandler;
+    }
+
+    private void UnregisterCaptureCallbacks(SessionAttemptID? expectedAttempt = null)
+    {
+        if (expectedAttempt is not null
+            && !Equals(captureCallbackLease?.Attempt, expectedAttempt))
+        {
+            return;
+        }
+
+        captureCallbackLease?.Revoke();
+
+        if (captureLevelHandler is not null)
+        {
+            audioCapture.LevelChanged -= captureLevelHandler;
+        }
+
+        if (captureFaultHandler is not null)
+        {
+            audioCapture.CaptureFaulted -= captureFaultHandler;
+        }
+
+        captureCallbackLease = null;
+        captureLevelHandler = null;
+        captureFaultHandler = null;
     }
 
     private void NotifyAvailability()
@@ -1117,6 +1564,16 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CurrentFolder));
         OnPropertyChanged(nameof(CurrentStartedAt));
     }
+
+    private SessionAttemptID BeginAttempt(Guid sessionID)
+    {
+        var attempt = SessionAttemptID.Create(sessionID, ++attemptGeneration);
+        activeAttempt = attempt;
+        return attempt;
+    }
+
+    private bool IsCurrent(SessionAttemptID? attempt) =>
+        attempt is not null && activeAttempt == attempt;
 
     private static string NormalizeLanguage(string? language) => language switch
     {

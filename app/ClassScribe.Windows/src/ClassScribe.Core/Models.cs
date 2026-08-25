@@ -68,6 +68,7 @@ public sealed record ReviewItem
     public bool ManuallyAssignedToProfessor { get; init; }
 }
 
+[JsonConverter(typeof(ClassMetadataJsonConverter))]
 public sealed record ClassMetadata
 {
     public Guid Id { get; init; } = Guid.NewGuid();
@@ -85,6 +86,16 @@ public sealed record ClassMetadata
     public string Language { get; init; } = "es";
     public string AudioFormat { get; init; } = PcmWaveFile.AudioFormatName;
     public string Platform { get; init; } = "windows";
+    public int SchemaVersion { get; init; } = 2;
+    public CaptureScope? CaptureScope { get; init; }
+    public SessionPhase? SessionPhase { get; init; }
+    public CapturePhase? CapturePhase { get; init; }
+    public AsrPhase? AsrPhase { get; init; }
+    public int FormatVersion { get; init; } = 1;
+    public SessionAttemptID? AttemptID { get; init; }
+    public ASRTranscriptReference? AsrOriginalReference { get; init; }
+    public IReadOnlyList<DiarizationProposalReference> DiarizationProposalReferences { get; init; } = [];
+    public HumanCorrectionOverlayReference? HumanCorrectionOverlayReference { get; init; }
 }
 
 public static class CaptureModeText
@@ -96,11 +107,26 @@ public static class CaptureModeText
         _ => throw new ArgumentOutOfRangeException(nameof(mode)),
     };
 
-    public static CaptureMode Parse(string value) => value switch
+    public static CaptureMode Parse(string value) => value.Trim().ToLowerInvariant() switch
     {
-        "Clase online" or "Online" => CaptureMode.Online,
-        "Clase presencial" or "InPerson" => CaptureMode.InPerson,
+        "clase online" or "online" or "application" => CaptureMode.Online,
+        "clase presencial" or "inperson" or "in_person" or "in person" or "microphone" => CaptureMode.InPerson,
+        "systemoutput" or "system_output" or "system output" => CaptureMode.Online,
         _ => throw new JsonException($"Modo de captura desconocido: {value}"),
+    };
+
+    public static string ToPersistentToken(this CaptureMode mode) => mode switch
+    {
+        CaptureMode.Online => "online",
+        CaptureMode.InPerson => "inPerson",
+        _ => throw new ArgumentOutOfRangeException(nameof(mode)),
+    };
+
+    public static CaptureScope ToScope(this CaptureMode mode) => mode switch
+    {
+        CaptureMode.Online => CaptureScope.Application,
+        CaptureMode.InPerson => CaptureScope.Microphone,
+        _ => throw new ArgumentOutOfRangeException(nameof(mode)),
     };
 }
 
@@ -129,6 +155,7 @@ public static class ProcessingStateText
         foreach (var state in Enum.GetValues<ProcessingState>())
         {
             if (string.Equals(state.ToSpanish(), value, StringComparison.Ordinal)
+                || string.Equals(state.ToToken(), value, StringComparison.OrdinalIgnoreCase)
                 || string.Equals(state.ToString(), value, StringComparison.OrdinalIgnoreCase))
             {
                 return state;
@@ -137,6 +164,24 @@ public static class ProcessingStateText
 
         throw new JsonException($"Estado desconocido: {value}");
     }
+
+    public static string ToToken(this ProcessingState state) => state switch
+    {
+        ProcessingState.Ready => "ready",
+        ProcessingState.StartingCapture => "startingCapture",
+        ProcessingState.LoadingModel => "loadingModel",
+        ProcessingState.Recording => "recording",
+        ProcessingState.TranscriptionPaused => "transcriptionPaused",
+        ProcessingState.Stopping => "stopping",
+        ProcessingState.FinalizingAudio => "finalizingAudio",
+        ProcessingState.FinalTranscription => "finalTranscription",
+        ProcessingState.Diarizing => "diarizing",
+        ProcessingState.Complete => "complete",
+        ProcessingState.Cancelled => "cancelled",
+        ProcessingState.Failed => "failed",
+        ProcessingState.Recoverable => "recoverable",
+        _ => throw new ArgumentOutOfRangeException(nameof(state)),
+    };
 }
 
 public static class Timecode
@@ -231,7 +276,7 @@ internal sealed class CaptureModeJsonConverter : JsonConverter<CaptureMode>
         CaptureModeText.Parse(reader.GetString() ?? string.Empty);
 
     public override void Write(Utf8JsonWriter writer, CaptureMode value, JsonSerializerOptions options) =>
-        writer.WriteStringValue(value.ToSpanish());
+        writer.WriteStringValue(value.ToPersistentToken());
 }
 
 internal sealed class ProcessingStateJsonConverter : JsonConverter<ProcessingState>
@@ -240,5 +285,5 @@ internal sealed class ProcessingStateJsonConverter : JsonConverter<ProcessingSta
         ProcessingStateText.Parse(reader.GetString() ?? string.Empty);
 
     public override void Write(Utf8JsonWriter writer, ProcessingState value, JsonSerializerOptions options) =>
-        writer.WriteStringValue(value.ToSpanish());
+        writer.WriteStringValue(value.ToToken());
 }

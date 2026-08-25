@@ -15,6 +15,7 @@ enum TranscriptTab: String, CaseIterable, Identifiable {
 
 private struct ClassSessionContext: Sendable {
     var id: UUID
+    var attemptID: SessionAttemptID
     var folder: URL
     var subject: String
     var startedAt: Date
@@ -57,6 +58,9 @@ final class ClassScribeModel {
     var selectedMicrophoneID: String?
     var selectedTab: TranscriptTab = .professor
     var state: ProcessingState = .ready
+    var sessionPhase: SessionPhase = .draft
+    var capturePhase: CapturePhase = .idle
+    var asrPhase: AsrPhase = .idle
     var statusDetail = "Selecciona una fuente y escribe el nombre de la materia."
     var elapsed: TimeInterval = 0
     var transcriptionLatency: TimeInterval = 0
@@ -101,6 +105,9 @@ final class ClassScribeModel {
     private var technicalVocabularyURL: URL?
     private var activeSession: ClassSessionContext?
     private var liveTranscriptionError: String?
+    private var generationGate = SessionGenerationGate()
+    private var asrOriginalReference: ASRTranscriptReference?
+    private var activeDiarizationProposal: DiarizationProposal?
 
     init(
         store: SessionStore = SessionStore(),
@@ -298,13 +305,19 @@ final class ClassScribeModel {
         accumulator = LiveTranscriptAccumulator()
         liveEditReconciler.reset()
         let now = Date()
+        let sessionID = UUID()
+        let attemptID = generationGate.begin(sessionID: sessionID)
+        asrOriginalReference = nil
+        activeDiarizationProposal = nil
+        var startedSession: ClassSessionContext?
         do {
             let folder = try store.createFolder(subject: subject, date: now)
             classFolder = folder
             startedAt = now
             technicalVocabularyURL = try makeVocabularyFile(in: folder)
             let session = ClassSessionContext(
-                id: UUID(),
+                id: sessionID,
+                attemptID: attemptID,
                 folder: folder,
                 subject: subject,
                 startedAt: now,
@@ -314,25 +327,55 @@ final class ClassScribeModel {
                 technicalVocabulary: technicalVocabulary,
                 technicalVocabularyURL: technicalVocabularyURL,
             )
+            startedSession = session
             activeSession = session
             state = .startingCapture
+            sessionPhase = .starting
+            capturePhase = .connecting
+            asrPhase = .idle
             statusDetail = mode == .inPerson
                 ? "Esperando el primer buffer escrito antes de iniciar el contador."
                 : "Iniciando la captura de audio de la aplicación seleccionada."
             try checkpointLive("session-created", session: session)
             try store.saveMetadata(metadata(session: session, state: .startingCapture), folder: folder)
             _ = try await capture.start(
+                attempt: session.attemptID,
                 mode: mode,
                 application: selectedApplication,
                 microphone: selectedMicrophone,
                 folder: folder,
             )
+            guard isCurrent(session) else { return }
             state = .recording
+            sessionPhase = .recording
+            capturePhase = .recording
+            asrPhase = .waitingForSpeech
             statusDetail = "El audio se guarda aunque pauses la transcripción."
             startElapsedTimer()
             startLiveTranscription(session: session)
+        } catch is CancellationError {
+            guard let session = startedSession, !isCurrent(session) else { return }
+            finishCancelledStartCleanup(session)
+            return
         } catch {
+            guard let session = startedSession else {
+                state = .failed
+                sessionPhase = .failed
+                capturePhase = .failedTerminal
+                asrPhase = .failedRecoverable
+                errorMessage = error.localizedDescription
+                statusDetail = error.localizedDescription
+                persistCurrentState(checkpoint: "start-failed")
+                return
+            }
+            guard isCurrent(session) else {
+                finishCancelledStartCleanup(session)
+                return
+            }
             state = .failed
+            sessionPhase = .failed
+            capturePhase = .failedTerminal
+            asrPhase = .failedRecoverable
             errorMessage = error.localizedDescription
             statusDetail = error.localizedDescription
             persistCurrentState(checkpoint: "start-failed")
@@ -345,6 +388,9 @@ final class ClassScribeModel {
         accumulator.confirmProvisional()
         syncLiveTextFromAccumulator()
         state = .transcriptionPaused
+        sessionPhase = .recording
+        capturePhase = .recording
+        asrPhase = .waitingForSpeech
         statusDetail = "La grabación continúa; solo se pausó la transcripción."
         persistCurrentState(checkpoint: "paused")
     }
@@ -353,6 +399,9 @@ final class ClassScribeModel {
         guard isRecording, isTranscriptionPaused else { return }
         isTranscriptionPaused = false
         state = .recording
+        sessionPhase = .recording
+        capturePhase = .recording
+        asrPhase = .waitingForSpeech
         statusDetail = "Transcripción reanudada; el audio siguió grabándose."
         persistCurrentState(checkpoint: "resumed")
     }
@@ -378,6 +427,9 @@ final class ClassScribeModel {
         cancelCalibration()
         errorMessage = nil
         state = .stopping
+        sessionPhase = .stopping
+        capturePhase = .stopping
+        asrPhase = .idle
         statusDetail = "Guardando transcripción antes de cerrar el audio."
         _ = await stopLiveTranscription()
         elapsedTimer?.invalidate()
@@ -393,19 +445,53 @@ final class ClassScribeModel {
 
         do {
             state = .finalizingAudio
+            // The control plane requested stop, but native teardown has not
+            // completed until capture.stop() returns.
+            capturePhase = .stopping
+            asrPhase = .idle
             statusDetail = "Cerrando y validando el audio."
             let stopped = try await capture.stop()
             elapsed = stopped.duration
+            capturePhase = .idle
             try checkpointLive("audio-stopped", session: session)
             isStopping = false
             runFinalProcessing(audioURL: stopped.url, session: session)
         } catch {
             isStopping = false
             state = .failed
+            sessionPhase = .failed
+            capturePhase = .failedRecoverable
+            asrPhase = .failedRecoverable
             errorMessage = error.localizedDescription
             statusDetail = "El audio se conservó, pero no se pudo validar: \(error.localizedDescription)"
             persistCurrentState(checkpoint: "audio-stop-failed")
         }
+    }
+
+    func cancelStart() {
+        guard capture.isStarting, let session = activeSession, isCurrent(session) else { return }
+        generationGate.invalidate()
+        capture.cancelStart(for: session.attemptID)
+        state = .cancelled
+        sessionPhase = .cancelled
+        // Startup is cancelled in the control plane immediately. Keep the
+        // capture axis in stopping until stale native setup has returned and
+        // its cleanup has completed.
+        capturePhase = .stopping
+        asrPhase = .idle
+        errorMessage = nil
+        statusDetail = "Inicio cancelado; se espera la limpieza nativa antes del próximo intento."
+        persistCurrentState(checkpoint: "capture-start-cancelled", session: session)
+    }
+
+    private func finishCancelledStartCleanup(_ session: ClassSessionContext) {
+        guard activeSession?.attemptID == session.attemptID,
+              state == .cancelled,
+              capturePhase == .stopping
+        else { return }
+        capturePhase = .idle
+        statusDetail = "Inicio cancelado; la limpieza nativa terminó."
+        persistCurrentState(checkpoint: "capture-start-cleaned", session: session)
     }
 
     func cancelFinalProcessing() {
@@ -418,6 +504,9 @@ final class ClassScribeModel {
         statusDetail = "Cancelando procesamiento; el texto y el audio permanecen disponibles."
         if cancelledRetryPreparation, let session = activeSession {
             state = .cancelled
+            sessionPhase = .cancelled
+            capturePhase = .idle
+            asrPhase = .idle
             statusDetail = "Procesamiento cancelado; se conservaron el audio y el mejor texto disponible."
             persistCurrentState(checkpoint: "processing-cancelled", session: session)
         }
@@ -427,17 +516,44 @@ final class ClassScribeModel {
         professorSpeakerID = id
         professorSelectionIsAutomatic = false
         statusDetail = "Profesor cambiado a \(id); vista filtrada regenerada."
-        editedProfessorText = nil
         selectedTab = .professor
-        persistFinalOutputs()
+        persistFinalOutputs(
+            humanCorrection: HumanCorrectionUpdate(
+                operations: [SpeakerCorrectionOperation(
+                    id: UUID(),
+                    kind: .professorConfirmation,
+                    speakerID: id,
+                    targetSpeakerID: nil,
+                    displayName: nil,
+                    segmentIDs: [],
+                    createdAt: Date(),
+                )],
+                allText: nil,
+                professorText: nil,
+            ),
+        )
         saveProfessorReference(for: id)
     }
 
     func toggleReviewAssignment(_ id: UUID) {
         guard let index = reviewItems.firstIndex(where: { $0.id == id }) else { return }
         reviewItems[index].manuallyAssignedToProfessor.toggle()
-        editedProfessorText = nil
-        persistFinalOutputs()
+        let segment = reviewItems[index].segment
+        persistFinalOutputs(
+            humanCorrection: HumanCorrectionUpdate(
+                operations: [SpeakerCorrectionOperation(
+                    id: UUID(),
+                    kind: .review,
+                    speakerID: segment.speakerID,
+                    targetSpeakerID: nil,
+                    displayName: nil,
+                    segmentIDs: [segment.id],
+                    createdAt: Date(),
+                )],
+                allText: nil,
+                professorText: nil,
+            ),
+        )
     }
 
     func calibrateProfessorVoice() {
@@ -455,19 +571,19 @@ final class ClassScribeModel {
             for remaining in stride(from: 20, through: 1, by: -1) {
                 guard !Task.isCancelled,
                       self.isRecording,
-                      self.activeSession?.id == session.id else { return }
+                      self.isCurrent(session) else { return }
                 self.calibrationSecondsRemaining = remaining
                 try? await Task.sleep(for: .seconds(1))
             }
             guard self.isRecording,
-                  self.activeSession?.id == session.id,
+                  self.isCurrent(session),
                   let window = await self.capture.liveStore.window(seconds: 20)
             else { return }
             do {
                 let url = session.folder.appendingPathComponent("professor-calibration.wav")
                 try WavFile.writeFloat32(window.samples, to: url)
                 let result = try await self.finalProcessor.diarize(url)
-                guard self.activeSession?.id == session.id else { return }
+                guard self.isCurrent(session) else { return }
                 let durations = Dictionary(grouping: result.spans, by: \.speakerID)
                     .mapValues { $0.reduce(0) { $0 + $1.end - $1.start } }
                 guard let dominant = durations.max(by: { $0.value < $1.value })?.key,
@@ -485,7 +601,7 @@ final class ClassScribeModel {
             } catch is CancellationError {
                 return
             } catch {
-                if self.activeSession?.id == session.id {
+                if self.isCurrent(session) {
                     self.errorMessage = "No se pudo calibrar la voz: \(error.localizedDescription)"
                 }
             }
@@ -630,6 +746,11 @@ final class ClassScribeModel {
         subject = metadata.subject
         mode = metadata.mode
         language = metadata.language ?? .spanish
+        let restoredAttemptID = generationGate.begin(sessionID: metadata.id)
+        sessionPhase = metadata.sessionPhase
+        capturePhase = metadata.capturePhase
+        asrPhase = metadata.asrPhase
+        asrOriginalReference = metadata.asrOriginalReference
         technicalVocabulary = metadata.technicalVocabulary
         elapsed = metadata.duration
         professorSpeakerID = metadata.professorSpeakerID
@@ -654,6 +775,11 @@ final class ClassScribeModel {
             selectedTab = .liveEdit
         }
         state = summary.state
+        if summary.isRecoverable {
+            sessionPhase = .recoverable
+            capturePhase = .failedRecoverable
+            asrPhase = .failedRecoverable
+        }
         statusDetail = summary.isRecoverable
             ? "Sesión recuperable cargada. El audio y el mejor texto disponible permanecen intactos."
             : "Sesión del historial cargada."
@@ -661,6 +787,7 @@ final class ClassScribeModel {
         let vocabularyURL = summary.folder.appendingPathComponent("technical-vocabulary.txt")
         activeSession = ClassSessionContext(
             id: metadata.id,
+            attemptID: restoredAttemptID,
             folder: summary.folder,
             subject: metadata.subject,
             startedAt: metadata.startedAt,
@@ -677,11 +804,19 @@ final class ClassScribeModel {
             await retryTask.value
             return
         }
-        guard canRetryProcessing, let session = activeSession else { return }
+        guard canRetryProcessing else { return }
         let jobID = UUID()
+        guard let currentSession = activeSession else { return }
+        var retrySession = currentSession
+        retrySession.attemptID = generationGate.begin(sessionID: currentSession.id)
+        activeSession = retrySession
+        let session = retrySession
         retryJobID = jobID
         isRetrying = true
         state = .finalizingAudio
+        sessionPhase = .processing
+        capturePhase = .idle
+        asrPhase = .preparingLoad
         statusDetail = "Validando el audio conservado antes de reintentar."
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -715,8 +850,11 @@ final class ClassScribeModel {
         } catch is CancellationError {
             return
         } catch {
-            guard retryJobID == jobID, activeSession?.id == session.id else { return }
+            guard retryJobID == jobID, isCurrent(session) else { return }
             state = .recoverable
+            sessionPhase = .recoverable
+            capturePhase = .failedRecoverable
+            asrPhase = .failedRecoverable
             errorMessage = "No se puede reprocesar el audio: \(error.localizedDescription)"
             statusDetail = "El texto recuperado sigue disponible."
             persistCurrentState(checkpoint: "audio-recovery-failed", session: session)
@@ -724,7 +862,7 @@ final class ClassScribeModel {
     }
 
     private func ensureCurrentRetry(jobID: UUID, session: ClassSessionContext) throws {
-        guard retryJobID == jobID, activeSession?.id == session.id else { throw CancellationError() }
+        guard retryJobID == jobID, isCurrent(session) else { throw CancellationError() }
     }
 
     func waitForFinalProcessingForTesting() async {
@@ -734,9 +872,15 @@ final class ClassScribeModel {
     private func startElapsedTimer() {
         elapsed = 0
         elapsedTimer?.invalidate()
+        let timerAttempt = activeSession?.attemptID
         elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, let startedAt = self.startedAt else { return }
+                guard let self,
+                      let timerAttempt,
+                      let startedAt = self.startedAt,
+                      self.generationGate.accepts(timerAttempt),
+                      self.activeSession?.attemptID == timerAttempt
+                else { return }
                 if let failure = self.capture.takeTerminalFailure() {
                     await self.failActiveCapture(failure)
                     return
@@ -751,6 +895,9 @@ final class ClassScribeModel {
         isStopping = true
         cancelCalibration()
         state = .stopping
+        sessionPhase = .stopping
+        capturePhase = .stopping
+        asrPhase = .idle
         statusDetail = "Cerrando y validando el audio después del error del micrófono."
         elapsedTimer?.invalidate()
         elapsedTimer = nil
@@ -766,7 +913,7 @@ final class ClassScribeModel {
         let validation = await Task.detached(priority: .userInitiated) {
             Result { try WavFile.validate(audioURL) }
         }.value
-        guard activeSession?.id == session.id else {
+        guard isCurrent(session) else {
             isStopping = false
             return
         }
@@ -774,10 +921,16 @@ final class ClassScribeModel {
         case let .success(duration):
             elapsed = duration
             state = .recoverable
+            sessionPhase = .recoverable
+            capturePhase = .failedRecoverable
+            asrPhase = .failedRecoverable
             errorMessage = message
             statusDetail = "La captura se detuvo, pero el audio se conservó y puede reprocesarse."
         case let .failure(validationError):
             state = .failed
+            sessionPhase = .failed
+            capturePhase = .failedTerminal
+            asrPhase = .failedRecoverable
             errorMessage = "\(message) El audio no pudo validarse: \(validationError.localizedDescription)"
             statusDetail = "La captura se detuvo y el audio quedó conservado para diagnóstico."
         }
@@ -808,7 +961,7 @@ final class ClassScribeModel {
             while !Task.isCancelled, self.isRecording {
                 do { try await Task.sleep(for: .milliseconds(400)) }
                 catch { break }
-                guard !Task.isCancelled, self.activeSession?.id == session.id else { break }
+                guard !Task.isCancelled, self.isCurrent(session) else { break }
                 guard !self.isTranscriptionPaused else {
                     // Pausing live inference must not build an unbounded queue
                     // that is replayed when the user resumes.
@@ -848,6 +1001,9 @@ final class ClassScribeModel {
                 let began = Date()
                 do {
                     self.state = .loadingModel
+                    self.sessionPhase = .recording
+                    self.capturePhase = .recording
+                    self.asrPhase = .preparingLoad
                     self.statusDetail = skippedExpiredSamples > 0
                         ? "La vista en vivo retomó el audio reciente; la versión final recuperará el tramo anterior."
                         : "Preparando la transcripción local…"
@@ -856,7 +1012,7 @@ final class ClassScribeModel {
                         language: session.language,
                     )
                     try Task.checkCancellation()
-                    guard self.activeSession?.id == session.id, self.isRecording else { break }
+                    guard self.isCurrent(session), self.isRecording else { break }
                     guard !self.isTranscriptionPaused else {
                         // The user paused while Core ML was still returning a
                         // result. Discard it and resume from recent audio later;
@@ -866,7 +1022,7 @@ final class ClassScribeModel {
                     }
                     let pause = pauseDuration >= 0.55
                     try Task.checkCancellation()
-                    guard self.activeSession?.id == session.id, self.isRecording else { break }
+                    guard self.isCurrent(session), self.isRecording else { break }
                     guard !self.isTranscriptionPaused else {
                         resumeAtLatestWindow = true
                         continue
@@ -887,6 +1043,9 @@ final class ClassScribeModel {
                     self.liveTranscriptionError = nil
                     self.transcriptionLatency = Date().timeIntervalSince(began) + 1.5
                     self.state = .recording
+                    self.sessionPhase = .recording
+                    self.capturePhase = .recording
+                    self.asrPhase = .transcribing
                     self.statusDetail = pause
                         ? "Texto actualizado. Puedes corregirlo mientras la grabación continúa."
                         : "Puedes corregir el texto mientras la grabación continúa."
@@ -895,9 +1054,12 @@ final class ClassScribeModel {
                 } catch is CancellationError {
                     break
                 } catch {
-                    guard !Task.isCancelled, self.activeSession?.id == session.id, self.isRecording else { break }
+                    guard !Task.isCancelled, self.isCurrent(session), self.isRecording else { break }
                     let delay = retryPolicy.recordFailure(atUptime: ProcessInfo.processInfo.systemUptime)
                     self.state = .recording
+                    self.sessionPhase = .recording
+                    self.capturePhase = .recording
+                    self.asrPhase = .retryScheduled
                     let previousLiveError = self.liveTranscriptionError
                     let message = "Transcripción en vivo no disponible: \(error.localizedDescription). La grabación continúa."
                     self.liveTranscriptionError = message
@@ -936,13 +1098,19 @@ final class ClassScribeModel {
                     )
                 } else {
                     self.state = .finalTranscription
+                    self.sessionPhase = .processing
+                    self.capturePhase = .idle
+                    self.asrPhase = .preparingLoad
                     self.statusDetail = "La versión en vivo permanece visible mientras se prepara la versión completa."
                     await self.finalProcessor.configureLanguage(session.language)
+                    try self.ensureCurrentFinalJob(jobID: jobID, session: session)
                     do {
                         try await self.finalProcessor.configureVocabulary(file: session.technicalVocabularyURL)
+                        try self.ensureCurrentFinalJob(jobID: jobID, session: session)
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch {
+                        try self.ensureCurrentFinalJob(jobID: jobID, session: session)
                         // Custom vocabulary is an optional accuracy boost. A
                         // missing CTC model or malformed list must not discard
                         // an otherwise valid full-file transcription.
@@ -956,9 +1124,7 @@ final class ClassScribeModel {
                     try self.ensureCurrentFinalJob(jobID: jobID, session: session)
                     guard !transcript.isEmpty else { throw SessionStoreError.emptyTranscript }
                     self.allSegments = transcript
-                    self.editedAllText = nil
-                    self.editedProfessorText = nil
-                    try self.store.saveFullTranscript(
+                    self.asrOriginalReference = try self.store.saveFullTranscript(
                         metadata: self.metadata(session: session, state: .diarizing),
                         segments: transcript,
                         folder: session.folder,
@@ -967,39 +1133,60 @@ final class ClassScribeModel {
                 self.finalReplacedLive = true
                 if self.editedLiveText != nil {
                     self.selectedTab = .liveEdit
-                } else if self.professorSegments.isEmpty {
+                } else if self.professorSegments.isEmpty, self.editedProfessorText == nil {
                     self.selectedTab = .everyone
                 }
                 self.state = .diarizing
+                self.sessionPhase = .processing
+                self.capturePhase = .idle
+                self.asrPhase = .idle
                 self.statusDetail = "Identificando las voces de la clase…"
                 let diarization = try await self.finalProcessor.diarize(audioURL)
                 try Task.checkCancellation()
                 try self.ensureCurrentFinalJob(jobID: jobID, session: session)
                 let assignment = SpeakerAssignment.assign(transcript: transcript, diarization: diarization.spans)
+                self.activeDiarizationProposal = DiarizationProposal(
+                    proposalID: UUID(),
+                    createdAt: Date(),
+                    engineVersion: "macos-current",
+                    asrRunID: self.asrOriginalReference?.runID,
+                    spans: diarization.spans,
+                )
                 self.allSegments = assignment.segments
                 self.reviewItems = assignment.review
                 self.speakers = self.makeSpeakers(spans: diarization.spans, embeddings: diarization.embeddings)
-                self.editedProfessorText = nil
                 self.chooseProfessorAutomatically(subject: session.subject, embeddings: diarization.embeddings)
                 self.finalReplacedLive = true
                 self.state = .complete
+                self.sessionPhase = .complete
+                self.capturePhase = .idle
+                self.asrPhase = .idle
                 self.statusDetail = vocabularyWarning
                     ?? (self.editedLiveText == nil
                         ? "La transcripción final reemplazó a la versión provisional."
                         : "La versión final está lista y tus correcciones permanecen en Mi edición.")
                 if !self.persistFinalOutputs(session: session) {
                     self.state = .recoverable
+                    self.sessionPhase = .recoverable
+                    self.capturePhase = .failedRecoverable
+                    self.asrPhase = .failedRecoverable
                     self.statusDetail = "El texto sigue disponible, pero no se pudieron confirmar todas las salidas finales."
                 }
             } catch is CancellationError {
                 if self.isCurrentFinalJob(jobID: jobID, session: session) {
                     self.state = .cancelled
+                    self.sessionPhase = .cancelled
+                    self.capturePhase = .idle
+                    self.asrPhase = .idle
                     self.statusDetail = "Procesamiento cancelado; se conservaron el audio y el texto en vivo."
                     self.persistCurrentState(checkpoint: "processing-cancelled", session: session)
                 }
             } catch {
                 if self.isCurrentFinalJob(jobID: jobID, session: session) {
                     self.state = .failed
+                    self.sessionPhase = .failed
+                    self.capturePhase = .failedRecoverable
+                    self.asrPhase = .failedRecoverable
                     self.errorMessage = error.localizedDescription
                     self.statusDetail = self.allSegments.isEmpty
                         ? "Falló la transcripción final; se conserva el texto en vivo."
@@ -1011,7 +1198,9 @@ final class ClassScribeModel {
                 self.finalJobID = nil
                 self.finalTask = nil
             }
-            self.refreshHistory()
+            if self.isCurrent(session) {
+                self.refreshHistory()
+            }
         }
     }
 
@@ -1020,7 +1209,13 @@ final class ClassScribeModel {
     }
 
     private func isCurrentFinalJob(jobID: UUID, session: ClassSessionContext) -> Bool {
-        finalJobID == jobID && activeSession?.id == session.id
+        finalJobID == jobID && isCurrent(session)
+    }
+
+    private func isCurrent(_ session: ClassSessionContext) -> Bool {
+        generationGate.accepts(session.attemptID)
+            && activeSession?.id == session.id
+            && activeSession?.attemptID == session.attemptID
     }
 
     private func makeSpeakers(spans: [DiarizationSpan], embeddings: [String: [Float]]) -> [SpeakerRecord] {
@@ -1051,6 +1246,7 @@ final class ClassScribeModel {
     }
 
     private func chooseProfessorAutomatically(subject: String, embeddings: [String: [Float]]) {
+        guard professorSelectionIsAutomatic else { return }
         professorSelectionIsAutomatic = true
         if let reference = store.loadVoiceReference(subject: subject) {
             let matches = embeddings.compactMap { id, embedding -> (String, Double)? in
@@ -1079,7 +1275,11 @@ final class ClassScribeModel {
     }
 
     private func metadata(session: ClassSessionContext, state override: ProcessingState? = nil) -> ClassMetadata {
-        ClassMetadata(
+        let effectiveState = override ?? state
+        let effectiveSessionPhase = override == nil ? sessionPhase : effectiveState.sessionPhase
+        let effectiveCapturePhase = override == nil ? capturePhase : effectiveState.defaultCapturePhase
+        let effectiveAsrPhase = override == nil ? asrPhase : effectiveState.defaultAsrPhase
+        return ClassMetadata(
             id: session.id,
             subject: session.subject,
             startedAt: session.startedAt,
@@ -1089,27 +1289,53 @@ final class ClassScribeModel {
             professorSpeakerID: professorSpeakerID,
             professorSelectionIsAutomatic: professorSelectionIsAutomatic,
             speakerCount: speakers.count,
-            state: override ?? state,
+            state: effectiveState,
             folderPath: session.folder.path,
             technicalVocabulary: session.technicalVocabulary,
             language: session.language,
+            sessionPhase: effectiveSessionPhase,
+            capturePhase: effectiveCapturePhase,
+            asrPhase: effectiveAsrPhase,
+            captureScope: session.mode.captureScope,
+            audioFormat: "float32_16000_mono",
+            formatVersion: 1,
+            platform: "macos",
+            attemptID: session.attemptID,
+            asrOriginalReference: asrOriginalReference,
         )
     }
 
     @discardableResult
-    private func persistFinalOutputs(session: ClassSessionContext? = nil) -> Bool {
+    private func persistFinalOutputs(
+        session: ClassSessionContext? = nil,
+        humanCorrection: HumanCorrectionUpdate? = nil,
+    ) -> Bool {
         guard let session = session ?? activeSession else { return false }
         do {
-            try store.saveFinal(
-                metadata: metadata(session: session),
-                all: allSegments,
-                professor: professorSegments,
-                review: reviewItems,
-                speakers: speakers,
-                folder: session.folder,
-                editedAllText: editedAllText,
-                editedProfessorText: editedProfessorText,
-            )
+            if let humanCorrection {
+                try store.saveFinal(
+                    metadata: metadata(session: session),
+                    all: allSegments,
+                    professor: professorSegments,
+                    review: reviewItems,
+                    speakers: speakers,
+                    folder: session.folder,
+                    humanCorrection: humanCorrection,
+                    diarizationProposal: activeDiarizationProposal,
+                )
+            } else {
+                try store.saveAutomaticProjection(
+                    metadata: metadata(session: session),
+                    all: allSegments,
+                    professor: professorSegments,
+                    review: reviewItems,
+                    speakers: speakers,
+                    folder: session.folder,
+                    automaticAllText: TranscriptExporter.plainText(allSegments),
+                    automaticProfessorText: TranscriptExporter.plainText(professorSegments),
+                    diarizationProposal: activeDiarizationProposal,
+                )
+            }
             refreshHistory()
             return true
         } catch {
@@ -1125,15 +1351,16 @@ final class ClassScribeModel {
             try store.saveMetadata(metadata(session: session), folder: session.folder)
             try checkpointLive(checkpoint, session: session)
             if !allSegments.isEmpty {
-                try store.saveFinal(
+                try store.saveAutomaticProjection(
                     metadata: metadata(session: session),
                     all: allSegments,
                     professor: professorSegments,
                     review: reviewItems,
                     speakers: speakers,
                     folder: session.folder,
-                    editedAllText: editedAllText,
-                    editedProfessorText: editedProfessorText,
+                    automaticAllText: TranscriptExporter.plainText(allSegments),
+                    automaticProfessorText: TranscriptExporter.plainText(professorSegments),
+                    diarizationProposal: activeDiarizationProposal,
                 )
             }
         } catch {
@@ -1190,7 +1417,7 @@ final class ClassScribeModel {
             do { try await Task.sleep(for: .milliseconds(300)) }
             catch { return }
             guard let self,
-                  self.activeSession?.id == session.id,
+                  self.isCurrent(session),
                   self.editedLiveText == text else { return }
             do {
                 try self.store.saveReadableLiveText(

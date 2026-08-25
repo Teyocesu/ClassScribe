@@ -25,13 +25,20 @@ func applicationCaptureFixture() async throws {
     defer { if player.isRunning { player.terminate() } }
 
     let controller = CaptureController()
+    let attempt = SessionAttemptID(generation: 1)
     let source = RunningApplication(
         id: player.processIdentifier,
         name: "ClassScribe fixture player",
         bundleIdentifier: "",
         bundleURL: nil
     )
-    _ = try await controller.start(mode: .online, application: source, microphone: nil, folder: folder)
+    _ = try await controller.start(
+        attempt: attempt,
+        mode: .online,
+        application: source,
+        microphone: nil,
+        folder: folder,
+    )
     try await Task.sleep(for: .seconds(6))
     let result = try await controller.stop()
     #expect(result.duration > 4)
@@ -64,7 +71,9 @@ func microphoneCaptureFixture() async throws {
     defer { try? FileManager.default.removeItem(at: folder) }
 
     let controller = CaptureController()
+    let attempt = SessionAttemptID(generation: 1)
     _ = try await controller.start(
+        attempt: attempt,
         mode: .inPerson,
         application: nil,
         microphone: MicrophoneOption(id: microphone.uniqueID, name: microphone.localizedName),

@@ -1,0 +1,12 @@
+[
+  {
+    "id": "33333333-3333-3333-3333-333333333333",
+    "start": 0,
+    "end": 1.5,
+    "text": "Explicación conservada",
+    "speakerID": "Persona 0",
+    "confidence": 0.8,
+    "provisional": false,
+    "overlappingVoices": false
+  }
+]

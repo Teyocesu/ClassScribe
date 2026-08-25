@@ -1,0 +1,14 @@
+{
+  "id": "22222222-2222-2222-2222-222222222222",
+  "subject": "Historia",
+  "startedAt": "2026-07-02T14:30:00Z",
+  "duration": 3.25,
+  "mode": "InPerson",
+  "source": "Micrófono principal",
+  "professorSpeakerID": "Persona 1",
+  "professorSelectionIsAutomatic": false,
+  "speakerCount": 2,
+  "state": "Recoverable",
+  "folderPath": "",
+  "technicalVocabulary": "revolución"
+}

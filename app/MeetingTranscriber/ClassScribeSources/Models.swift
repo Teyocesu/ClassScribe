@@ -94,7 +94,7 @@ struct ProfessorVoiceReference: Codable, Equatable {
     var embedding: [Float]
 }
 
-struct ClassMetadata: Identifiable, Codable, Equatable {
+struct ClassMetadata: Identifiable, Equatable {
     var id: UUID
     var subject: String
     var startedAt: Date
@@ -109,6 +109,72 @@ struct ClassMetadata: Identifiable, Codable, Equatable {
     var technicalVocabulary: String
     /// Optional keeps metadata from versions before multilingual support decodable.
     var language: TranscriptionLanguage? = nil
+    var schemaVersion: Int = 2
+    var sessionPhase: SessionPhase = .draft
+    var capturePhase: CapturePhase = .idle
+    var asrPhase: AsrPhase = .idle
+    var captureScope: CaptureScope? = nil
+    var audioFormat: String = "legacy_unknown"
+    var formatVersion: Int = 1
+    var platform: String = "macos"
+    var attemptID: SessionAttemptID? = nil
+    var asrOriginalReference: ASRTranscriptReference? = nil
+    var diarizationProposalReferences: [DiarizationProposalReference] = []
+    var humanCorrectionOverlayReference: HumanCorrectionOverlayReference? = nil
+
+    init(
+        id: UUID,
+        subject: String,
+        startedAt: Date,
+        duration: TimeInterval,
+        mode: CaptureMode,
+        source: String,
+        professorSpeakerID: String?,
+        professorSelectionIsAutomatic: Bool,
+        speakerCount: Int,
+        state: ProcessingState,
+        folderPath: String,
+        technicalVocabulary: String,
+        language: TranscriptionLanguage? = nil,
+        schemaVersion: Int = 2,
+        sessionPhase: SessionPhase? = nil,
+        capturePhase: CapturePhase? = nil,
+        asrPhase: AsrPhase? = nil,
+        captureScope: CaptureScope? = nil,
+        audioFormat: String = "legacy_unknown",
+        formatVersion: Int = 1,
+        platform: String = "macos",
+        attemptID: SessionAttemptID? = nil,
+        asrOriginalReference: ASRTranscriptReference? = nil,
+        diarizationProposalReferences: [DiarizationProposalReference] = [],
+        humanCorrectionOverlayReference: HumanCorrectionOverlayReference? = nil,
+    ) {
+        self.id = id
+        self.subject = subject
+        self.startedAt = startedAt
+        self.duration = duration
+        self.mode = mode
+        self.source = source
+        self.professorSpeakerID = professorSpeakerID
+        self.professorSelectionIsAutomatic = professorSelectionIsAutomatic
+        self.speakerCount = speakerCount
+        self.state = state
+        self.folderPath = folderPath
+        self.technicalVocabulary = technicalVocabulary
+        self.language = language
+        self.schemaVersion = schemaVersion
+        self.sessionPhase = sessionPhase ?? state.sessionPhase
+        self.capturePhase = capturePhase ?? state.defaultCapturePhase
+        self.asrPhase = asrPhase ?? state.defaultAsrPhase
+        self.captureScope = captureScope
+        self.audioFormat = audioFormat
+        self.formatVersion = formatVersion
+        self.platform = platform
+        self.attemptID = attemptID
+        self.asrOriginalReference = asrOriginalReference
+        self.diarizationProposalReferences = diarizationProposalReferences
+        self.humanCorrectionOverlayReference = humanCorrectionOverlayReference
+    }
 }
 
 enum Timecode {

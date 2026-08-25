@@ -209,6 +209,55 @@ func successfulFinalRetryCompletesSession() async throws {
 
 @MainActor
 @Test
+func automaticRetryKeepsHumanOverlayEffectiveInActiveModel() async throws {
+    let fixture = try makeRecoverableProcessingFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let humanMetadata = ClassMetadata(
+        id: UUID(),
+        subject: "Prueba resiliente",
+        startedAt: Date(timeIntervalSince1970: 1_750_000_000),
+        duration: 1,
+        mode: .inPerson,
+        source: "Micrófono de prueba",
+        professorSpeakerID: "Persona humana",
+        professorSelectionIsAutomatic: false,
+        speakerCount: 1,
+        state: .failed,
+        folderPath: fixture.folder.path,
+        technicalVocabulary: "",
+    )
+    try fixture.store.saveTextOverrides(
+        metadata: humanMetadata,
+        allText: "corrección humana completa",
+        professorText: "corrección humana del profesor",
+        folder: fixture.folder,
+    )
+    let overlayURL = fixture.folder.appendingPathComponent("human-correction-overlay.json")
+    let overlayBefore = try Data(contentsOf: overlayURL)
+
+    let model = ClassScribeModel(
+        store: fixture.store,
+        finalProcessor: StubFinalProcessor(.success),
+    )
+    let summary = try #require(model.history.first(where: { $0.folder == fixture.folder }))
+    model.openHistory(summary)
+
+    await model.retryProcessing()
+    await model.waitForFinalProcessingForTesting()
+
+    #expect(model.state == .complete)
+    #expect(model.editedAllText == "corrección humana completa")
+    #expect(model.editedProfessorText == "corrección humana del profesor")
+    #expect(model.displayedText == "corrección humana del profesor")
+    #expect(model.professorSelectionIsAutomatic == false)
+    #expect(try Data(contentsOf: overlayURL) == overlayBefore)
+    #expect(try String(contentsOf: fixture.folder.appendingPathComponent("all-speakers.txt"), encoding: .utf8)
+        == "corrección humana completa")
+    #expect(FileManager.default.fileExists(atPath: fixture.folder.appendingPathComponent("diarization-proposals.json").path))
+}
+
+@MainActor
+@Test
 func rawOnlyFinalRetryCompletesSession() async throws {
     let fixture = try makeRecoverableProcessingFixture()
     defer { try? FileManager.default.removeItem(at: fixture.root) }

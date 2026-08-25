@@ -81,7 +81,7 @@ func transcriptionLanguagesRoundTripAndRemainBackwardCompatible() throws {
         technicalVocabulary: "",
     )
     let legacyData = try JSONEncoder().encode(legacy)
-    #expect(try JSONDecoder().decode(ClassMetadata.self, from: legacyData).language == nil)
+    #expect(try JSONDecoder().decode(ClassMetadata.self, from: legacyData).language == .spanish)
 
     var multilingual = legacy
     multilingual.language = .french

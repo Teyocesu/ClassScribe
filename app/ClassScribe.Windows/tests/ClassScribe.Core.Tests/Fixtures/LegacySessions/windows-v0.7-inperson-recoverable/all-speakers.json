@@ -1,0 +1,12 @@
+[
+  {
+    "id": "44444444-4444-4444-4444-444444444444",
+    "start": 0,
+    "end": 1.0,
+    "text": "Texto recuperable",
+    "speakerID": "Persona 1",
+    "confidence": 0.7,
+    "provisional": false,
+    "overlappingVoices": false
+  }
+]

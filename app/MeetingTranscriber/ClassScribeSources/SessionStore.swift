@@ -217,14 +217,112 @@ struct SessionStore {
         review: [ReviewItem],
         speakers: [SpeakerRecord],
         folder: URL,
-        editedAllText: String? = nil,
-        editedProfessorText: String? = nil,
+        humanCorrection: HumanCorrectionUpdate? = nil,
+        diarizationProposal: DiarizationProposal? = nil,
     ) throws {
+        try saveProjection(
+            metadata: metadata,
+            all: all,
+            professor: professor,
+            review: review,
+            speakers: speakers,
+            folder: folder,
+            automaticAllText: nil,
+            automaticProfessorText: nil,
+            humanCorrection: humanCorrection,
+            diarizationProposal: diarizationProposal,
+        )
+    }
+
+    func saveAutomaticProjection(
+        metadata: ClassMetadata,
+        all: [TranscriptSegment],
+        professor: [TranscriptSegment],
+        review: [ReviewItem],
+        speakers: [SpeakerRecord],
+        folder: URL,
+        automaticAllText: String,
+        automaticProfessorText: String,
+        diarizationProposal: DiarizationProposal? = nil,
+    ) throws {
+        try saveProjection(
+            metadata: metadata,
+            all: all,
+            professor: professor,
+            review: review,
+            speakers: speakers,
+            folder: folder,
+            automaticAllText: automaticAllText,
+            automaticProfessorText: automaticProfessorText,
+            humanCorrection: nil,
+            diarizationProposal: diarizationProposal,
+        )
+    }
+
+    private func saveProjection(
+        metadata: ClassMetadata,
+        all: [TranscriptSegment],
+        professor: [TranscriptSegment],
+        review: [ReviewItem],
+        speakers: [SpeakerRecord],
+        folder: URL,
+        automaticAllText: String?,
+        automaticProfessorText: String?,
+        humanCorrection: HumanCorrectionUpdate?,
+        diarizationProposal: DiarizationProposal?,
+    ) throws {
+        var overlay = loadCorrectionOverlay(in: folder)
+        if let humanCorrection {
+            var humanOverlay = overlay ?? HumanCorrectionOverlay()
+            humanOverlay.operations.append(contentsOf: humanCorrection.operations.filter { operation in
+                !humanOverlay.operations.contains(where: { $0.id == operation.id })
+            })
+            if let allText = humanCorrection.allText {
+                humanOverlay.editedAllText = allText
+            }
+            if let professorText = humanCorrection.professorText {
+                humanOverlay.editedProfessorText = professorText
+            }
+            try writeJSON(humanOverlay, to: folder.appendingPathComponent("human-correction-overlay.json"))
+            overlay = humanOverlay
+        }
+
+        var proposalDocument = loadDiarizationProposalDocument(in: folder)
+            ?? DiarizationProposalDocument(proposals: [])
+        if let diarizationProposal,
+           !proposalDocument.proposals.contains(where: { $0.proposalID == diarizationProposal.proposalID }) {
+            proposalDocument.proposals.append(diarizationProposal)
+        }
+        var metadataToSave = metadata
+        if overlay != nil {
+            metadataToSave.humanCorrectionOverlayReference = metadataToSave.humanCorrectionOverlayReference
+                ?? HumanCorrectionOverlayReference(relativePath: "human-correction-overlay.json")
+        }
+        if let diarizationProposal {
+            let reference = DiarizationProposalReference(
+                proposalID: diarizationProposal.proposalID,
+                relativePath: "diarization-proposals.json",
+            )
+            if !metadataToSave.diarizationProposalReferences.contains(where: { $0.proposalID == reference.proposalID }) {
+                metadataToSave.diarizationProposalReferences.append(reference)
+            }
+        }
+        for proposal in proposalDocument.proposals {
+            if !metadataToSave.diarizationProposalReferences.contains(where: { $0.proposalID == proposal.proposalID }) {
+                metadataToSave.diarizationProposalReferences.append(
+                    DiarizationProposalReference(
+                        proposalID: proposal.proposalID,
+                        relativePath: "diarization-proposals.json",
+                    ),
+                )
+            }
+        }
+        try writeJSON(proposalDocument, to: folder.appendingPathComponent("diarization-proposals.json"))
         try writeJSON(all, to: folder.appendingPathComponent("all-speakers.json"))
         try writeJSON(review, to: folder.appendingPathComponent("review.json"))
         try writeJSON(speakers, to: folder.appendingPathComponent("speakers.json"))
-        let readableAll = editedAllText ?? TranscriptExporter.plainText(all)
-        let readableProfessor = editedProfessorText ?? TranscriptExporter.plainText(professor)
+        let readableAll = overlay?.editedAllText ?? automaticAllText ?? TranscriptExporter.plainText(all)
+        let readableProfessor = overlay?.editedProfessorText ?? automaticProfessorText ?? TranscriptExporter.plainText(professor)
         try writeText(readableAll, to: folder.appendingPathComponent("all-speakers.txt"))
         try writeText(
             TranscriptExporter.markdown(subject: metadata.subject, date: metadata.startedAt, text: readableAll),
@@ -239,22 +337,51 @@ struct SessionStore {
         // Commit the successful state last. If any output above fails or the
         // process is interrupted, the prior metadata remains non-complete and
         // the scanner truthfully offers recovery/retry on the next launch.
-        try writeJSON(metadata, to: folder.appendingPathComponent("metadata.json"))
+        try writeJSON(metadataToSave, to: folder.appendingPathComponent("metadata.json"))
     }
 
     func saveMetadata(_ metadata: ClassMetadata, folder: URL) throws {
         try writeJSON(metadata, to: folder.appendingPathComponent("metadata.json"))
     }
 
-    func saveFullTranscript(metadata: ClassMetadata, segments: [TranscriptSegment], folder: URL) throws {
+    @discardableResult
+    func saveFullTranscript(metadata: ClassMetadata, segments: [TranscriptSegment], folder: URL) throws -> ASRTranscriptReference {
         guard !segments.isEmpty else { throw SessionStoreError.emptyTranscript }
-        try writeJSON(metadata, to: folder.appendingPathComponent("metadata.json"))
+        let reference = try saveASROriginal(metadata: metadata, segments: segments, folder: folder)
+        var metadataWithReference = metadata
+        metadataWithReference.asrOriginalReference = reference
+        if loadCorrectionOverlay(in: folder) != nil {
+            metadataWithReference.humanCorrectionOverlayReference = metadataWithReference.humanCorrectionOverlayReference
+                ?? HumanCorrectionOverlayReference(relativePath: "human-correction-overlay.json")
+        }
+        if let proposalDocument = loadDiarizationProposalDocument(in: folder) {
+            for proposal in proposalDocument.proposals {
+                if !metadataWithReference.diarizationProposalReferences.contains(where: { $0.proposalID == proposal.proposalID }) {
+                    metadataWithReference.diarizationProposalReferences.append(
+                        DiarizationProposalReference(
+                            proposalID: proposal.proposalID,
+                            relativePath: "diarization-proposals.json",
+                        ),
+                    )
+                }
+            }
+        }
+        try writeJSON(metadataWithReference, to: folder.appendingPathComponent("metadata.json"))
         try writeJSON(segments, to: folder.appendingPathComponent("all-speakers.json"))
-        try writeText(TranscriptExporter.plainText(segments), to: folder.appendingPathComponent("all-speakers.txt"))
+        let overlay = loadCorrectionOverlay(in: folder)
         try writeText(
-            TranscriptExporter.markdown(subject: metadata.subject, date: metadata.startedAt, segments: segments),
+            overlay?.editedAllText ?? TranscriptExporter.plainText(segments),
+            to: folder.appendingPathComponent("all-speakers.txt"),
+        )
+        try writeText(
+            TranscriptExporter.markdown(
+                subject: metadata.subject,
+                date: metadata.startedAt,
+                text: overlay?.editedAllText ?? TranscriptExporter.plainText(segments),
+            ),
             to: folder.appendingPathComponent("all-speakers.md"),
         )
+        return reference
     }
 
     func saveReadableLiveText(
@@ -287,6 +414,14 @@ struct SessionStore {
         professorText: String?,
         folder: URL,
     ) throws {
+        var overlay = loadCorrectionOverlay(in: folder) ?? HumanCorrectionOverlay()
+        if let allText {
+            overlay.editedAllText = allText
+        }
+        if let professorText {
+            overlay.editedProfessorText = professorText
+        }
+        try writeJSON(overlay, to: folder.appendingPathComponent("human-correction-overlay.json"))
         if let allText {
             try writeText(allText, to: folder.appendingPathComponent("all-speakers.txt"))
             try writeText(
@@ -301,6 +436,10 @@ struct SessionStore {
                 to: folder.appendingPathComponent("professor.md"),
             )
         }
+        var metadataToSave = metadata
+        metadataToSave.humanCorrectionOverlayReference = metadataToSave.humanCorrectionOverlayReference
+            ?? HumanCorrectionOverlayReference(relativePath: "human-correction-overlay.json")
+        try writeJSON(metadataToSave, to: folder.appendingPathComponent("metadata.json"))
     }
 
     func saveVoiceReference(_ reference: ProfessorVoiceReference, folder: URL) throws {
@@ -323,7 +462,7 @@ struct SessionStore {
         return try? decoder.decode(ProfessorVoiceReference.self, from: data)
     }
 
-    func scanSessions(materializeLegacyText: Bool = true) -> [SessionSummary] {
+    func scanSessions(materializeLegacyText: Bool = false) -> [SessionSummary] {
         guard let folders = try? FileManager.default.contentsOfDirectory(
             at: root,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
@@ -337,7 +476,7 @@ struct SessionStore {
     }
 
     func history() -> [SessionSummary] {
-        scanSessions()
+        scanSessions(materializeLegacyText: false)
     }
 
     func restore(_ summary: SessionSummary) -> RestoredSession {
@@ -345,6 +484,7 @@ struct SessionStore {
         let allSegments: [TranscriptSegment] = decodeFile("all-speakers.json", in: folder) ?? []
         let speakers: [SpeakerRecord] = decodeFile("speakers.json", in: folder) ?? []
         let review: [ReviewItem] = decodeFile("review.json", in: folder) ?? []
+        let overlay: HumanCorrectionOverlay? = decodeFile("human-correction-overlay.json", in: folder)
         let accumulator = loadLive(folder: folder) ?? LiveTranscriptAccumulator()
         let allBase = TranscriptExporter.plainText(allSegments)
         let professorSegments = SpeakerAssignment.professorSegments(
@@ -373,8 +513,9 @@ struct SessionStore {
             preferredTextSource: preferred.source,
             editedLiveText: explicitLiveEdit?.text
                 ?? liveBody.flatMap { $0 == accumulator.visibleText ? nil : $0 },
-            editedAllText: allReadable.flatMap { $0 == allBase ? nil : $0 },
-            editedProfessorText: professorReadable.flatMap { $0 == professorBase ? nil : $0 },
+            editedAllText: overlay?.editedAllText ?? allReadable.flatMap { $0 == allBase ? nil : $0 },
+            editedProfessorText: overlay?.editedProfessorText
+                ?? professorReadable.flatMap { $0 == professorBase ? nil : $0 },
         )
     }
 
@@ -382,7 +523,38 @@ struct SessionStore {
         let fileManager = FileManager.default
         let metadataURL = folder.appendingPathComponent("metadata.json")
         let metadataData = readRegularData(metadataURL, maximumBytes: Self.maximumMetadataBytes)
-        let decodedMetadata = metadataData.flatMap { try? decoder.decode(ClassMetadata.self, from: $0) }
+        let decodedMetadata: ClassMetadata?
+        var metadataWasCorrupt = false
+        if let metadataData {
+            do {
+                guard let object = try JSONSerialization.jsonObject(with: metadataData) as? [String: Any] else {
+                    // Valid JSON with a non-object root is not metadata and
+                    // must not be reinterpreted as a legacy session.
+                    return nil
+                }
+                if let schemaValue = object["schemaVersion"] {
+                    guard let schemaVersion = schemaValue as? Int else { return nil }
+                    if schemaVersion > 2 {
+                        // A future schema is unsupported, not a legacy
+                        // document to reinterpret and later downgrade.
+                        return nil
+                    }
+                }
+                guard let decoded = try? decoder.decode(ClassMetadata.self, from: metadataData) else {
+                    // Syntax-valid metadata with an explicit unknown token is
+                    // unsupported; it must not receive inferred defaults.
+                    return nil
+                }
+                decodedMetadata = decoded
+            } catch {
+                // v0.7 could leave metadata partially written. Recover from
+                // the surviving artifacts without rewriting this file.
+                metadataWasCorrupt = true
+                decodedMetadata = nil
+            }
+        } else {
+            decodedMetadata = nil
+        }
         let audioURL = folder.appendingPathComponent("source.wav")
         let hasAudio = fileManager.fileExists(atPath: audioURL.path)
         let audioDuration = hasAudio ? try? WavFile.validate(audioURL) : nil
@@ -401,8 +573,14 @@ struct SessionStore {
             "live-transcript.txt", "live-transcript.json", "live-transcript-journal.jsonl",
             "live-transcript-edit.json", "recovered-transcript.txt", "all-speakers.txt",
             "all-speakers.json", "professor.txt", "source.raw",
+            "asr-original.json", "diarization-proposals.json", "human-correction-overlay.json",
         ]
-        let hasKnownContent = hasAudio || metadataData != nil || knownNames.contains {
+        let hasASROriginal = (try? fileManager.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles],
+        ))?.contains { $0.lastPathComponent.hasPrefix("asr-original-") } == true
+        let hasKnownContent = hasAudio || metadataData != nil || hasASROriginal || knownNames.contains {
             fileManager.fileExists(atPath: folder.appendingPathComponent($0).path)
         }
         guard hasKnownContent else { return nil }
@@ -432,11 +610,19 @@ struct SessionStore {
         let invalidAudio = hasAudio && !audioIsValid
         let needsAudioRecovery = !audioIsValid && hasRecoverableRawAudio
         let missingFinal = !hasFullTranscript
-        let isRecoverable = missingMetadata || incompleteState || missingAudio || invalidAudio || needsAudioRecovery || missingFinal
+        let isRecoverable = metadataWasCorrupt
+            || missingMetadata
+            || incompleteState
+            || missingAudio
+            || invalidAudio
+            || needsAudioRecovery
+            || missingFinal
         let reason: String? = if needsAudioRecovery {
             "El WAV quedó incompleto, pero el audio crudo se conservó y puede recuperarse."
         } else if invalidAudio {
             "El audio no es válido; el texto disponible se conserva."
+        } else if metadataWasCorrupt {
+            "La metadata quedó truncada o corrupta; el audio y el texto disponibles se conservaron."
         } else if missingMetadata {
             "Faltaba metadata; la sesión se reconstruyó desde sus archivos."
         } else if missingFinal {
@@ -513,6 +699,38 @@ struct SessionStore {
         let url = folder.appendingPathComponent(name)
         guard let data = readRegularData(url, maximumBytes: Self.maximumStructuredBytes) else { return nil }
         return try? decoder.decode(T.self, from: data)
+    }
+
+    private func loadCorrectionOverlay(in folder: URL) -> HumanCorrectionOverlay? {
+        decodeFile("human-correction-overlay.json", in: folder)
+    }
+
+    private func loadDiarizationProposalDocument(in folder: URL) -> DiarizationProposalDocument? {
+        decodeFile("diarization-proposals.json", in: folder)
+    }
+
+    private func saveASROriginal(
+        metadata: ClassMetadata,
+        segments: [TranscriptSegment],
+        folder: URL,
+    ) throws -> ASRTranscriptReference {
+        let runID = UUID()
+        let relativePath = "asr-original-\(runID.uuidString.lowercased()).json"
+        let reference = ASRTranscriptReference(
+            runID: runID,
+            relativePath: relativePath,
+            language: metadata.effectiveTranscriptionLanguage,
+            attemptID: metadata.attemptID,
+        )
+        let artifact = ASRTranscriptArtifact(
+            runID: runID,
+            createdAt: Date(),
+            language: metadata.effectiveTranscriptionLanguage,
+            attemptID: metadata.attemptID,
+            segments: segments,
+        )
+        try writeJSON(artifact, to: folder.appendingPathComponent(relativePath))
+        return reference
     }
 
     private func readRegularData(_ url: URL, maximumBytes: UInt64) -> Data? {

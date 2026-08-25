@@ -285,7 +285,12 @@ struct ContentView: View {
             case .stopping:
                 progressLabel("Guardando…")
             case .starting:
-                progressLabel("Conectando al audio…")
+                HStack(spacing: 8) {
+                    progressLabel("Conectando al audio…")
+                    Button("Cancelar", role: .cancel) {
+                        model.cancelStart()
+                    }
+                }
             case let .recording(paused):
                 HStack(spacing: 8) {
                     Button {

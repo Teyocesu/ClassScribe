@@ -23,12 +23,15 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private TaskCompletionSource stopped = NewSignal();
     private Exception? captureFailure;
     private string? rawPath;
+    private SessionAttemptID? captureAttempt;
+    private CaptureDataAvailableHandler? dataAvailableHandler;
+    private EventHandler<StoppedEventArgs>? recordingStoppedHandler;
     private long capturedBytes;
     private int recentBytes;
 
-    public event Action<double>? LevelChanged;
+    public event Action<SessionAttemptID, double>? LevelChanged;
 
-    public event Action<Exception>? CaptureFaulted;
+    public event Action<SessionAttemptID, Exception>? CaptureFaulted;
 
     public string? LastWarning { get; private set; }
 
@@ -99,9 +102,11 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     public async Task StartAsync(
         AudioSourceOption source,
         string sessionFolder,
+        SessionAttemptID attempt,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(attempt);
         if (IsRecording)
         {
             throw new InvalidOperationException("Ya hay una grabación en curso.");
@@ -130,6 +135,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         capturedBytes = 0;
         recentBytes = 0;
         recentPackets.Clear();
+        captureAttempt = attempt;
 
         try
         {
@@ -169,8 +175,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 recorder = builder.WithDevice(selectedDevice).Build();
             }
 
-            recorder.DataAvailable += HandleDataAvailable;
-            recorder.RecordingStopped += HandleRecordingStopped;
+            var callbackAttempt = attempt;
+            dataAvailableHandler = (buffer, flags, devicePosition, qpcPosition) =>
+                HandleDataAvailable(callbackAttempt, buffer, flags, devicePosition, qpcPosition);
+            recordingStoppedHandler = (sender, eventArgs) =>
+                HandleRecordingStopped(callbackAttempt, sender, eventArgs);
+            recorder.DataAvailable += dataAvailableHandler!;
+            recorder.RecordingStopped += recordingStoppedHandler!;
             recorder.StartRecording();
 
             try
@@ -283,11 +294,17 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private void HandleDataAvailable(
+        SessionAttemptID attempt,
         ReadOnlySpan<byte> buffer,
         AudioClientBufferFlags flags,
         long devicePosition,
         long qpcPosition)
     {
+        if (captureAttempt != attempt)
+        {
+            return;
+        }
+
         _ = flags;
         _ = devicePosition;
         _ = qpcPosition;
@@ -316,16 +333,21 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
 
         firstPacket.TrySetResult();
-        LevelChanged?.Invoke(CalculateLevel(copy));
+        LevelChanged?.Invoke(attempt, CalculateLevel(copy));
     }
 
-    private void HandleRecordingStopped(object? sender, StoppedEventArgs eventArgs)
+    private void HandleRecordingStopped(SessionAttemptID attempt, object? sender, StoppedEventArgs eventArgs)
     {
+        if (captureAttempt != attempt)
+        {
+            return;
+        }
+
         captureFailure ??= eventArgs.Exception;
         stopped.TrySetResult();
         if (eventArgs.Exception is not null)
         {
-            CaptureFaulted?.Invoke(eventArgs.Exception);
+            CaptureFaulted?.Invoke(attempt, eventArgs.Exception);
         }
     }
 
@@ -389,12 +411,23 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private async Task FinishCaptureResourcesAsync()
     {
         var currentRecorder = recorder;
+        var finishedAttempt = captureAttempt;
         recorder = null;
+        captureAttempt = null;
         if (currentRecorder is not null)
         {
-            currentRecorder.DataAvailable -= HandleDataAvailable;
-            currentRecorder.RecordingStopped -= HandleRecordingStopped;
+            if (dataAvailableHandler is not null)
+            {
+                currentRecorder.DataAvailable -= dataAvailableHandler;
+            }
+
+            if (recordingStoppedHandler is not null)
+            {
+                currentRecorder.RecordingStopped -= recordingStoppedHandler;
+            }
         }
+        dataAvailableHandler = null;
+        recordingStoppedHandler = null;
 
         packetChannel?.Writer.TryComplete();
         try
@@ -444,7 +477,10 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             packetChannel = null;
             writerTask = null;
             rawStream = null;
-            LevelChanged?.Invoke(0);
+            if (finishedAttempt is not null)
+            {
+                LevelChanged?.Invoke(finishedAttempt, 0);
+            }
         }
     }
 

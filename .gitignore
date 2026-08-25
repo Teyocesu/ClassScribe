@@ -43,6 +43,12 @@ metadata.json
 *.secret
 Secrets.plist
 
+# Golden legacy-session fixtures are test data, not local session data.
+!app/MeetingTranscriber/ClassScribeTests/Fixtures/LegacySessions/**/metadata.json
+!app/MeetingTranscriber/ClassScribeTests/Fixtures/LegacySessions/**/all-speakers.json
+!app/ClassScribe.Windows/tests/ClassScribe.Core.Tests/Fixtures/LegacySessions/**/metadata.json
+!app/ClassScribe.Windows/tests/ClassScribe.Core.Tests/Fixtures/LegacySessions/**/all-speakers.json
+
 # Swift build artifacts
 .dependencies/
 .toolchain/

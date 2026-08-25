@@ -324,6 +324,31 @@ struct CaptureStopResult: Sendable, Equatable {
     var duration: TimeInterval
 }
 
+/// MainActor-owned startup slot for resources that must be stopped if the
+/// final startup cancellation/generation gate rejects publication. Clearing
+/// the slot before invoking `cleanup` makes release idempotent and prevents a
+/// second cleanup path from stopping a different attempt's resource.
+@MainActor
+final class CaptureStartupResourceOwner<Resource> {
+    private(set) var ownedResource: Resource?
+    private let cleanup: (Resource) -> Void
+
+    init(cleanup: @escaping (Resource) -> Void) {
+        self.cleanup = cleanup
+    }
+
+    func acquire(_ resource: Resource) {
+        precondition(ownedResource == nil, "startup resource already owned")
+        ownedResource = resource
+    }
+
+    func release() {
+        guard let resource = ownedResource else { return }
+        ownedResource = nil
+        cleanup(resource)
+    }
+}
+
 /// Detects a dead callback stream without treating digital silence as a
 /// failure. `sampleCount` advances for both audible and silent buffers; only a
 /// complete absence of frames for `stallTimeout` is terminal.
@@ -388,8 +413,17 @@ final class CaptureController {
     private(set) var isStarting = false
 
     let liveStore = LiveAudioBufferStore()
-    private var onlineSession: AudioCaptureSession?
-    private var microphoneCapture: MicCaptureHandler?
+    private let nativeExecutor = CaptureNativeExecutor()
+    private let attemptGate = CaptureAttemptGate()
+    private let microphoneCaptureOwner = CaptureStartupResourceOwner<MicCaptureHandler> { $0.stop() }
+    private var microphoneCapture: MicCaptureHandler? {
+        microphoneCaptureOwner.ownedResource
+    }
+    private var activeAttempt: SessionAttemptID?
+    private var startCancellation: CaptureStartCancellation?
+    private var nativeStartWork: CaptureNativeWork<Void>?
+    private var nativeStopWork: CaptureNativeWork<Void>?
+    private var nativeStopAttempt: SessionAttemptID?
     private var levelTimer: Timer?
     private var rawOnlineURL: URL?
     private var sourceWAVURL: URL?
@@ -404,7 +438,12 @@ final class CaptureController {
     private var onlineFrameWatchdog = AudioFrameWatchdog(stallTimeout: onlineStallTimeout)
 
     var isBusy: Bool {
-        isCapturing || isStarting || terminalCaptureFailure != nil
+        isCapturing
+            || isStarting
+            || startCancellation != nil
+            || nativeStartWork != nil
+            || nativeStopWork != nil
+            || terminalCaptureFailure != nil
     }
 
     func refreshSources() {
@@ -433,6 +472,7 @@ final class CaptureController {
     }
 
     func start(
+        attempt: SessionAttemptID,
         mode: CaptureMode,
         application: RunningApplication?,
         microphone: MicrophoneOption?,
@@ -441,7 +481,16 @@ final class CaptureController {
         guard !isBusy else { throw CaptureError.notRecording }
         try Task.checkCancellation()
         isStarting = true
-        defer { isStarting = false }
+        activeAttempt = attempt
+        attemptGate.begin(attempt)
+        let startCancellation = CaptureStartCancellation()
+        self.startCancellation = startCancellation
+        defer {
+            if self.startCancellation === startCancellation {
+                self.startCancellation = nil
+                self.isStarting = false
+            }
+        }
         terminalCaptureFailure = nil
         completedStop = nil
         stopTask = nil
@@ -449,6 +498,8 @@ final class CaptureController {
         rawOnlineURL = nil
         stopLiveBufferPump()
         let liveGeneration = await liveStore.reset()
+        try Task.checkCancellation()
+        guard activeAttempt == attempt else { throw CancellationError() }
         activeCaptureGeneration = nil
         onlineRootPID = nil
         onlineHealthCheckInFlight = false
@@ -467,6 +518,7 @@ final class CaptureController {
             }
         }
         var keepLiveBufferPump = false
+        let callbackAttemptGate = attemptGate
         defer {
             if !keepLiveBufferPump {
                 liveContinuation.finish()
@@ -477,115 +529,130 @@ final class CaptureController {
             // AsyncStream preserves callback order without blocking the audio
             // thread. Spawning one unstructured Task per buffer allowed tasks
             // to reach the actor out of order and could scramble live ASR.
+            guard callbackAttemptGate.accepts(attempt) else { return }
             _ = liveContinuation.yield(buffer)
         }
 
-        switch mode {
-        case .online:
-            guard let application else { throw CaptureError.sourceMissing }
-            guard Self.processIsRunning(application.id) else { throw CaptureError.noProcesses }
-            var pids: [pid_t] = [application.id]
-            if let bundleURL = application.bundleURL {
-                pids.append(contentsOf: ProcessTreeEnumerator.pidsRooted(in: bundleURL))
-            }
-            var seenPIDs = Set<pid_t>()
-            pids = pids.filter {
-                $0 > 0 && $0 != getpid() && seenPIDs.insert($0).inserted
-            }
-            guard !pids.isEmpty else { throw CaptureError.noProcesses }
-            guard try await AudioProcessStartupWaiter.waitUntilRegistered(
-                pids: pids,
-                timeout: Self.onlineProcessRegistrationTimeout,
-            ) else {
+        do {
+            switch mode {
+            case .online:
+                guard let application else { throw CaptureError.sourceMissing }
                 guard Self.processIsRunning(application.id) else { throw CaptureError.noProcesses }
-                throw CaptureError.applicationAudioUnavailable
-            }
-            try Task.checkCancellation()
-            guard Self.processIsRunning(application.id) else { throw CaptureError.noProcesses }
-            let rawURL = folder.appendingPathComponent("source.raw")
-            let session = AudioCaptureSession(
-                pids: pids,
-                appOutputURL: rawURL,
-                micOutputURL: nil,
-                appLiveSink: sink,
-            )
-            try session.start()
-            let initialSampleCount: Int64
-            do {
-                guard let received = try await liveStore.waitForSamples(
+                var pids: [pid_t] = [application.id]
+                if let bundleURL = application.bundleURL {
+                    pids.append(contentsOf: ProcessTreeEnumerator.pidsRooted(in: bundleURL))
+                }
+                var seenPIDs = Set<pid_t>()
+                pids = pids.filter {
+                    $0 > 0 && $0 != getpid() && seenPIDs.insert($0).inserted
+                }
+                guard !pids.isEmpty else { throw CaptureError.noProcesses }
+                guard Self.processIsRunning(application.id) else { throw CaptureError.noProcesses }
+                let rawURL = folder.appendingPathComponent("source.raw")
+                let nativeStart = nativeExecutor.beginApplicationStart(
+                    attempt: attempt,
+                    rootPID: application.id,
+                    pids: pids,
+                    outputURL: rawURL,
+                    registrationTimeout: Self.onlineProcessRegistrationTimeout,
+                    liveSink: sink,
+                )
+                nativeStartWork = nativeStart
+                observeNativeCompletion(nativeStart, kind: .start)
+                try await nativeStart.value()
+                try Task.checkCancellation()
+                guard activeAttempt == attempt else { throw CancellationError() }
+
+                let initialSampleCount = try await waitForFirstSamples(
                     after: 0,
                     timeout: Self.onlineFirstBufferTimeout,
-                ) else {
-                    throw CaptureError.applicationAudioUnavailable
+                    cancellation: startCancellation,
+                )
+                guard activeAttempt == attempt else { throw CancellationError() }
+                rawOnlineURL = rawURL
+                onlineRootPID = application.id
+                activeCaptureGeneration = liveGeneration
+                onlineFrameWatchdog.reset(
+                    sampleCount: initialSampleCount,
+                    now: ProcessInfo.processInfo.systemUptime,
+                )
+
+            case .inPerson:
+                let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
+                MicCaptureDiagnostics.record(
+                    "authorization=\(authorization.rawValue) bundle=\(Bundle.main.bundleIdentifier ?? "unknown") requested=\(microphone?.id ?? "none")",
+                )
+                guard await requestMicrophonePermission() else { throw CaptureError.permissionDenied }
+                // The permission sheet can outlive the task that initiated it.
+                // Never start hardware after that owner has been cancelled.
+                try Task.checkCancellation()
+                guard activeAttempt == attempt else { throw CancellationError() }
+                guard let microphone else { throw CaptureError.sourceMissing }
+                let connectedMicrophoneIDs = Set(currentMicrophones().map(\.uniqueID))
+                guard connectedMicrophoneIDs.contains(microphone.id) else {
+                    throw CaptureError.microphoneUnavailable
                 }
-                try Task.checkCancellation()
-                initialSampleCount = received
-            } catch {
-                _ = session.stop()
-                throw error
+                let capture = MicCaptureHandler(outputURL: sourceURL, debugLogging: true, liveSink: sink)
+                try capture.start(deviceUID: microphone.id)
+                do {
+                    try await capture.waitForFirstBuffer()
+                    try Task.checkCancellation()
+                } catch {
+                    // This legacy mic path remains MainActor-owned while its
+                    // physical gate is TCC-blocked; preserve its existing
+                    // deterministic cleanup until it gets its own gate.
+                    capture.stop()
+                    throw error
+                }
+                microphoneCaptureOwner.acquire(capture)
+                activeCaptureGeneration = liveGeneration
             }
-            rawOnlineURL = rawURL
-            onlineSession = session
-            onlineRootPID = application.id
-            activeCaptureGeneration = liveGeneration
-            onlineFrameWatchdog.reset(
-                sampleCount: initialSampleCount,
-                now: ProcessInfo.processInfo.systemUptime,
-            )
 
-        case .inPerson:
-            let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
-            MicCaptureDiagnostics.record(
-                "authorization=\(authorization.rawValue) bundle=\(Bundle.main.bundleIdentifier ?? "unknown") requested=\(microphone?.id ?? "none")",
-            )
-            guard await requestMicrophonePermission() else { throw CaptureError.permissionDenied }
-            // The permission sheet can outlive the task that initiated it.
-            // Never start hardware after that owner has been cancelled.
-            try Task.checkCancellation()
-            guard let microphone else { throw CaptureError.sourceMissing }
-            let connectedMicrophoneIDs = Set(currentMicrophones().map(\.uniqueID))
-            guard connectedMicrophoneIDs.contains(microphone.id) else {
-                throw CaptureError.microphoneUnavailable
-            }
-            let capture = MicCaptureHandler(outputURL: sourceURL, debugLogging: true, liveSink: sink)
-            try capture.start(deviceUID: microphone.id)
-            do {
-                try await capture.waitForFirstBuffer()
-                try Task.checkCancellation()
-            } catch {
-                // Do not rely on deinit timing to release the input tap and
-                // close the WAV after a timeout/cancellation.
-                capture.stop()
-                throw error
-            }
-            microphoneCapture = capture
-            activeCaptureGeneration = liveGeneration
-        }
-
-        do {
             // Close the final race between a successful first-buffer wait and
-            // publishing `isCapturing`. A cancelled start must never leave
-            // hardware running behind a UI that believes startup failed.
+            // publishing `isCapturing`. A stale start never publishes recording.
             try Task.checkCancellation()
+            guard activeAttempt == attempt else { throw CancellationError() }
+            sourceWAVURL = sourceURL
+            self.liveBufferContinuation = liveContinuation
+            self.liveBufferTask = liveBufferTask
+            keepLiveBufferPump = true
+            isCapturing = true
+            startLevelTimer()
+            return sourceURL
         } catch {
-            if let onlineSession {
-                _ = onlineSession.stop()
-                self.onlineSession = nil
+            // A legacy mic may have been published immediately before the
+            // final cancellation/generation gate failed. Stop it on MainActor
+            // before awaiting any other teardown, and clear ownership first.
+            microphoneCaptureOwner.release()
+            startCancellation.cancel()
+            if activeAttempt == attempt {
+                activeAttempt = nil
+                attemptGate.invalidate(attempt)
+                activeCaptureGeneration = nil
+                onlineRootPID = nil
             }
-            microphoneCapture?.stop()
-            microphoneCapture = nil
-            activeCaptureGeneration = nil
-            onlineRootPID = nil
+            let nativeStop = requestNativeStop(for: attempt)
+            await nativeStop.waitForCompletion()
             throw error
         }
+    }
 
-        sourceWAVURL = sourceURL
-        self.liveBufferContinuation = liveContinuation
-        self.liveBufferTask = liveBufferTask
-        keepLiveBufferPump = true
-        isCapturing = true
-        startLevelTimer()
-        return sourceURL
+    /// Invalidates startup synchronously on MainActor. Native work is only
+    /// marked stale here; the dedicated executor owns the eventual stop and
+    /// resource destruction when a synchronous native call returns.
+    func cancelStart(for attempt: SessionAttemptID) {
+        guard isStarting, activeAttempt == attempt else { return }
+        activeAttempt = nil
+        attemptGate.invalidate(attempt)
+        startCancellation?.cancel()
+        nativeStartWork?.cancel()
+        activeCaptureGeneration = nil
+        onlineRootPID = nil
+        levelTimer?.invalidate()
+        levelTimer = nil
+        stopLiveBufferPump()
+        _ = requestNativeStop(for: attempt)
+        isStarting = false
     }
 
     func stop() async throws -> CaptureStopResult {
@@ -601,23 +668,29 @@ final class CaptureController {
         // terminal channel error. Once teardown owns the session, the parked
         // failure must not leave `isBusy` stuck after finalization.
         terminalCaptureFailure = nil
+        let stoppedAttempt = activeAttempt
+        if let stoppedAttempt {
+            activeAttempt = nil
+            attemptGate.invalidate(stoppedAttempt)
+        }
         activeCaptureGeneration = nil
         onlineRootPID = nil
         onlineHealthCheckInFlight = false
         levelTimer?.invalidate()
         levelTimer = nil
-        let rawToWrap: URL?
-        if let onlineSession {
-            _ = onlineSession.stop()
-            self.onlineSession = nil
-            rawToWrap = rawOnlineURL
-        } else {
-            rawToWrap = nil
-        }
-        microphoneCapture?.stop()
-        microphoneCapture = nil
+        let rawToWrap = rawOnlineURL
         stopLiveBufferPump()
         levelDBFS = -120
+
+        // The control-plane state above is committed before awaiting native
+        // teardown. The actual stop remains owned by the serial native queue,
+        // so a slow AudioDeviceStop/engine.stop cannot freeze MainActor.
+        if let stoppedAttempt {
+            let nativeStop = requestNativeStop(for: stoppedAttempt)
+            await nativeStop.waitForCompletion()
+        }
+        microphoneCaptureOwner.release()
+
         let finalization = Task.detached(priority: .userInitiated) { () -> Result<CaptureStopResult, CaptureError> in
             do {
                 if let rawToWrap {
@@ -641,6 +714,59 @@ final class CaptureController {
         return try result.get()
     }
 
+    private enum NativeWorkKind {
+        case start
+        case stop
+    }
+
+    private func observeNativeCompletion<Value: Sendable>(
+        _ work: CaptureNativeWork<Value>,
+        kind: NativeWorkKind,
+    ) {
+        // This task is a control-plane watcher only. It never calls native
+        // APIs; those remain inside CaptureNativeExecutor's serial queue.
+        Task { @MainActor [weak self] in
+            await work.waitForCompletion()
+            guard let self else { return }
+            switch kind {
+            case .start:
+                if let start = self.nativeStartWork,
+                   ObjectIdentifier(start) == ObjectIdentifier(work) {
+                    self.nativeStartWork = nil
+                }
+            case .stop:
+                if let stop = self.nativeStopWork,
+                   ObjectIdentifier(stop) == ObjectIdentifier(work) {
+                    self.nativeStopWork = nil
+                    self.nativeStopAttempt = nil
+                }
+            }
+        }
+    }
+
+    private func requestNativeStop(for attempt: SessionAttemptID) -> CaptureNativeWork<Void> {
+        if let nativeStopWork,
+           nativeStopAttempt == attempt {
+            return nativeStopWork
+        }
+        let work = nativeExecutor.beginStop(attempt: attempt)
+        nativeStopWork = work
+        nativeStopAttempt = attempt
+        observeNativeCompletion(work, kind: .stop)
+        return work
+    }
+
+    private func waitForFirstSamples(
+        after baseline: Int64,
+        timeout: TimeInterval,
+        cancellation: CaptureStartCancellation,
+    ) async throws -> Int64 {
+        let liveStore = self.liveStore
+        return try await CaptureFirstSampleRace.wait(cancellation: cancellation) {
+            try await liveStore.waitForSamples(after: baseline, timeout: timeout)
+        }
+    }
+
     func abortPreservingAudio() async {
         guard isCapturing else { return }
         _ = try? await stop()
@@ -655,13 +781,21 @@ final class CaptureController {
         levelTimer?.invalidate()
         levelTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                if let onlineSession = self.onlineSession {
-                    self.levelDBFS = onlineSession.appLevelDBFS
-                    self.checkOnlineFrameProgress()
+                guard let self,
+                      self.isCapturing,
+                      let attempt = self.activeAttempt
+                else { return }
+                if self.onlineRootPID != nil {
+                    let snapshot = await self.nativeExecutor.levelSnapshot(for: attempt)
+                    guard self.isCapturing,
+                          self.activeAttempt == attempt,
+                          self.attemptGate.accepts(attempt)
+                    else { return }
+                    self.levelDBFS = snapshot.levelDBFS
+                    self.checkOnlineFrameProgress(for: attempt)
                 } else if let microphoneCapture = self.microphoneCapture {
                     if let error = microphoneCapture.terminalError {
-                        self.terminateMicrophoneCapture(error)
+                        self.terminateMicrophoneCapture(error.localizedDescription)
                         return
                     }
                     self.levelDBFS = microphoneCapture.currentLevelDBFS
@@ -670,10 +804,11 @@ final class CaptureController {
         }
     }
 
-    private func checkOnlineFrameProgress() {
+    private func checkOnlineFrameProgress(for attempt: SessionAttemptID) {
         guard !onlineHealthCheckInFlight,
               terminalCaptureFailure == nil,
-              let generation = activeCaptureGeneration
+              let generation = activeCaptureGeneration,
+              activeAttempt == attempt
         else { return }
         if let onlineRootPID, !Self.processIsRunning(onlineRootPID) {
             reportTerminalFailure(CaptureError.applicationAudioStopped.localizedDescription)
@@ -685,7 +820,7 @@ final class CaptureController {
             let sampleCount = await self.liveStore.totalSamples()
             self.onlineHealthCheckInFlight = false
             guard self.isCapturing,
-                  self.onlineSession != nil,
+                  self.activeAttempt == attempt,
                   self.activeCaptureGeneration == generation,
                   self.terminalCaptureFailure == nil
             else { return }
@@ -698,11 +833,10 @@ final class CaptureController {
         }
     }
 
-    private func terminateMicrophoneCapture(_ error: MicCaptureError) {
+    private func terminateMicrophoneCapture(_ error: String) {
         guard isCapturing else { return }
-        microphoneCapture?.stop()
-        microphoneCapture = nil
-        reportTerminalFailure(error.localizedDescription)
+        microphoneCaptureOwner.release()
+        reportTerminalFailure(error)
         MicCaptureDiagnostics.record("CaptureController stopped after terminal microphone error")
     }
 

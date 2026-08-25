@@ -35,7 +35,7 @@ func privateSessionRecoveryAudit() throws {
     #expect(summary.isRecoverable)
     #expect(summary.canRetryProcessing)
     #expect(summary.preferredTextURL?.lastPathComponent == "recovered-transcript.txt")
-    #expect(FileManager.default.fileExists(atPath: folder.appendingPathComponent("live-transcript.txt").path))
+    #expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent("live-transcript.txt").path))
     #expect(!store.restore(summary).preferredText.isEmpty)
     #expect(try Data(contentsOf: legacyURL) == originalLegacy)
 }
@@ -66,14 +66,11 @@ func legacySessionRecovery() throws {
     #expect(first.preferredTextURL?.lastPathComponent == "recovered-transcript.txt")
     #expect(try Data(contentsOf: legacyURL) == legacy)
 
+    // Reading history/restoring legacy data is read-only. A future explicit
+    // migration may materialize a readable checkpoint, but opening v0.7 must
+    // not create one as a side effect.
     let liveTXT = folder.appendingPathComponent("live-transcript.txt")
-    let readable = try String(contentsOf: liveTXT, encoding: .utf8)
-    #expect(readable.contains("texto estable"))
-    #expect(readable.contains("fragmento provisional conservado"))
-    let permissions = try #require(
-        FileManager.default.attributesOfItem(atPath: liveTXT.path)[.posixPermissions] as? NSNumber,
-    ).intValue & 0o777
-    #expect(permissions == 0o600)
+    #expect(!FileManager.default.fileExists(atPath: liveTXT.path))
 
     let restored = store.restore(first)
     #expect(restored.preferredText == "transcripción completa recuperada")
@@ -169,8 +166,10 @@ func restoredFinalEdits() throws {
         review: [],
         speakers: [],
         folder: folder,
-        editedAllText: "texto completo corregido",
-        editedProfessorText: "texto del profesor corregido",
+        humanCorrection: HumanCorrectionUpdate(
+            allText: "texto completo corregido",
+            professorText: "texto del profesor corregido",
+        ),
     )
 
     let summary = try #require(store.scanSessions().first)

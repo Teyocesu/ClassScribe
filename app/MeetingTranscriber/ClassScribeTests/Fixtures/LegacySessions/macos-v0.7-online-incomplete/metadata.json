@@ -1,0 +1,14 @@
+{
+  "id": "11111111-1111-1111-1111-111111111111",
+  "subject": "Álgebra",
+  "startedAt": "2026-07-01T09:00:00Z",
+  "duration": 12.5,
+  "mode": "Clase online",
+  "source": "Chrome",
+  "professorSpeakerID": "Persona 0",
+  "professorSelectionIsAutomatic": true,
+  "speakerCount": 1,
+  "state": "Grabando",
+  "folderPath": "",
+  "technicalVocabulary": "matriz,vector"
+}

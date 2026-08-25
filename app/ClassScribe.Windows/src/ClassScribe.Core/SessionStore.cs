@@ -18,6 +18,7 @@ public sealed record SessionSummary(
 public sealed class SessionStore
 {
     private const long MaximumMetadataBytes = 1 * 1_024 * 1_024;
+    private const long MaximumStructuredBytes = 64 * 1_024 * 1_024;
     private const long MaximumTextBytes = 64 * 1_024 * 1_024;
     private const long MaximumJournalBytes = 16 * 1_024 * 1_024;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
@@ -125,18 +126,146 @@ public sealed class SessionStore
             cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task SaveFinalAsync(
+    public Task SaveFinalAsync(
         ClassMetadata metadata,
         IReadOnlyList<TranscriptSegment> all,
         IReadOnlyList<TranscriptSegment> professor,
         IReadOnlyList<ReviewItem> review,
         IReadOnlyList<SpeakerRecord> speakers,
         string folder,
-        string? editedAllText = null,
-        string? editedProfessorText = null,
-        CancellationToken cancellationToken = default)
+        HumanCorrectionUpdate? humanCorrection = null,
+        CancellationToken cancellationToken = default,
+        DiarizationProposal? diarizationProposal = null) =>
+        SaveProjectionAsync(
+            metadata,
+            all,
+            professor,
+            review,
+            speakers,
+            folder,
+            automaticAllText: null,
+            automaticProfessorText: null,
+            humanCorrection: humanCorrection,
+            cancellationToken: cancellationToken,
+            diarizationProposal: diarizationProposal);
+
+    public Task SaveAutomaticProjectionAsync(
+        ClassMetadata metadata,
+        IReadOnlyList<TranscriptSegment> all,
+        IReadOnlyList<TranscriptSegment> professor,
+        IReadOnlyList<ReviewItem> review,
+        IReadOnlyList<SpeakerRecord> speakers,
+        string folder,
+        string automaticAllText,
+        string automaticProfessorText,
+        CancellationToken cancellationToken = default,
+        DiarizationProposal? diarizationProposal = null) =>
+        SaveProjectionAsync(
+            metadata,
+            all,
+            professor,
+            review,
+            speakers,
+            folder,
+            automaticAllText,
+            automaticProfessorText,
+            humanCorrection: null,
+            cancellationToken: cancellationToken,
+            diarizationProposal: diarizationProposal);
+
+    private async Task SaveProjectionAsync(
+        ClassMetadata metadata,
+        IReadOnlyList<TranscriptSegment> all,
+        IReadOnlyList<TranscriptSegment> professor,
+        IReadOnlyList<ReviewItem> review,
+        IReadOnlyList<SpeakerRecord> speakers,
+        string folder,
+        string? automaticAllText,
+        string? automaticProfessorText,
+        HumanCorrectionUpdate? humanCorrection,
+        CancellationToken cancellationToken,
+        DiarizationProposal? diarizationProposal)
     {
         folder = EnsureSessionFolder(folder);
+        var overlayPath = Path.Combine(folder, "human-correction-overlay.json");
+        var overlay = await ReadJsonAsync<HumanCorrectionOverlay>(
+                overlayPath)
+            .ConfigureAwait(false);
+        if (humanCorrection is not null)
+        {
+            var existingOverlay = overlay ?? new HumanCorrectionOverlay();
+            overlay = existingOverlay with
+            {
+                Operations = existingOverlay.Operations
+                    .Concat(humanCorrection.Operations.Where(operation =>
+                        existingOverlay.Operations.All(existing => existing.Id != operation.Id)))
+                    .ToArray(),
+                EditedAllText = humanCorrection.AllText ?? existingOverlay.EditedAllText,
+                EditedProfessorText = humanCorrection.ProfessorText ?? existingOverlay.EditedProfessorText,
+            };
+            await AtomicFile.WriteJsonAsync(
+                    overlayPath,
+                    overlay,
+                    JsonOptions,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (overlay is not null)
+        {
+            metadata = metadata with
+            {
+                HumanCorrectionOverlayReference = metadata.HumanCorrectionOverlayReference
+                    ?? new HumanCorrectionOverlayReference { RelativePath = "human-correction-overlay.json" },
+            };
+        }
+
+        var proposalPath = Path.Combine(folder, "diarization-proposals.json");
+        var proposalDocument = await ReadJsonAsync<DiarizationProposalDocument>(proposalPath)
+            .ConfigureAwait(false)
+            ?? new DiarizationProposalDocument();
+        if (diarizationProposal is not null
+            && proposalDocument.Proposals.All(existing => existing.ProposalID != diarizationProposal.ProposalID))
+        {
+            proposalDocument = proposalDocument with
+            {
+                Proposals = proposalDocument.Proposals.Append(diarizationProposal).ToArray(),
+            };
+        }
+        if (diarizationProposal is not null
+            && metadata.DiarizationProposalReferences.All(existing => existing.ProposalID != diarizationProposal.ProposalID))
+        {
+            metadata = metadata with
+            {
+                DiarizationProposalReferences = metadata.DiarizationProposalReferences
+                    .Append(new DiarizationProposalReference
+                    {
+                        ProposalID = diarizationProposal.ProposalID,
+                        RelativePath = "diarization-proposals.json",
+                    })
+                    .ToArray(),
+            };
+        }
+        var proposalReferences = metadata.DiarizationProposalReferences.ToList();
+        foreach (var proposal in proposalDocument.Proposals)
+        {
+            if (proposalReferences.All(existing => existing.ProposalID != proposal.ProposalID))
+            {
+                proposalReferences.Add(new DiarizationProposalReference
+                {
+                    ProposalID = proposal.ProposalID,
+                    RelativePath = "diarization-proposals.json",
+                });
+            }
+        }
+        metadata = metadata with { DiarizationProposalReferences = proposalReferences };
+
+        await AtomicFile.WriteJsonAsync(
+                proposalPath,
+                proposalDocument,
+                JsonOptions,
+                cancellationToken)
+            .ConfigureAwait(false);
         await AtomicFile.WriteJsonAsync(
             Path.Combine(folder, "all-speakers.json"), all, JsonOptions, cancellationToken).ConfigureAwait(false);
         await AtomicFile.WriteJsonAsync(
@@ -144,8 +273,8 @@ public sealed class SessionStore
         await AtomicFile.WriteJsonAsync(
             Path.Combine(folder, "speakers.json"), speakers, JsonOptions, cancellationToken).ConfigureAwait(false);
 
-        var allText = editedAllText ?? TranscriptExporter.PlainText(all);
-        var professorText = editedProfessorText ?? TranscriptExporter.PlainText(professor);
+        var allText = overlay?.EditedAllText ?? automaticAllText ?? TranscriptExporter.PlainText(all);
+        var professorText = overlay?.EditedProfessorText ?? automaticProfessorText ?? TranscriptExporter.PlainText(professor);
         await SaveTextPairAsync("all-speakers", allText, metadata, folder, cancellationToken).ConfigureAwait(false);
         await SaveTextPairAsync("professor", professorText, metadata, folder, cancellationToken).ConfigureAwait(false);
         await AtomicFile.WriteTextAsync(
@@ -165,11 +294,64 @@ public sealed class SessionStore
         CancellationToken cancellationToken = default)
     {
         folder = EnsureSessionFolder(folder);
+        var overlay = await ReadJsonAsync<HumanCorrectionOverlay>(
+                Path.Combine(folder, "human-correction-overlay.json"))
+            .ConfigureAwait(false)
+            ?? new HumanCorrectionOverlay();
+        overlay = overlay with
+        {
+            EditedAllText = allText,
+            EditedProfessorText = professorText,
+        };
+        await AtomicFile.WriteJsonAsync(
+                Path.Combine(folder, "human-correction-overlay.json"),
+                overlay,
+                JsonOptions,
+                cancellationToken)
+            .ConfigureAwait(false);
+        metadata = metadata with
+        {
+            HumanCorrectionOverlayReference = metadata.HumanCorrectionOverlayReference
+                ?? new HumanCorrectionOverlayReference { RelativePath = "human-correction-overlay.json" },
+        };
         await SaveTextPairAsync("all-speakers", allText, metadata, folder, cancellationToken)
             .ConfigureAwait(false);
         await SaveTextPairAsync("professor", professorText, metadata, folder, cancellationToken)
             .ConfigureAwait(false);
         await SaveMetadataAsync(metadata, folder, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<ASRTranscriptReference> SaveAsrOriginalAsync(
+        ClassMetadata metadata,
+        IReadOnlyList<TranscriptSegment> segments,
+        string folder,
+        CancellationToken cancellationToken = default)
+    {
+        folder = EnsureSessionFolder(folder);
+        var runID = Guid.NewGuid();
+        var relativePath = $"asr-original-{runID:N}.json";
+        var reference = new ASRTranscriptReference
+        {
+            RunID = runID,
+            RelativePath = relativePath,
+            Language = NormalizeLanguage(metadata.Language),
+            AttemptID = metadata.AttemptID,
+        };
+        var artifact = new ASRTranscriptArtifact
+        {
+            RunID = runID,
+            CreatedAt = DateTimeOffset.UtcNow,
+            Language = reference.Language,
+            AttemptID = metadata.AttemptID,
+            Segments = segments,
+        };
+        await AtomicFile.WriteJsonAsync(
+                Path.Combine(folder, relativePath),
+                artifact,
+                JsonOptions,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return reference;
     }
 
     public async Task<string> RecoverRawAudioAsync(
@@ -241,16 +423,49 @@ public sealed class SessionStore
     {
         var metadataPath = Path.Combine(folder, "metadata.json");
         ClassMetadata? metadata = null;
-        try
+        var metadataWasCorrupt = false;
+        if (IsRegularFileWithinLimit(metadataPath, MaximumMetadataBytes))
         {
-            if (IsRegularFileWithinLimit(metadataPath, MaximumMetadataBytes))
+            var metadataText = File.ReadAllText(metadataPath);
+            try
             {
-                metadata = JsonSerializer.Deserialize<ClassMetadata>(File.ReadAllText(metadataPath), JsonOptions);
+                using var document = JsonDocument.Parse(metadataText);
+                if (document.RootElement.ValueKind != JsonValueKind.Object)
+                {
+                    // Valid JSON with a non-object root is not a legacy
+                    // metadata document and must not be inferred.
+                    return null;
+                }
+
+                if (document.RootElement.TryGetProperty("schemaVersion", out var schemaVersion)
+                    && schemaVersion.TryGetInt32(out var version)
+                    && version > 2)
+                {
+                    // A future schema is unsupported, not legacy. Leave the
+                    // session untouched instead of recovering it by guessing
+                    // fields and later downgrading it to v2.
+                    return null;
+                }
+
+                try
+                {
+                    // Syntax-valid metadata is authoritative. A supported
+                    // schema with an explicit unknown token is invalid, not
+                    // an invitation to apply legacy defaults.
+                    metadata = JsonSerializer.Deserialize<ClassMetadata>(metadataText, JsonOptions);
+                }
+                catch (JsonException)
+                {
+                    return null;
+                }
             }
-        }
-        catch (JsonException)
-        {
-            // A partially-written/legacy metadata file is recoverable below.
+            catch (JsonException)
+            {
+                // v0.7 could leave metadata partially written. Keep the
+                // artifacts recoverable, but never rewrite this file merely
+                // because history was scanned.
+                metadataWasCorrupt = true;
+            }
         }
 
         var audioPath = Path.Combine(folder, "source.wav");
@@ -271,8 +486,13 @@ public sealed class SessionStore
         };
         var hasFinal = File.Exists(Path.Combine(folder, "all-speakers.json"))
             && !string.IsNullOrWhiteSpace(ReadText(Path.Combine(folder, "all-speakers.txt")));
-        var recoverable = metadata.State != ProcessingState.Complete || !audioValid || !hasFinal;
-        var reason = !audioValid && rawValid
+        var recoverable = metadataWasCorrupt
+            || metadata.State != ProcessingState.Complete
+            || !audioValid
+            || !hasFinal;
+        var reason = metadataWasCorrupt
+            ? "La metadata quedó truncada o corrupta; el audio y el texto disponibles se conservaron."
+            : !audioValid && rawValid
             ? "El WAV quedó incompleto, pero el audio crudo puede reconstruirse."
             : !audioValid
                 ? "Falta un WAV válido; el texto guardado sigue disponible."
@@ -318,6 +538,10 @@ public sealed class SessionStore
             Source = "Fuente recuperada",
             State = ProcessingState.Recoverable,
             FolderPath = Path.GetFullPath(folder),
+            SchemaVersion = 1,
+            SessionPhase = ClassScribe.Core.SessionPhase.Recoverable,
+            CapturePhase = ClassScribe.Core.CapturePhase.FailedRecoverable,
+            AsrPhase = ClassScribe.Core.AsrPhase.FailedRecoverable,
         };
     }
 
@@ -381,6 +605,31 @@ public sealed class SessionStore
             return null;
         }
     }
+
+    private static async Task<T?> ReadJsonAsync<T>(string path)
+    {
+        try
+        {
+            if (!IsRegularFileWithinLimit(path, MaximumStructuredBytes))
+            {
+                return default;
+            }
+
+            await using var stream = File.OpenRead(path);
+            return await JsonSerializer.DeserializeAsync<T>(stream, JsonOptions).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return default;
+        }
+    }
+
+    private static string NormalizeLanguage(string? language) => language?.Trim().ToLowerInvariant() switch
+    {
+        "en" => "en",
+        "fr" => "fr",
+        _ => "es",
+    };
 
     private static bool TryValidateWave(string path, out double duration)
     {
