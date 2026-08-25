@@ -75,12 +75,17 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                         continue;
                     }
 
-                    var name = title.Length == 0 ? process.ProcessName : $"{process.ProcessName} — {title}";
+                    var processName = process.ProcessName;
+                    var identity = WindowsApplicationIdentity.FromObservation(
+                        TryExecutablePath(process),
+                        processName);
+                    var name = title.Length == 0 ? processName : $"{processName} — {title}";
                     sources.Add(new AudioSourceOption(
                         AudioSourceKind.Process,
-                        process.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        identity.StableKey,
                         name,
-                        process.Id));
+                        process.Id,
+                        identity));
                 }
                 catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception)
                 {
@@ -93,6 +98,52 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             .OrderBy(static source => source.Name, StringComparer.CurrentCultureIgnoreCase)
             .ThenBy(static source => source.ProcessId)
             .ToArray();
+    }
+
+    private static IReadOnlyList<WindowsProcessIncarnation> EnumerateProcessIncarnations()
+    {
+        var ownProcessId = Environment.ProcessId;
+        var snapshots = new List<WindowsProcessIncarnation>();
+        foreach (var process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.Id == ownProcessId || process.HasExited)
+                    {
+                        continue;
+                    }
+
+                    snapshots.Add(new WindowsProcessIncarnation(
+                        process.Id,
+                        WindowsApplicationIdentity.FromObservation(
+                            TryExecutablePath(process),
+                            process.ProcessName)));
+                }
+                catch (Exception error) when (
+                    error is InvalidOperationException or System.ComponentModel.Win32Exception)
+                {
+                    // The process may exit or deny access between the two
+                    // observations. It is not a valid replacement candidate.
+                }
+            }
+        }
+
+        return snapshots;
+    }
+
+    private static string? TryExecutablePath(Process process)
+    {
+        try
+        {
+            return process.MainModule?.FileName;
+        }
+        catch (Exception error) when (
+            error is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            return null;
+        }
     }
 
     public static IReadOnlyList<AudioSourceOption> EnumerateMicrophones()
@@ -156,14 +207,23 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
             if (source.Kind == AudioSourceKind.Process)
             {
-                if (source.ProcessId is null)
+                if (source.ProcessId is null || source.Identity is null)
                 {
-                    throw new InvalidOperationException("La aplicación seleccionada ya no tiene un proceso válido.");
+                    throw new InvalidOperationException("La aplicación seleccionada no tiene una identidad estable verificable.");
                 }
 
+                // This is the final startup-only revalidation. The returned
+                // root PID is passed directly to BuildAsync; no process
+                // replacement is attempted while a recorder is running.
+                var resolvedRootPID = await WindowsApplicationStartup.ResolveBeforeBuildAsync(
+                    source.Identity,
+                    source.ProcessId,
+                    EnumerateProcessIncarnations,
+                    cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
                 recorder = await builder
                     .WithProcessLoopback(
-                        checked((uint)source.ProcessId.Value),
+                        checked((uint)resolvedRootPID),
                         ProcessLoopbackMode.IncludeTargetProcessTree)
                     .BuildAsync()
                     .ConfigureAwait(false);

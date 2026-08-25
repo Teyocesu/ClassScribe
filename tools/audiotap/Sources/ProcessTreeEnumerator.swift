@@ -27,6 +27,21 @@ public enum ProcessTreeEnumerator {
         )
     }
 
+    /// Uses the canonical executable path when the workspace does not expose
+    /// a bundle URL. The nearest enclosing `.app` remains the topology root;
+    /// an executable path is therefore a reinforcement/fallback for discovery,
+    /// never a display-name identity.
+    public static func pidsRooted(inExecutableURL executableURL: URL) -> [pid_t] {
+        var current = executableURL.standardizedFileURL
+        while current.path != "/" {
+            if current.pathExtension.caseInsensitiveCompare("app") == .orderedSame {
+                return pidsRooted(in: current)
+            }
+            current.deleteLastPathComponent()
+        }
+        return []
+    }
+
     /// Test seam — same matching logic as the public `pidsRooted(in:)` but
     /// driven by injected snapshot/lookup closures. Lets unit tests drive the
     /// kernel-prefix matching without spawning real ad-hoc-unsigned binaries

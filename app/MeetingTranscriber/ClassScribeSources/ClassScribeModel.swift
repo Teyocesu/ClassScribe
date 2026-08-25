@@ -54,7 +54,7 @@ final class ClassScribeModel {
     var language: TranscriptionLanguage = .spanish
     var subject = ""
     var technicalVocabulary = ""
-    var selectedApplicationID: Int32?
+    var selectedApplicationIdentityID: String?
     var selectedMicrophoneID: String?
     var selectedTab: TranscriptTab = .professor
     var state: ProcessingState = .ready
@@ -127,7 +127,7 @@ final class ClassScribeModel {
         capture = injectedCapture ?? CaptureController()
         capture.refreshSources()
         history = store.history()
-        selectedApplicationID = capture.applications.first?.id
+        selectedApplicationIdentityID = capture.applications.first?.id
         selectedMicrophoneID = capture.microphones.first?.id
     }
 
@@ -156,7 +156,7 @@ final class ClassScribeModel {
     }
 
     var selectedApplication: RunningApplication? {
-        capture.applications.first { $0.id == selectedApplicationID }
+        capture.applications.first { $0.id == selectedApplicationIdentityID }
     }
 
     var selectedMicrophone: MicrophoneOption? {
@@ -281,7 +281,7 @@ final class ClassScribeModel {
     func refreshSources() {
         capture.refreshSources()
         if selectedApplication == nil {
-            selectedApplicationID = capture.applications.first?.id
+            selectedApplicationIdentityID = capture.applications.first?.id
         }
         if selectedMicrophone == nil {
             selectedMicrophoneID = capture.microphones.first?.id

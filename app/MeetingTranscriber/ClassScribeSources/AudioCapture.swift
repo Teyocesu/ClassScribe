@@ -313,6 +313,8 @@ enum CaptureError: LocalizedError, Sendable {
     case permissionDenied
     case microphoneUnavailable
     case noProcesses
+    case applicationIdentityAmbiguous
+    case applicationIdentityUnsupported
     case applicationAudioUnavailable
     case applicationAudioStopped
     case captureCallbacksStalled
@@ -330,6 +332,10 @@ enum CaptureError: LocalizedError, Sendable {
         case .permissionDenied: "El permiso de micrófono fue denegado. Actívalo en Privacidad y seguridad."
         case .microphoneUnavailable: "El micrófono seleccionado ya no está disponible. Conéctalo de nuevo o elige otro."
         case .noProcesses: "La aplicación elegida ya no está en ejecución."
+        case .applicationIdentityAmbiguous:
+            "La aplicación seleccionada tiene más de una coincidencia válida. Cierra la copia adicional o vuelve a elegir la fuente."
+        case .applicationIdentityUnsupported:
+            "La aplicación seleccionada no tiene una identidad estable verificable. Vuelve a actualizar y elegir la fuente."
         case .applicationAudioUnavailable:
             "La aplicación no entregó audio. Comprueba que siga abierta y revisa el permiso de Audio del sistema en Privacidad y seguridad."
         case .applicationAudioStopped:
@@ -484,10 +490,13 @@ final class CaptureController {
                   let name = app.localizedName,
                   !name.isEmpty else { return nil }
             return RunningApplication(
-                id: app.processIdentifier,
+                identity: ApplicationIdentity(
+                    bundleIdentifier: app.bundleIdentifier,
+                    bundleURL: app.bundleURL,
+                    executableURL: app.executableURL,
+                ),
                 name: name,
-                bundleIdentifier: app.bundleIdentifier ?? "",
-                bundleURL: app.bundleURL,
+                processID: app.processIdentifier,
             )
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 
@@ -581,24 +590,78 @@ final class CaptureController {
             switch mode {
             case .online:
                 guard let application else { throw CaptureError.sourceMissing }
-                guard Self.processIsRunning(application.id) else { throw CaptureError.noProcesses }
-                var pids: [pid_t] = [application.id]
-                if let bundleURL = application.bundleURL {
-                    pids.append(contentsOf: ProcessTreeEnumerator.pidsRooted(in: bundleURL))
+                let reconciliationStarted = DispatchTime.now().uptimeNanoseconds
+                let selectedIdentity = application.identity
+                let previousPID = application.processID
+                let callbackAttemptGate = attemptGate
+                let startupPlan = try await Task.detached(priority: .userInitiated) {
+                    try await MacApplicationStartupReconciler.reconcile(
+                        selectedIdentity: selectedIdentity,
+                        previousPID: previousPID,
+                        attempt: attempt,
+                        timeout: CaptureController.onlineProcessRegistrationTimeout,
+                        candidates: {
+                            var observed = MacApplicationIdentityResolver.liveCandidates(excluding: getpid())
+                            // Command-line players and other weakly identified
+                            // sources may not appear in NSWorkspace. Keeping the
+                            // exact live PID is safe for this incarnation only;
+                            // the resolver never uses it to replace a dead PID.
+                            if selectedIdentity.strength == .weak,
+                               Self.processIsRunning(previousPID),
+                               !observed.contains(where: { $0.pid == previousPID }) {
+                                observed.append(MacApplicationProcessSnapshot(
+                                    pid: previousPID,
+                                    identity: selectedIdentity,
+                                    displayName: "selected-source",
+                                ))
+                            }
+                            return observed
+                        },
+                        topology: { candidate in
+                            if let bundleURL = candidate.identity.bundleURL {
+                                return ProcessTreeEnumerator.pidsRooted(in: bundleURL)
+                            }
+                            if let executableURL = candidate.identity.executableURL {
+                                return ProcessTreeEnumerator.pidsRooted(inExecutableURL: executableURL)
+                            }
+                            return []
+                        },
+                        translatedTargets: { pids in
+                            AppAudioCapture.validatedAudioProcessPIDs(in: pids)
+                        },
+                        isCurrentAttempt: { callbackAttemptGate.accepts($0) },
+                    )
+                }.value
+                guard activeAttempt == attempt else { throw CancellationError() }
+                switch startupPlan.result.state {
+                case .missing:
+                    throw CaptureError.noProcesses
+                case .ambiguous:
+                    throw CaptureError.applicationIdentityAmbiguous
+                case .unsupportedWeakIdentity:
+                    throw CaptureError.applicationIdentityUnsupported
+                case .resolved:
+                    break
                 }
-                var seenPIDs = Set<pid_t>()
-                pids = pids.filter {
-                    $0 > 0 && $0 != getpid() && seenPIDs.insert($0).inserted
+                guard let rootPID = startupPlan.rootPID,
+                      !startupPlan.topologyPIDs.isEmpty,
+                      !startupPlan.translatedTargetPIDs.isEmpty else {
+                    throw CaptureError.applicationAudioUnavailable
                 }
-                guard !pids.isEmpty else { throw CaptureError.noProcesses }
-                guard Self.processIsRunning(application.id) else { throw CaptureError.noProcesses }
                 let rawURL = folder.appendingPathComponent("source.raw")
+                let elapsed = Double(
+                    DispatchTime.now().uptimeNanoseconds - reconciliationStarted,
+                ) / 1_000_000_000
                 let nativeStart = nativeExecutor.beginApplicationStart(
                     attempt: attempt,
-                    rootPID: application.id,
-                    pids: pids,
+                    rootPID: rootPID,
+                    pids: startupPlan.topologyPIDs,
                     outputURL: rawURL,
-                    registrationTimeout: Self.onlineProcessRegistrationTimeout,
+                    // The resolver and the native registration retry share
+                    // one monotonic startup budget. The native executor still
+                    // performs its own immediate revalidation just before
+                    // CATapDescription is constructed.
+                    registrationTimeout: max(0, Self.onlineProcessRegistrationTimeout - elapsed),
                     liveSink: sink,
                 )
                 nativeStartWork = nativeStart
@@ -614,7 +677,7 @@ final class CaptureController {
                 )
                 guard activeAttempt == attempt else { throw CancellationError() }
                 rawOnlineURL = rawURL
-                onlineRootPID = application.id
+                onlineRootPID = rootPID
                 activeCaptureGeneration = liveGeneration
 
             case .inPerson:

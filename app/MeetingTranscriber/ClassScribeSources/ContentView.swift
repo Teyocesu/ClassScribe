@@ -238,10 +238,10 @@ struct ContentView: View {
     @ViewBuilder
     private var sourcePicker: some View {
         if model.mode == .online {
-            Picker("Aplicación", selection: $model.selectedApplicationID) {
-                Text("Seleccionar aplicación…").tag(Int32?.none)
+            Picker("Aplicación", selection: $model.selectedApplicationIdentityID) {
+                Text("Seleccionar aplicación…").tag(String?.none)
                 ForEach(model.capture.applications) { app in
-                    Text(app.name).tag(Int32?.some(app.id))
+                    Text(app.name).tag(String?.some(app.id))
                 }
             }
             .labelsHidden()

@@ -273,7 +273,6 @@ public class AppAudioCapture: @unchecked Sendable {
     // swiftlint:disable:next function_body_length
     private func startCapture() throws {
         let translated = try translatePIDs()
-        let processObjectIDs = translated.map(\.audioObjectID)
 
         // Always log at info level with exe names so a "silent _app.wav"
         // report can be triaged without the user toggling Verbose Audio
@@ -315,6 +314,13 @@ public class AppAudioCapture: @unchecked Sendable {
                 "[debug] Default output device: name=\(deviceName, privacy: .public) uid=\(systemOutputUID, privacy: .public) transport=\(transport, privacy: .public) rate=\(deviceRate, privacy: .public)",
             )
         }
+
+        // Process objects are ephemeral. Re-translate and round-trip every
+        // PID after device setup and immediately before CATapDescription so a
+        // helper exit/PID reuse cannot hand an object for another process to
+        // the tap. An empty validated set throws before any tap is created.
+        let handoffTranslated = try translatePIDs()
+        let processObjectIDs = handoffTranslated.map(\.audioObjectID)
 
         // Create CATapDescription for the target process(es). For Electron
         // apps this covers the helper tree so the renderer holding the audio

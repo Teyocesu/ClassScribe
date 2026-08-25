@@ -40,10 +40,43 @@ enum ProcessingState: String, Codable {
 }
 
 struct RunningApplication: Identifiable, Hashable {
-    let id: Int32
+    let identity: ApplicationIdentity
     let name: String
-    let bundleIdentifier: String
-    let bundleURL: URL?
+    let processID: pid_t
+
+    var id: String { identity.stableKey }
+    var bundleIdentifier: String { identity.bundleIdentifier ?? "" }
+    var bundleURL: URL? { identity.bundleURL }
+    var executableURL: URL? { identity.executableURL }
+
+    init(
+        identity: ApplicationIdentity,
+        name: String,
+        processID: pid_t,
+    ) {
+        self.identity = identity
+        self.name = name
+        self.processID = processID
+    }
+
+    /// Compatibility initializer for existing physical fixtures. The PID is
+    /// retained only as the observed incarnation; the logical ID is derived
+    /// from the supplied identity fields.
+    init(
+        id: pid_t,
+        name: String,
+        bundleIdentifier: String,
+        bundleURL: URL?,
+    ) {
+        self.init(
+            identity: ApplicationIdentity(
+                bundleIdentifier: bundleIdentifier,
+                bundleURL: bundleURL,
+            ),
+            name: name,
+            processID: id,
+        )
+    }
 }
 
 struct MicrophoneOption: Identifiable, Hashable {
