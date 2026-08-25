@@ -2,7 +2,7 @@
 
 Fecha: 2026-08-24
 
-Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente** (runtime process-backed macOS **PASS**; runtime Windows **PENDING / SKIPPED — dotnet unavailable**); Fase 1C **ARCHITECTURE APPROVED** (CATap subsystem físico macOS **PASS**; micrófono macOS physical gate pending — TCC; Windows physical/runtime gate pending; process isolation **INCONCLUSIVE / evidence-gated**, no requerida por la evidencia actual). La arquitectura de Fase 1 está **APPROVED**; los physical release gates permanecen pendientes; Fase 2A **FIXED / PARTIAL**, Fase 2B.1 **COMPLETE / PARTIAL**, Fase 2B.2 **COMPLETE / PARTIAL** y Fases 2C–2F **NOT STARTED**.
+Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente** (runtime process-backed macOS **PASS**; runtime Windows **PENDING / SKIPPED — dotnet unavailable**); Fase 1C **ARCHITECTURE APPROVED** (CATap subsystem físico macOS **PASS**; micrófono macOS physical gate pending — TCC; Windows physical/runtime gate pending; process isolation **INCONCLUSIVE / evidence-gated**, no requerida por la evidencia actual). La arquitectura de Fase 1 está **APPROVED**; los physical release gates permanecen pendientes; Fase 2A **FIXED / PARTIAL**, Fase 2B.1 **COMPLETE / PARTIAL**, Fase 2B.2 **FIXED / PARTIAL** y Fases 2C–2F **NOT STARTED**.
 SPEC canónica: [`docs/specs/v0.8.0.md`](docs/specs/v0.8.0.md)
 
 Este documento es mutable: ordena trabajo pequeño y verificable. No redefine requisitos. Cada fase se valida localmente con el patrón `focused → subsystem`; los gates con TCC, hardware, llamada real o Windows físico están definidos en la SPEC.
@@ -58,7 +58,7 @@ porque `dotnet` no está instalado. El detalle reproducible existente está en
 
 ## Fase 2 — Captura confiable y audio del equipo
 
-Estado: **FASE 2B.2 COMPLETE / PARTIAL**; Fase 2A permanece **FIXED / PARTIAL**, Fase 2B.1 permanece **COMPLETE / PARTIAL** y Fases 2C–2F permanecen **NOT STARTED**.
+Estado: **FASE 2B.2 FIXED / PARTIAL**; Fase 2A permanece **FIXED / PARTIAL**, Fase 2B.1 permanece **COMPLETE / PARTIAL** y Fases 2C–2F permanecen **NOT STARTED**.
 
 Objetivo: diferenciar transporte/señal y agregar global con consentimiento explícito y master fiel.
 
@@ -67,8 +67,8 @@ Objetivo: diferenciar transporte/señal y agregar global con consentimiento expl
 - [x] Fase 2A: conservar callbacks silenciosos y callbacks vacíos como evidencia de transporte vivo; un stall es distinto de silencio y ASR permanece en un eje separado.
 - [ ] Fase 2A: ejecutar runtime/tests Windows; **SKIPPED — dotnet unavailable**.
 - [x] Fase 2B.1: separar identidad lógica de encarnación PID y reconciliar aplicación/topología durante startup; validar AudioObjectIDs justo antes del handoff CATap y revalidar el root Windows antes de `BuildAsync`.
-- [x] Fase 2B.2 **COMPLETE / PARTIAL**: macOS rebind durante grabación, ownership/cancelación separada de startup, confirmación pre-stop, recuperación post-stop explícita y seams de lifecycle; el gate físico PID lifecycle permanece pendiente.
-- [x] Fase 2B.2 **COMPLETE / PARTIAL**: Windows rebind durante grabación con writer/generation seam, gap sólo en handoff, límite explícito y reconstrucción por root reemplazado; runtime físico **SKIPPED — dotnet/csc unavailable**.
+- [x] Fase 2B.2 **FIXED / PARTIAL**: macOS rebind durante grabación con confirmación → stop/drain de la generación vieja → avance de generación → salud fresca → build/start, recuperación post-stop explícita y seams de lifecycle; el gate físico PID lifecycle permanece pendiente.
+- [x] Fase 2B.2 **FIXED / PARTIAL**: Windows rebind durante grabación con drenaje de callbacks antes del cambio, writer/generation seam, gap desde el primer PCM no vacío hasta un máximo total de 30 s y reconstrucción por root reemplazado; runtime físico **SKIPPED — dotnet/csc unavailable**.
 - [ ] Implementar global CATap y WASAPI loopback con exclusión/self y device lifecycle correspondientes.
 - [ ] Implementar modal de privacidad y CTA `Capturar audio del equipo`, sin transición automática posible.
 - [ ] Separar master source-rate/stereo del derivado ASR 16 kHz mono.

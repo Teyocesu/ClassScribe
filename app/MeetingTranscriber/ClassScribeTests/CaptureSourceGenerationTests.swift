@@ -22,11 +22,18 @@ private final class GenerationTestCounter: @unchecked Sendable {
 
 private final class TestRebindDriver: CaptureApplicationRebindDriver, @unchecked Sendable {
     private let emitFirstCallback: Bool
+    private let blockStopUntilReleased: Bool
+    private let stopDrainRelease = CaptureStartCancellation()
     private var stopCountValue = 0
     private var startCountValue = 0
+    private(set) var stopEntered = false
 
-    init(emitFirstCallback: Bool = true) {
+    init(
+        emitFirstCallback: Bool = true,
+        blockStopUntilReleased: Bool = false,
+    ) {
         self.emitFirstCallback = emitFirstCallback
+        self.blockStopUntilReleased = blockStopUntilReleased
     }
 
     var stopCount: Int {
@@ -43,7 +50,15 @@ private final class TestRebindDriver: CaptureApplicationRebindDriver, @unchecked
     ) async throws {
         _ = attempt
         _ = sourceGeneration
+        stopEntered = true
+        if blockStopUntilReleased {
+            await stopDrainRelease.wait()
+        }
         stopCountValue += 1
+    }
+
+    func releaseStopDrain() {
+        stopDrainRelease.cancel()
     }
 
     func startApplicationSource(
@@ -554,6 +569,48 @@ func failedPostStopResolutionCannotLeaveHealthyStateWithNoNativeSource() async {
     #expect(driver.startCount == 0)
     #expect(!controller.onlineSourceAvailableForTest)
     #expect(controller.onlineRecoveryPendingForTest)
+    controller.cleanupOnlineRebindLifecycleForTest(for: attempt)
+}
+
+@MainActor
+@Test
+func pausedMacCallbackCannotWriteOrPublishAfterGenerationSwitch() async {
+    let attempt = SessionAttemptID(generation: 1)
+    let identity = strongTestIdentity()
+    let changed = startupPlan(rootPID: 200, targets: [200, 300])
+    let driver = TestRebindDriver(blockStopUntilReleased: true)
+    let sequence = TestApplicationReconcileSequence([changed, changed])
+    let controller = CaptureController(
+        rebindDriver: driver,
+        applicationReconcile: { _, _, _, _ in try sequence.next() },
+    )
+    await controller.prepareOnlineRebindLifecycleForTest(
+        attempt: attempt,
+        selectedIdentity: identity,
+        rootPID: 200,
+        targetPIDs: [200],
+    )
+
+    #expect(controller.beginApplicationRebindForTest(plan: changed, attempt: attempt))
+    for _ in 0 ..< 100 {
+        if driver.stopEntered { break }
+        await Task.yield()
+    }
+
+    #expect(driver.stopEntered)
+    // The fake native stop is paused at the old callback-drain boundary. The
+    // controller must not advance/publish N+1 or start a new source first.
+    #expect(controller.activeSourceGenerationNumberForTest == 1)
+    #expect(driver.startCount == 0)
+    #expect(controller.onlineSourceAvailableForTest)
+
+    driver.releaseStopDrain()
+    await controller.waitForApplicationRebindForTest()
+
+    #expect(driver.stopCount == 1)
+    #expect(driver.startCount == 1)
+    #expect(controller.activeSourceGenerationNumberForTest == 2)
+    #expect(controller.onlineSourceAvailableForTest)
     controller.cleanupOnlineRebindLifecycleForTest(for: attempt)
 }
 

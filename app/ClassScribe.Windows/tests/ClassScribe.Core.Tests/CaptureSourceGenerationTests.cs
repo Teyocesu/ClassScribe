@@ -261,8 +261,11 @@ public sealed class CaptureSourceGenerationTests
         timeline.CommitPacket(oldPacket);
 
         var newGeneration = gate.Advance(attempt)!;
-        timeline.MarkHandoff(newGeneration, Stopwatch.Frequency * 3);
-        var firstNewPacket = timeline.PreparePacket(newGeneration, 3_200);
+        timeline.MarkHandoff(newGeneration);
+        var firstNewPacket = timeline.PreparePacket(
+            newGeneration,
+            3_200,
+            handoffArrivalTimestamp: () => Stopwatch.Frequency * 3);
         timeline.CommitPacket(firstNewPacket);
         var secondNewPacket = timeline.PreparePacket(newGeneration, 3_200);
 
@@ -283,10 +286,13 @@ public sealed class CaptureSourceGenerationTests
         var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
         timeline.CommitPacket(oldPacket);
         var newGeneration = gate.Advance(attempt)!;
-        timeline.MarkHandoff(newGeneration, Stopwatch.Frequency * 3);
+        timeline.MarkHandoff(newGeneration);
 
         var empty = timeline.PreparePacket(newGeneration, 0);
-        var firstNonEmpty = timeline.PreparePacket(newGeneration, 3_200);
+        var firstNonEmpty = timeline.PreparePacket(
+            newGeneration,
+            3_200,
+            handoffArrivalTimestamp: () => Stopwatch.Frequency * 3);
 
         Assert.IsTrue(empty.IsEmpty);
         Assert.AreEqual(CaptureGapDisposition.NoGap, empty.HandoffGap.Disposition);
@@ -305,10 +311,13 @@ public sealed class CaptureSourceGenerationTests
         var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
         timeline.CommitPacket(oldPacket);
         var newGeneration = gate.Advance(attempt)!;
-        timeline.MarkHandoff(newGeneration, Stopwatch.Frequency * 3);
+        timeline.MarkHandoff(newGeneration);
 
         var stale = timeline.PreparePacket(oldGeneration, 3_200);
-        var current = timeline.PreparePacket(newGeneration, 3_200);
+        var current = timeline.PreparePacket(
+            newGeneration,
+            3_200,
+            handoffArrivalTimestamp: () => Stopwatch.Frequency * 3);
 
         Assert.IsTrue(stale.IsRejected);
         Assert.AreEqual(CaptureGapDisposition.Silence, current.HandoffGap.Disposition);
@@ -326,12 +335,13 @@ public sealed class CaptureSourceGenerationTests
         var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
         timeline.CommitPacket(oldPacket);
         var newGeneration = gate.Advance(attempt)!;
-        timeline.MarkHandoff(newGeneration, Stopwatch.Frequency * 40);
+        timeline.MarkHandoff(newGeneration);
 
         var firstNewPacket = timeline.PreparePacket(
             newGeneration,
             3_200,
-            TimeSpan.FromSeconds(30));
+            handoffArrivalTimestamp: () => Stopwatch.Frequency * 40,
+            maximumGap: TimeSpan.FromSeconds(30));
 
         Assert.IsTrue(firstNewPacket.RequiresExplicitFailure);
         Assert.AreEqual(CaptureGapDisposition.ExceedsSafetyBound, firstNewPacket.HandoffGap.Disposition);
@@ -368,6 +378,106 @@ public sealed class CaptureSourceGenerationTests
         callback.GetAwaiter().GetResult();
 
         Assert.AreEqual(0, Volatile.Read(ref writes));
+    }
+
+    [TestMethod]
+    public void handoffGapIncludesResolveBuildAndFirstCallbackDelay()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var oldGeneration = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(oldGeneration, 0);
+        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.CommitPacket(oldPacket);
+
+        var newGeneration = gate.Advance(attempt)!;
+        timeline.MarkHandoff(newGeneration);
+        var firstNewPacket = timeline.PreparePacket(
+            newGeneration,
+            3_200,
+            handoffArrivalTimestamp: () => Stopwatch.Frequency * 6);
+
+        // The durable old end is 1 s and the first accepted new PCM arrives
+        // at 6 s: resolve/build/start/first-callback delay contributes 5 s.
+        Assert.AreEqual(CaptureGapDisposition.Silence, firstNewPacket.HandoffGap.Disposition);
+        Assert.AreEqual(160_000, firstNewPacket.HandoffGap.SilenceBytes);
+    }
+
+    [TestMethod]
+    public void buildDelayBeyondSafetyBoundProducesExplicitFault()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var oldGeneration = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(oldGeneration, 0);
+        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.CommitPacket(oldPacket);
+
+        var newGeneration = gate.Advance(attempt)!;
+        timeline.MarkHandoff(newGeneration);
+        var firstNewPacket = timeline.PreparePacket(
+            newGeneration,
+            3_200,
+            handoffArrivalTimestamp: () => Stopwatch.Frequency * 32,
+            maximumGap: TimeSpan.FromSeconds(30));
+
+        Assert.IsTrue(firstNewPacket.RequiresExplicitFailure);
+        Assert.AreEqual(CaptureGapDisposition.ExceedsSafetyBound, firstNewPacket.HandoffGap.Disposition);
+    }
+
+    [TestMethod]
+    public async Task pausedWindowsCallbackCannotMutateHealthLevelOrWriterAfterGenerationSwitch()
+    {
+        var callbackLifecycle = new WindowsCaptureCallbackLifecycle();
+        var entered = new ManualResetEventSlim();
+        var release = new ManualResetEventSlim();
+        var healthMutations = 0;
+        var levelMutations = 0;
+        var writerMutations = 0;
+        var generationSwitched = 0;
+        var staleMutations = 0;
+        var callback = Task.Run(() =>
+        {
+            callbackLifecycle.Run(() =>
+            {
+                entered.Set();
+                release.Wait();
+                if (Volatile.Read(ref generationSwitched) != 0)
+                {
+                    Interlocked.Increment(ref staleMutations);
+                    return;
+                }
+                Interlocked.Increment(ref healthMutations);
+                Interlocked.Increment(ref levelMutations);
+                Interlocked.Increment(ref writerMutations);
+            });
+        });
+
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(1)));
+        var drain = callbackLifecycle.CloseAndWaitAsync();
+        Assert.IsFalse(drain.IsCompleted);
+
+        // A handoff cannot advance its generation while the product callback
+        // is paused before health, level, and writer side effects.
+        Assert.AreEqual(0, healthMutations);
+        Assert.AreEqual(0, levelMutations);
+        Assert.AreEqual(0, writerMutations);
+
+        release.Set();
+        await drain;
+        await callback;
+        Interlocked.Exchange(ref generationSwitched, 1);
+
+        Assert.AreEqual(1, healthMutations);
+        Assert.AreEqual(1, levelMutations);
+        Assert.AreEqual(1, writerMutations);
+        Assert.AreEqual(0, staleMutations);
+        Assert.IsFalse(callbackLifecycle.Run(static () => { }));
+        Assert.AreEqual(1, healthMutations);
+        Assert.AreEqual(1, levelMutations);
+        Assert.AreEqual(1, writerMutations);
     }
 
     [TestMethod]

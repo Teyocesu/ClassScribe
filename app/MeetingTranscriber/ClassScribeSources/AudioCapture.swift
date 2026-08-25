@@ -1132,6 +1132,10 @@ final class CaptureController {
         onlineRebindCancellation?.hasActiveWaiter == true
     }
 
+    var activeSourceGenerationNumberForTest: UInt64? {
+        activeSourceGeneration?.number
+    }
+
     private func startLevelTimer() {
         levelTimer?.invalidate()
         levelTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
@@ -1427,12 +1431,6 @@ final class CaptureController {
                     }
                 }
 
-                guard let nextGeneration = self.sourceGenerationGate.advance(attempt) else {
-                    throw CancellationError()
-                }
-                self.activeSourceGeneration = nextGeneration
-
-                let refreshed: MacApplicationStartupPlan
                 if sourceWasAvailable {
                     do {
                         try await self.rebindDriver.stopApplicationSource(
@@ -1456,14 +1454,40 @@ final class CaptureController {
                           self.rebindCoordinator.canPublish(attempt),
                           self.onlineRebindToken == rebindToken,
                           !rebindCancellation.isCancelled
-                    else { return }
+                    else {
+                        // The old native source was already stopped. Do not
+                        // leave the control plane claiming it is healthy when
+                        // cancellation wins after that destructive point.
+                        self.onlineSourceAvailable = false
+                        if self.onlineRecoveryDeadline == nil {
+                            self.onlineRecoveryDeadline = ProcessInfo.processInfo.systemUptime + 6
+                        }
+                        return
+                    }
                     self.onlineSourceAvailable = false
                     if self.onlineRecoveryDeadline == nil {
                         self.onlineRecoveryDeadline = ProcessInfo.processInfo.systemUptime + 6
                     }
                     self.signalHealthTracker?.invalidate(attempt)
                     self.signalHealth = nil
+                }
 
+                // The generation remains old until the native stop/drain
+                // above has completed. Only then publish the new generation
+                // and reset signal health before resolving/building it.
+                guard let nextGeneration = self.sourceGenerationGate.advance(attempt) else {
+                    throw CancellationError()
+                }
+                self.activeSourceGeneration = nextGeneration
+                let freshTracker = CaptureSignalHealthTracker(
+                    attempt: attempt,
+                    thresholds: .macOSApplication,
+                )
+                self.signalHealthTracker = freshTracker
+                self.signalHealth = freshTracker.snapshot(for: attempt)
+
+                let refreshed: MacApplicationStartupPlan
+                if sourceWasAvailable {
                     // The old tap is gone now. A same-topology result is
                     // valid: it still needs a fresh CATap over the session.
                     refreshed = try await self.reconcileApplication(
@@ -1482,12 +1506,6 @@ final class CaptureController {
                     throw CaptureError.applicationAudioUnavailable
                 }
 
-                let freshTracker = CaptureSignalHealthTracker(
-                    attempt: attempt,
-                    thresholds: .macOSApplication,
-                )
-                self.signalHealthTracker = freshTracker
-                self.signalHealth = freshTracker.snapshot(for: attempt)
                 let callbackSourceGate = self.sourceGenerationGate
                 let callbackAttemptGate = self.attemptGate
                 let sourceCallbackGate: @Sendable () -> Bool = {

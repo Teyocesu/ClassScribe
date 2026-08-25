@@ -53,6 +53,10 @@ public class AppAudioCapture: @unchecked Sendable {
     /// `AudioDeviceStart` so a synchronously-enqueued first callback is accepted;
     /// the atomic lock makes that ordering visible to `writeQueue`.
     private let runningLock = OSAllocatedUnfairLock(initialState: false)
+    /// Holds the entire IOProc/writeQueue callback through the durable file and
+    /// live-sink side effects. `stopCapture()` closes and drains this lease
+    /// before a source generation can be destroyed or replaced.
+    private let callbackLeaseGate = InFlightCallbackGate()
     private var isRunning: Bool {
         get { runningLock.withLock { $0 } }
         set { runningLock.withLock { $0 = newValue } }
@@ -402,7 +406,9 @@ public class AppAudioCapture: @unchecked Sendable {
         let ioProcStatus = AudioDeviceCreateIOProcIDWithBlock(
             &newProcID, aggregateID, writeQueue,
         ) { [weak self] _, inInputData, inInputTime, _, _ in
-            guard let self, self.isRunning,
+            guard let self, self.callbackLeaseGate.enter() else { return }
+            defer { self.callbackLeaseGate.leave() }
+            guard self.isRunning,
                   self.sourceCallbackGate?() ?? true else { return }
             let abl = inInputData.pointee
 
@@ -484,6 +490,7 @@ public class AppAudioCapture: @unchecked Sendable {
         // afterwards dropped that first buffer and could make a short capture
         // appear to have delivered no frames at all.
         isRunning = true
+        callbackLeaseGate.open()
         let startStatus = AudioDeviceStart(aggregateID, procID)
         guard startStatus == noErr else {
             stopCapture()
@@ -501,6 +508,11 @@ public class AppAudioCapture: @unchecked Sendable {
 
     private func stopCapture() {
         isRunning = false
+
+        // Reject queued callbacks and wait for an admitted callback to finish
+        // all resampling, durable writes, and live publication. The generation
+        // owner may advance only after this barrier returns.
+        callbackLeaseGate.closeAndWait()
 
         if debugLogging {
             logger.info(

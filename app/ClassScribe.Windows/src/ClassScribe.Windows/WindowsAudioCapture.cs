@@ -34,6 +34,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private CaptureSourceGeneration? activeSourceGeneration;
     private AudioSourceOption? activeSource;
     private int? activeRootProcessId;
+    private WindowsCaptureCallbackLifecycle? activeCallbackLifecycle;
     private CaptureDataAvailableHandler? dataAvailableHandler;
     private EventHandler<StoppedEventArgs>? recordingStoppedHandler;
     private long capturedBytes;
@@ -329,11 +330,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     {
         var generationFirstPacket = NewSignal();
         var generationStopped = NewSignal();
+        var generationCallbackLifecycle = new WindowsCaptureCallbackLifecycle();
         CaptureDataAvailableHandler dataHandler = (buffer, flags, devicePosition, qpcPosition) =>
             HandleDataAvailable(
                 attempt,
                 generation,
                 generationFirstPacket,
+                generationCallbackLifecycle,
                 buffer,
                 flags,
                 devicePosition,
@@ -350,6 +353,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             recorder = generationRecorder;
             firstPacket = generationFirstPacket;
             stopped = generationStopped;
+            activeCallbackLifecycle = generationCallbackLifecycle;
             dataAvailableHandler = dataHandler;
             recordingStoppedHandler = stoppedHandler;
         }
@@ -473,6 +477,38 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         SessionAttemptID attempt,
         CaptureSourceGeneration generation,
         TaskCompletionSource generationFirstPacket,
+        WindowsCaptureCallbackLifecycle callbackLifecycle,
+        ReadOnlySpan<byte> buffer,
+        AudioClientBufferFlags flags,
+        long devicePosition,
+        long qpcPosition)
+    {
+        if (!callbackLifecycle.TryEnter())
+        {
+            return;
+        }
+
+        try
+        {
+            HandleDataAvailableCore(
+                attempt,
+                generation,
+                generationFirstPacket,
+                buffer,
+                flags,
+                devicePosition,
+                qpcPosition);
+        }
+        finally
+        {
+            callbackLifecycle.Leave();
+        }
+    }
+
+    private void HandleDataAvailableCore(
+        SessionAttemptID attempt,
+        CaptureSourceGeneration generation,
+        TaskCompletionSource generationFirstPacket,
         ReadOnlySpan<byte> buffer,
         AudioClientBufferFlags flags,
         long devicePosition,
@@ -517,7 +553,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         var plan = packetTimeline.PreparePacket(
             generation,
             copy.Length,
-            RebindGapSafetyBound);
+            handoffArrivalTimestamp: Stopwatch.GetTimestamp,
+            maximumGap: RebindGapSafetyBound);
         if (plan.IsRejected)
         {
             return;
@@ -765,12 +802,14 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     {
         WasapiRecorder? currentRecorder;
         TaskCompletionSource generationStopped;
+        WindowsCaptureCallbackLifecycle? currentCallbackLifecycle;
         CaptureDataAvailableHandler? currentDataHandler;
         EventHandler<StoppedEventArgs>? currentStoppedHandler;
         lock (sync)
         {
             currentRecorder = recorder;
             generationStopped = stopped;
+            currentCallbackLifecycle = activeCallbackLifecycle;
             currentDataHandler = dataAvailableHandler;
             currentStoppedHandler = recordingStoppedHandler;
         }
@@ -782,6 +821,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         Exception? stopFailure = null;
         try
         {
+            // Close admission and drain the product callback path before the
+            // native recorder is stopped. The old generation remains current
+            // until this completes, so no callback can cross the switch.
+            if (currentCallbackLifecycle is not null)
+            {
+                await currentCallbackLifecycle.CloseAndWaitAsync().ConfigureAwait(false);
+            }
             currentRecorder.StopRecording();
             await generationStopped.Task
                 .WaitAsync(TimeSpan.FromSeconds(10), cancellationToken)
@@ -807,6 +853,10 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             if (ReferenceEquals(recorder, currentRecorder))
             {
                 recorder = null;
+                if (ReferenceEquals(activeCallbackLifecycle, currentCallbackLifecycle))
+                {
+                    activeCallbackLifecycle = null;
+                }
                 dataAvailableHandler = null;
                 recordingStoppedHandler = null;
             }
@@ -1047,6 +1097,21 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 return false;
             }
 
+            // Stop and drain the old recorder while its generation is still
+            // current. Only after that lease has closed may the source gate
+            // publish the next generation.
+            var stopFailure = await StopCurrentRecorderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (!IsCurrentSourceGeneration(attempt, oldGeneration)
+                || !rebindCoordinator.CanPublish(attempt))
+            {
+                return false;
+            }
+            if (stopFailure is not null)
+            {
+                captureFailure ??= stopFailure;
+            }
+
             var nextGeneration = sourceGenerationGate.Advance(attempt);
             if (nextGeneration is null)
             {
@@ -1057,25 +1122,12 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 activeSourceGeneration = nextGeneration;
             }
 
-            // Old callbacks are rejected before stop. The generation-local
-            // stopped event still releases StopCurrentRecorderAsync without
-            // mutating the new health/source state.
-            var stopFailure = await StopCurrentRecorderAsync(cancellationToken)
-                .ConfigureAwait(false);
-            if (!IsCurrentSourceGeneration(attempt, nextGeneration)
-                || !rebindCoordinator.CanPublish(attempt))
-            {
-                return false;
-            }
-            if (stopFailure is not null)
-            {
-                captureFailure ??= stopFailure;
-            }
-
-            // The old recorder is fully stopped and its callbacks drained at
-            // this point. Capture one handoff boundary; ordinary callbacks do
-            // not sample Stopwatch and cannot manufacture jitter silence.
-            packetTimeline.MarkHandoff(nextGeneration, Stopwatch.GetTimestamp());
+            // The first accepted non-empty PCM callback records the arrival
+            // timestamp. This keeps resolve/build/start/first-callback delay
+            // inside the measured gap instead of timestamping at old stop.
+            packetTimeline.MarkHandoff(nextGeneration);
+            signalHealthTracker.Begin(attempt);
+            PublishSignalHealth(attempt);
 
             var refreshedRootPID = await WindowsApplicationStartup.ResolveBeforeBuildAsync(
                 source.Identity,
@@ -1093,8 +1145,6 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 return false;
             }
 
-            signalHealthTracker.Begin(attempt);
-            PublishSignalHealth(attempt);
             var builder = new WasapiRecorderBuilder()
                 .WithSharedMode()
                 .WithEventSync()

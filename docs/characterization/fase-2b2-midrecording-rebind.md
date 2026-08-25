@@ -1,6 +1,6 @@
 # Caracterización de Fase 2B.2 — rebind de source durante una grabación
 
-Estado: **PHASE 2B.2 COMPLETE / PARTIAL — blockers de revisión corregidos**.
+Estado: **PHASE 2B.2 FIXED / PARTIAL — blockers finales de revisión corregidos**.
 
 La implementación cubre el rebind de la encarnación nativa de una aplicación
 durante una misma sesión. El intento de sesión, el audio durable, el timeline
@@ -48,21 +48,23 @@ AudioObjectIDs/PIDs validados, no el orden. Rebind sólo se solicita por:
 Un resultado `missing` o `ambiguous` conserva el source actual mientras la
 fuente sigue sana y no elige una aplicación por nombre. Antes de detener el
 tap se confirma de nuevo la identidad/topología; si la observación vuelve al
-estado original, se abandona el rebind sin tocar el tap sano. Después del
-punto destructivo, una topología original válida sí arranca un tap nuevo. Una
-identidad débil no hace auto-rebind. Si la resolución post-stop falla, el
+estado original, se abandona el rebind sin tocar el tap sano. El orden
+destructivo es explícito: se detiene y drena la generación vieja mientras aún
+es la actual; sólo después se avanza la generación, se crea salud fresca y se
+resuelve/construye/inicia el siguiente tap. Una identidad débil no hace
+auto-rebind. Si el stop/drain ya ocurrió y la resolución o el build fallan, el
 control plane marca explícitamente la fuente como no disponible y mantiene una
 recuperación acotada; no presenta `isCapturing` sin tap como estado sano.
 
 `AudioCaptureSession` es ahora el owner de la salida durable y del timeline.
-`source.raw` se crea y abre una sola vez. `replaceApplicationCapture` detiene y
-drena completamente el CATap/IOProc anterior, reutiliza el mismo descriptor y
-crea el siguiente `AppAudioCapture` con el mismo `TimelineAnchor`. No se
-trunca ni se crea otro `source.raw`; el gap se representa como silencio según
-los timestamps host del source, con el segundo gate justo antes de la frontera
-durable. Un callback admitido que se vuelve stale mientras resamplea ya no
-puede escribir el archivo ni alimentar el live store. El live store y su
-generación lógica no se reinician.
+`source.raw` se crea y abre una sola vez. `replaceApplicationCapture` cierra la
+admisión, drena el callback IOProc/writeQueue completo antes de
+`AudioDeviceStop`, reutiliza el mismo descriptor y crea el siguiente
+`AppAudioCapture` con el mismo `TimelineAnchor`. No se trunca ni se crea otro
+`source.raw`; el gap se representa como silencio según los timestamps host del
+source. Un callback admitido que se vuelve stale mientras resamplea ya no puede
+escribir el archivo ni alimentar el live store. El live store y su generación
+lógica no se reinician.
 
 El driver de rebind es un seam de producto: el default delega al
 `CaptureNativeExecutor` serial real, mientras las pruebas inyectan un driver
@@ -78,15 +80,19 @@ puede publicar el recorder construido. La resolución conserva precedencia del
 incumbent PID: un sibling con la misma identidad no provoca rebind mientras el
 root actual siga vivo; replacement ambiguo o weak no construye recorder.
 
-El rebind detiene y dispone el recorder viejo, conserva el mismo
-`source.raw`/writer, marca un único boundary monotónico después del drain,
-vuelve a resolver y revalida el root antes de construir la nueva encarnación.
-`CaptureHandoffTimeline` sólo evalúa el gap en el primer callback no vacío de
-la nueva generación. Los callbacks normales de una misma generación nunca
-rellenan jitter; un callback vacío no consume el gap y un callback stale no
-puede consumirlo. El silencio se escribe en chunks acotados. Un gap mayor que
-el presupuesto seguro de 30 s produce un fault explícito y detiene la captura;
-no se devuelve `0` fingiendo éxito.
+El rebind cierra la admisión y drena el callback viejo antes de detener y
+disponer su recorder; la generación vieja permanece actual durante todo ese
+stop/drain. Conserva el mismo `source.raw`/writer, avanza la generación y arma
+el handoff sólo después del drain, vuelve a resolver y revalida el root antes
+de construir la nueva encarnación. `CaptureHandoffTimeline` toma
+`Stopwatch.GetTimestamp()` únicamente en el primer callback no vacío aceptado
+de la nueva generación: el gap se mide desde el final durable de N hasta la
+llegada de ese PCM, por lo que incluye resolve/build/start/first-callback.
+Los callbacks normales de una misma generación nunca rellenan jitter; un
+callback vacío no consume el gap y un callback stale no puede consumirlo. El
+silencio se escribe en chunks acotados. El presupuesto de 30 s aplica al gap
+total: si se supera, produce un fault explícito y detiene la captura; no se
+devuelve `0` fingiendo éxito.
 
 El seam de writer se usa desde `WindowsAudioCapture` y cubre también el
 segundo gate de callback antes de encolar el paquete durable. No requiere
@@ -94,14 +100,15 @@ WASAPI físico para probar la transición de generación.
 
 ## Race review
 
-Se revisaron explícitamente las parejas callback viejo/advance-stop,
+Se revisaron explícitamente las parejas callback viejo/stop-drain/advance,
 start nuevo/Stop, completion de rebind/sesión siguiente, timer de salud/
 generation y stopped viejo/source nuevo. No se mantienen locks mientras se
 llaman APIs nativas de start/stop, se espera un callback o se hace I/O de
-archivo. Hay pruebas con un callback pausado que pasa el primer gate, sufre
-`advance` y es rechazado en el segundo gate. El executor macOS sigue
-serializando setup/stop/rebind para que el tap viejo se drene antes del nuevo;
-Windows mantiene el writer fuera del lifecycle del recorder.
+archivo. macOS serializa setup/stop/rebind y drena el IOProc/writeQueue antes
+de publicar la siguiente generación; Windows cierra su lease de callback antes
+de detener/publicar. Los seams de producto cubren un callback viejo pausado:
+no se publica N+1 hasta completar el drain y no quedan mutaciones stale de
+salud, nivel o writer después del cambio.
 
 ## Seams de ciclo de vida cubiertos
 
@@ -109,14 +116,19 @@ Los tests de producto ejercitan `CaptureController` hasta la decisión y el
 driver de stop/start: startup cleanup no deshabilita un rebind posterior,
 prerrequisitos fallidos no filtran ownership, Stop cancela la espera del
 primer callback, una aparición transitoria del helper no destruye el tap, una
-topología que vuelve después del stop arranca una fuente nueva y una
-resolución post-stop fallida deja una recuperación explícita sin fuente nativa
-saludable. En Windows, los tests ejercitan `CaptureHandoffTimeline`, el gate
-de generation y el writer boundary usado por `WindowsAudioCapture`.
+topología que vuelve después del stop arranca una fuente nueva, una resolución
+post-stop fallida deja una recuperación explícita sin fuente nativa saludable
+y un stop/drain pausado no permite publicar N+1 antes de liberar callbacks
+viejos (`pausedMacCallbackCannotWriteOrPublishAfterGenerationSwitch`). En
+Windows, los tests ejercitan `CaptureHandoffTimeline`, el lease de callback,
+el gap hasta el primer PCM (`handoffGapIncludesResolveBuildAndFirstCallbackDelay`),
+el fault sobre 30 s (`buildDelayBeyondSafetyBoundProducesExplicitFault`) y el
+writer boundary usado por `WindowsAudioCapture`
+(`pausedWindowsCallbackCannotMutateHealthLevelOrWriterAfterGenerationSwitch`).
 
 ## Evidencia local
 
-- `./scripts/pre-push.sh --with-tests`: **PASS — 220 tests macOS**.
+- `./scripts/pre-push.sh --with-tests`: **PASS — 221 tests macOS**.
 - `git diff --check` sobre archivos intencionales: **PASS**.
 - Build release de ClassScribe: **PASS**.
 - Fuentes AudioTapLib: compiladas dentro del build/test target de ClassScribe.

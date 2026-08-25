@@ -3,9 +3,9 @@ using System.Diagnostics;
 namespace ClassScribe.Core;
 
 /// The durable packet writer's handoff state. It deliberately has no wall-clock
-/// sampling on ordinary callbacks: only a generation transition records a
-/// monotonic boundary, and only the first non-empty callback of that generation
-/// consumes the pending gap.
+/// sampling on ordinary callbacks: only the first non-empty callback of a new
+/// generation samples the monotonic arrival boundary and consumes the pending
+/// gap.
 public sealed class CaptureHandoffTimeline
 {
     private readonly object sync = new();
@@ -49,19 +49,20 @@ public sealed class CaptureHandoffTimeline
         }
     }
 
-    public void MarkHandoff(CaptureSourceGeneration generation, long boundaryTimestamp)
+    public void MarkHandoff(CaptureSourceGeneration generation)
     {
         ArgumentNullException.ThrowIfNull(generation);
         lock (sync)
         {
             activeGeneration = generation;
-            pendingHandoff = new PendingHandoff(generation, boundaryTimestamp);
+            pendingHandoff = new PendingHandoff(generation);
         }
     }
 
     public CapturePacketWritePlan PreparePacket(
         CaptureSourceGeneration generation,
         int byteCount,
+        Func<long>? handoffArrivalTimestamp = null,
         TimeSpan maximumGap = default)
     {
         ArgumentNullException.ThrowIfNull(generation);
@@ -87,14 +88,19 @@ public sealed class CaptureHandoffTimeline
             {
                 return CapturePacketWritePlan.Rejected(generation, byteCount);
             }
+            var handoffArrival = handoff is null
+                ? null
+                : handoffArrivalTimestamp?.Invoke()
+                    ?? throw new InvalidOperationException(
+                        "El primer PCM de un handoff necesita su timestamp de llegada.");
             var assessment = handoff is null
                 ? new CaptureGapAssessment(CaptureGapDisposition.NoGap, 0, 0)
                 : CaptureGapSilence.Assess(
                     lastPacketEndTimestamp,
-                    handoff.BoundaryTimestamp,
+                    handoffArrival,
                     bytesPerSecond,
                     maximumGap: maximumGap);
-            var baseTimestamp = handoff?.BoundaryTimestamp ?? lastPacketEndTimestamp;
+            var baseTimestamp = handoffArrival ?? lastPacketEndTimestamp;
             var packetEndTimestamp = baseTimestamp is null
                 ? null
                 : checked(baseTimestamp.Value + DurationTicks(byteCount));
@@ -145,9 +151,7 @@ public sealed class CaptureHandoffTimeline
             byteCount / (double)bytesPerSecond * Stopwatch.Frequency,
             MidpointRounding.AwayFromZero));
 
-    private sealed record PendingHandoff(
-        CaptureSourceGeneration Generation,
-        long BoundaryTimestamp);
+    private sealed record PendingHandoff(CaptureSourceGeneration Generation);
 }
 
 public readonly record struct CapturePacketWritePlan(
