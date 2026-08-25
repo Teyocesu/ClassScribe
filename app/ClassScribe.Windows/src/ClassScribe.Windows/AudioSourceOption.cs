@@ -6,6 +6,7 @@ internal enum AudioSourceKind
 {
     Process,
     Microphone,
+    SystemOutput,
 }
 
 internal sealed record AudioSourceOption(

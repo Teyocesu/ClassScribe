@@ -20,6 +20,7 @@ public class AppAudioCapture: @unchecked Sendable {
     /// `internal` (not `private`) so the cross-file `+PIDTranslation`
     /// extension can read it; it's not otherwise touched from outside.
     private(set) var pids: [pid_t]
+    let source: AppAudioCaptureSource
     /// `sampleRate` and `liveSink` are `internal` (not `private`) so the
     /// cross-file `+LiveSink` extension can populate the live buffer struct.
     let sampleRate: Int
@@ -124,7 +125,7 @@ public class AppAudioCapture: @unchecked Sendable {
     ///   - liveSink: Optional callback receiving a copy of each captured buffer.
     ///     Called on the audio IOProc thread — must not block. Nil = no-op,
     ///     existing batch path unchanged.
-    public init(
+    public convenience init(
         pids: [pid_t],
         outputFileDescriptor: Int32,
         sampleRate: Int = 48000,
@@ -134,7 +135,34 @@ public class AppAudioCapture: @unchecked Sendable {
         timelineAnchor: TimelineAnchor? = nil,
         sourceCallbackGate: (@Sendable () -> Bool)? = nil,
     ) {
-        self.pids = pids
+        self.init(
+            source: .application(processes: pids),
+            outputFileDescriptor: outputFileDescriptor,
+            sampleRate: sampleRate,
+            channels: channels,
+            debugLogging: debugLogging,
+            liveSink: liveSink,
+            timelineAnchor: timelineAnchor,
+            sourceCallbackGate: sourceCallbackGate,
+        )
+    }
+
+    public init(
+        source: AppAudioCaptureSource,
+        outputFileDescriptor: Int32,
+        sampleRate: Int = 48000,
+        channels: Int = 2,
+        debugLogging: Bool = false,
+        liveSink: LiveAudioSink? = nil,
+        timelineAnchor: TimelineAnchor? = nil,
+        sourceCallbackGate: (@Sendable () -> Bool)? = nil,
+    ) {
+        self.source = source
+        if case let .application(processes) = source {
+            self.pids = processes
+        } else {
+            self.pids = []
+        }
         self.outputFileDescriptor = outputFileDescriptor
         self.sampleRate = sampleRate
         self.channels = channels
@@ -281,25 +309,31 @@ public class AppAudioCapture: @unchecked Sendable {
 
     // swiftlint:disable:next function_body_length
     private func startCapture() throws {
-        let translated = try translatePIDs()
+        if case .application = source {
+            let translated = try translatePIDs()
 
-        // Always log at info level with exe names so a "silent _app.wav"
-        // report can be triaged without the user toggling Verbose Audio
-        // Logging first — process names like "MSTeams Helper (Renderer)"
-        // make issue-#84-style failures actionable.
-        let tapSummary = translated.map { "\(getExecutableName(pid: $0.pid))(\($0.pid))" }.joined(separator: ", ")
-        logger.info(
-            "App audio tap: \(translated.count) PID(s) [\(tapSummary, privacy: .public)]",
-        )
+            // Always log at info level with exe names so a "silent _app.wav"
+            // report can be triaged without the user toggling Verbose Audio
+            // Logging first — process names like "MSTeams Helper (Renderer)"
+            // make issue-#84-style failures actionable.
+            let tapSummary = translated.map { "\(getExecutableName(pid: $0.pid))(\($0.pid))" }.joined(separator: ", ")
+            logger.info(
+                "App audio tap: \(translated.count) PID(s) [\(tapSummary, privacy: .public)]",
+            )
 
-        if debugLogging {
-            for entry in translated {
-                let bundleID = getProcessBundleID(entry.audioObjectID) ?? "?"
-                let exeName = getExecutableName(pid: entry.pid)
-                logger.info(
-                    "[debug] Tap target: pid=\(entry.pid, privacy: .public) exe=\(exeName, privacy: .public) bundle=\(bundleID, privacy: .public) audioObjectID=\(entry.audioObjectID, privacy: .public)",
-                )
+            if debugLogging {
+                for entry in translated {
+                    let bundleID = getProcessBundleID(entry.audioObjectID) ?? "?"
+                    let exeName = getExecutableName(pid: entry.pid)
+                    logger.info(
+                        "[debug] Tap target: pid=\(entry.pid, privacy: .public) exe=\(exeName, privacy: .public) bundle=\(bundleID, privacy: .public) audioObjectID=\(entry.audioObjectID, privacy: .public)",
+                    )
+                }
             }
+        } else if case let .systemOutput(exclusions) = source {
+            logger.info(
+                "System output global tap requested; validated self-exclusion count=\(exclusions.count, privacy: .public)",
+            )
         }
 
         // Get default output device UID
@@ -327,14 +361,17 @@ public class AppAudioCapture: @unchecked Sendable {
         // Process objects are ephemeral. Re-translate and round-trip every
         // PID after device setup and immediately before CATapDescription so a
         // helper exit/PID reuse cannot hand an object for another process to
-        // the tap. An empty validated set throws before any tap is created.
-        let handoffTranslated = try translatePIDs()
-        let processObjectIDs = handoffTranslated.map(\.audioObjectID)
-
-        // Create CATapDescription for the target process(es). For Electron
-        // apps this covers the helper tree so the renderer holding the audio
-        // handle is included; for native apps the array is a single PID.
-        let tap = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
+        // the tap. The global source already carries an explicit, validated
+        // exclusion list and never enumerates capture targets.
+        let tapSource: CATapDescriptionSource
+        switch source {
+        case .application:
+            let handoffTranslated = try translatePIDs()
+            tapSource = .application(processObjectIDs: handoffTranslated.map(\.audioObjectID))
+        case let .systemOutput(exclusions):
+            tapSource = .systemOutput(excludingProcessObjectIDs: exclusions)
+        }
+        let tap = CATapDescriptionFactory.make(for: tapSource)
         tap.uuid = UUID()
         tap.name = "ClassScribe-tap"
         tap.isPrivate = true
@@ -345,7 +382,7 @@ public class AppAudioCapture: @unchecked Sendable {
         guard tapStatus == noErr else {
             let hint = Self.describeTapError(tapStatus)
             logger.error(
-                "Failed to create process tap (pids=\(self.pids, privacy: .public)): \(hint, privacy: .public)",
+                "Failed to create CATap source (pids=\(self.pids, privacy: .public)): \(hint, privacy: .public)",
             )
             throw NSError(
                 domain: "audiotap", code: Int(tapStatus),
@@ -354,7 +391,7 @@ public class AppAudioCapture: @unchecked Sendable {
         }
         tapID = newTapID
         let tapRate = Self.queryTapSampleRate(tapID: tapID)
-        logger.info("Created process tap: \(self.tapID) rate=\(tapRate, privacy: .public) Hz")
+        logger.info("Created CATap source: \(self.tapID) rate=\(tapRate, privacy: .public) Hz")
 
         if debugLogging {
             logger.info(
@@ -364,7 +401,7 @@ public class AppAudioCapture: @unchecked Sendable {
 
         // Create aggregate device with the tap. The name embeds the root PID
         // (first entry) — purely cosmetic for `system_profiler SPAudioDataType`.
-        let nameTag = pids.first.map(String.init) ?? "0"
+        let nameTag = pids.first.map(String.init) ?? "system-output"
         let desc: [String: Any] = [
             kAudioAggregateDeviceNameKey as String: "audiotap-\(nameTag)",
             kAudioAggregateDeviceUIDKey as String: UUID().uuidString,

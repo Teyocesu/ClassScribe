@@ -51,6 +51,31 @@ func schemaV2UsesStableTokens() throws {
     #expect(!String(data: try JSONEncoder().encode(metadata), encoding: .utf8)!.contains("Transcripción final lista"))
 }
 
+@Test("El scope systemOutput se conserva y no se degrada a application")
+func systemOutputScopeRoundTrips() throws {
+    let metadata = ClassMetadata(
+        id: UUID(),
+        subject: "Física",
+        startedAt: Date(timeIntervalSince1970: 1_750_000_000),
+        duration: 4,
+        mode: .online,
+        source: "Audio del equipo",
+        professorSpeakerID: nil,
+        professorSelectionIsAutomatic: true,
+        speakerCount: 0,
+        state: .complete,
+        folderPath: "/tmp/classscribe",
+        technicalVocabulary: "",
+        captureScope: .systemOutput,
+    )
+
+    let data = try JSONEncoder().encode(metadata)
+    let decoded = try JSONDecoder().decode(ClassMetadata.self, from: data)
+
+    #expect(decoded.captureScope == .systemOutput)
+    #expect(String(data: data, encoding: .utf8)?.contains("\"captureScope\":\"systemOutput\"") == true)
+}
+
 @Test("Un token explícito desconocido no se convierte en un default legacy")
 func explicitUnknownMetadataTokensFail() throws {
     func assertUnknown(field: String, value: String, removeCaptureScope: Bool = false) throws {

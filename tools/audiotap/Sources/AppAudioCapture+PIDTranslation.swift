@@ -1,4 +1,5 @@
 import CoreAudio
+import Darwin
 import Foundation
 
 public struct ValidatedAudioTarget: Equatable, Sendable {
@@ -48,6 +49,16 @@ extension AppAudioCapture {
     /// before constructing a CATapDescription.
     public static func validatedAudioProcessPIDs(in pids: [pid_t]) -> [pid_t] {
         validatedAudioTargets(in: pids).map(\.pid)
+    }
+
+    /// Returns the CoreAudio process objects belonging to ClassScribe itself
+    /// and its bundle-rooted helpers when CoreAudio can prove the PID round
+    /// trip. Unknown objects are omitted; no synthetic ID is ever fabricated.
+    public static func systemOutputExclusionObjectIDs() -> [AudioObjectID] {
+        var candidatePIDs = [getpid()]
+        candidatePIDs.append(contentsOf: ProcessTreeEnumerator.pidsRooted(in: Bundle.main.bundleURL))
+        let uniquePIDs = Array(Set(candidatePIDs.filter { $0 > 0 })).sorted()
+        return Array(Set(validatedAudioTargets(in: uniquePIDs).map(\.audioObjectID))).sorted()
     }
 
     public static func validatedAudioTargets(in pids: [pid_t]) -> [ValidatedAudioTarget] {

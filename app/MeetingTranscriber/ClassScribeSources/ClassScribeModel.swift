@@ -20,6 +20,7 @@ private struct ClassSessionContext: Sendable {
     var subject: String
     var startedAt: Date
     var mode: CaptureMode
+    var captureScope: CaptureScope
     var source: String
     var language: TranscriptionLanguage
     var technicalVocabulary: String
@@ -330,6 +331,7 @@ final class ClassScribeModel {
                 subject: subject,
                 startedAt: now,
                 mode: mode,
+                captureScope: mode.captureScope,
                 source: selectedSourceName,
                 language: language,
                 technicalVocabulary: technicalVocabulary,
@@ -349,6 +351,7 @@ final class ClassScribeModel {
             _ = try await capture.start(
                 attempt: session.attemptID,
                 mode: mode,
+                captureScope: session.captureScope,
                 application: selectedApplication,
                 microphone: selectedMicrophone,
                 folder: folder,
@@ -801,6 +804,7 @@ final class ClassScribeModel {
             subject: metadata.subject,
             startedAt: metadata.startedAt,
             mode: metadata.mode,
+            captureScope: metadata.captureScope ?? metadata.mode.captureScope,
             source: metadata.source,
             language: metadata.language ?? .spanish,
             technicalVocabulary: metadata.technicalVocabulary,
@@ -1341,7 +1345,7 @@ final class ClassScribeModel {
             sessionPhase: effectiveSessionPhase,
             capturePhase: effectiveCapturePhase,
             asrPhase: effectiveAsrPhase,
-            captureScope: session.mode.captureScope,
+            captureScope: session.captureScope,
             audioFormat: "float32_16000_mono",
             formatVersion: 1,
             platform: "macos",

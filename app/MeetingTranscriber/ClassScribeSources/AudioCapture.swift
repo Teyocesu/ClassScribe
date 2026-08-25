@@ -310,6 +310,7 @@ private extension Data {
 
 enum CaptureError: LocalizedError, Sendable {
     case sourceMissing
+    case systemOutputAuthorizationRequired
     case permissionDenied
     case microphoneUnavailable
     case noProcesses
@@ -329,6 +330,8 @@ enum CaptureError: LocalizedError, Sendable {
     var errorDescription: String? {
         switch self {
         case .sourceMissing: "Selecciona una fuente de audio."
+        case .systemOutputAuthorizationRequired:
+            "La captura del audio del sistema requiere una autorización explícita para este intento."
         case .permissionDenied: "El permiso de micrófono fue denegado. Actívalo en Privacidad y seguridad."
         case .microphoneUnavailable: "El micrófono seleccionado ya no está disponible. Conéctalo de nuevo o elige otro."
         case .noProcesses: "La aplicación elegida ya no está en ejecución."
@@ -458,6 +461,7 @@ final class CaptureController {
 
     let liveStore = LiveAudioBufferStore()
     private let nativeExecutor: CaptureNativeExecutor
+    private let systemOutputAuthorizationAuthority: SystemOutputCaptureAuthorizationAuthority
     private let rebindDriver: any CaptureApplicationRebindDriver
     private let applicationReconcileOverride: CaptureApplicationReconcile?
     private let attemptGate = CaptureAttemptGate()
@@ -481,6 +485,7 @@ final class CaptureController {
     private var liveBufferContinuation: AsyncStream<LiveAudioBuffer>.Continuation?
     private var liveBufferTask: Task<Void, Never>?
     private var activeCaptureGeneration: UUID?
+    private var activeCaptureScope: CaptureScope?
     private var activeSourceGeneration: CaptureSourceGeneration?
     private var onlineRootPID: pid_t?
     private var onlineSelectedIdentity: ApplicationIdentity?
@@ -500,7 +505,11 @@ final class CaptureController {
         rebindDriver: (any CaptureApplicationRebindDriver)? = nil,
         applicationReconcile: CaptureApplicationReconcile? = nil,
     ) {
-        let executor = CaptureNativeExecutor()
+        let authorizationAuthority = SystemOutputCaptureAuthorizationAuthority()
+        let executor = CaptureNativeExecutor(
+            systemOutputAuthorizationAuthority: authorizationAuthority,
+        )
+        systemOutputAuthorizationAuthority = authorizationAuthority
         nativeExecutor = executor
         self.rebindDriver = rebindDriver ?? CaptureNativeRebindDriver(executor: executor)
         applicationReconcileOverride = applicationReconcile
@@ -548,16 +557,32 @@ final class CaptureController {
     func start(
         attempt: SessionAttemptID,
         mode: CaptureMode,
+        captureScope: CaptureScope? = nil,
         application: RunningApplication?,
         microphone: MicrophoneOption?,
         folder: URL,
+        systemOutputAuthorization: SystemOutputCaptureAuthorization? = nil,
     ) async throws -> URL {
         guard !isBusy else { throw CaptureError.notRecording }
-        try Task.checkCancellation()
+        let resolvedScope = captureScope ?? mode.captureScope
+        do {
+            try Task.checkCancellation()
+        } catch {
+            if resolvedScope == .systemOutput {
+                systemOutputAuthorizationAuthority.invalidate(attempt)
+            }
+            throw error
+        }
+        guard resolvedScope != .systemOutput
+            || systemOutputAuthorizationAuthority.accepts(systemOutputAuthorization, for: attempt)
+        else {
+            throw CaptureError.systemOutputAuthorizationRequired
+        }
         if let previousAttempt = activeAttempt {
             attemptGate.invalidate(previousAttempt)
             sourceGenerationGate.invalidate(previousAttempt)
             rebindCoordinator.cancel(previousAttempt)
+            systemOutputAuthorizationAuthority.invalidate(previousAttempt)
         }
         onlineRebindCancellation?.cancel()
         onlineRebindTask?.cancel()
@@ -571,9 +596,9 @@ final class CaptureController {
         self.startCancellation = startCancellation
         let signalTracker = CaptureSignalHealthTracker(
             attempt: attempt,
-            thresholds: mode == .online
-                ? .macOSApplication
-                : .macOSMicrophone,
+            thresholds: resolvedScope == .microphone
+                ? .macOSMicrophone
+                : .macOSApplication,
         )
         signalHealthTracker = signalTracker
         signalHealth = signalTracker.snapshot(for: attempt)
@@ -593,6 +618,7 @@ final class CaptureController {
         try Task.checkCancellation()
         guard activeAttempt == attempt else { throw CancellationError() }
         activeCaptureGeneration = nil
+        activeCaptureScope = nil
         activeSourceGeneration = nil
         onlineRootPID = nil
         onlineSelectedIdentity = nil
@@ -608,6 +634,7 @@ final class CaptureController {
         onlineRecoveryDeadline = nil
         onlineRebindFailureCount = 0
         let sourceURL = folder.appendingPathComponent("source.wav")
+        let rawURL = folder.appendingPathComponent("source.raw")
         // The pump normally drains far faster than real time. A generous bound
         // still prevents unbounded memory if the process is heavily starved;
         // newest buffers are the useful ones for a live view, while the complete
@@ -645,8 +672,8 @@ final class CaptureController {
         }
 
         do {
-            switch mode {
-            case .online:
+            switch resolvedScope {
+            case .application:
                 guard let application else { throw CaptureError.sourceMissing }
                 let reconciliationStarted = DispatchTime.now().uptimeNanoseconds
                 let selectedIdentity = application.identity
@@ -710,7 +737,6 @@ final class CaptureController {
                 }
                 try Task.checkCancellation()
                 guard activeAttempt == attempt else { throw CancellationError() }
-                let rawURL = folder.appendingPathComponent("source.raw")
                 let sourceGeneration = sourceGenerationGate.begin(attempt)
                 let callbackSourceGate = sourceGenerationGate
                 let sourceCallbackGate: @Sendable () -> Bool = {
@@ -763,11 +789,56 @@ final class CaptureController {
                 onlineSelectedIdentity = selectedIdentity
                 onlineTargetPIDs = Set(startupPlan.translatedTargetPIDs)
                 activeSourceGeneration = sourceGeneration
+                activeCaptureScope = .application
                 onlineSourceAvailable = true
                 onlineRecoveryDeadline = nil
                 activeCaptureGeneration = liveGeneration
 
-            case .inPerson:
+            case .systemOutput:
+                let sourceGeneration = sourceGenerationGate.begin(attempt)
+                let callbackSourceGate = sourceGenerationGate
+                let sourceCallbackGate: @Sendable () -> Bool = {
+                    callbackSourceGate.accepts(attempt, generation: sourceGeneration)
+                }
+                let systemOutputSink: LiveAudioSink = { buffer in
+                    guard callbackAttemptGate.accepts(attempt),
+                          callbackSourceGate.accepts(attempt, generation: sourceGeneration)
+                    else { return }
+                    _ = signalTracker.recordCallback(
+                        for: attempt,
+                        measurement: CaptureSignalMeasurement(
+                            samples: buffer.samples,
+                            channelCount: buffer.channelCount,
+                        ),
+                    )
+                    _ = liveContinuation.yield(buffer)
+                }
+                let nativeStart = nativeExecutor.beginSystemOutputStart(
+                    attempt: attempt,
+                    sourceGeneration: sourceGeneration,
+                    authorization: systemOutputAuthorization,
+                    outputURL: rawURL,
+                    liveSink: systemOutputSink,
+                    sourceCallbackGate: sourceCallbackGate,
+                )
+                nativeStartWork = nativeStart
+                observeNativeCompletion(nativeStart, kind: .start)
+                try await nativeStart.value()
+                try Task.checkCancellation()
+                guard activeAttempt == attempt else { throw CancellationError() }
+                _ = try await waitForFirstCallbacks(
+                    after: 0,
+                    timeout: Self.onlineFirstBufferTimeout,
+                    cancellation: startCancellation,
+                )
+                guard activeAttempt == attempt else { throw CancellationError() }
+                rawOnlineURL = rawURL
+                activeSourceGeneration = sourceGeneration
+                activeCaptureScope = .systemOutput
+                onlineSourceAvailable = true
+                activeCaptureGeneration = liveGeneration
+
+            case .microphone:
                 let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
                 MicCaptureDiagnostics.record(
                     "authorization=\(authorization.rawValue) bundle=\(Bundle.main.bundleIdentifier ?? "unknown") requested=\(microphone?.id ?? "none")",
@@ -805,6 +876,7 @@ final class CaptureController {
                     throw error
                 }
                 microphoneCaptureOwner.acquire(capture)
+                activeCaptureScope = .microphone
                 activeCaptureGeneration = liveGeneration
             }
 
@@ -831,6 +903,7 @@ final class CaptureController {
             signalHealth = lastHealth
             sourceGenerationGate.invalidate(attempt)
             rebindCoordinator.cancel(attempt)
+            systemOutputAuthorizationAuthority.invalidate(attempt)
             onlineProbeTask?.cancel()
             onlineProbeTask = nil
             onlineRebindCancellation?.cancel()
@@ -845,6 +918,7 @@ final class CaptureController {
                 activeAttempt = nil
                 attemptGate.invalidate(attempt)
                 activeCaptureGeneration = nil
+                activeCaptureScope = nil
                 activeSourceGeneration = nil
                 onlineRootPID = nil
                 onlineSelectedIdentity = nil
@@ -866,6 +940,7 @@ final class CaptureController {
         attemptGate.invalidate(attempt)
         sourceGenerationGate.invalidate(attempt)
         rebindCoordinator.cancel(attempt)
+        systemOutputAuthorizationAuthority.invalidate(attempt)
         startCancellation?.cancel()
         onlineRebindCancellation?.cancel()
         onlineRebindCancellation = nil
@@ -874,6 +949,7 @@ final class CaptureController {
         signalHealth = nil
         signalHealthTracker = nil
         activeCaptureGeneration = nil
+        activeCaptureScope = nil
         activeSourceGeneration = nil
         onlineRootPID = nil
         onlineSelectedIdentity = nil
@@ -914,11 +990,13 @@ final class CaptureController {
             attemptGate.invalidate(stoppedAttempt)
             sourceGenerationGate.invalidate(stoppedAttempt)
             rebindCoordinator.cancel(stoppedAttempt)
+            systemOutputAuthorizationAuthority.invalidate(stoppedAttempt)
         }
         onlineRebindCancellation?.cancel()
         onlineRebindCancellation = nil
         signalHealthTracker = nil
         activeCaptureGeneration = nil
+        activeCaptureScope = nil
         activeSourceGeneration = nil
         onlineRootPID = nil
         onlineSelectedIdentity = nil
@@ -1030,6 +1108,15 @@ final class CaptureController {
         return terminalCaptureFailure
     }
 
+    /// 2C.1 test seam for the future consent modal. Production UI does not
+    /// expose system-output selection yet; the returned capability remains
+    /// bound to this controller and exactly one attempt.
+    func issueSystemOutputAuthorizationForTest(
+        for attempt: SessionAttemptID,
+    ) -> SystemOutputCaptureAuthorization {
+        systemOutputAuthorizationAuthority.issueForTesting(for: attempt)
+    }
+
     // Product lifecycle seam used by focused tests. It prepares the same
     // attempt/source-generation/live-buffer ownership that a successful online
     // start publishes, while leaving native CATap work injectable.
@@ -1049,6 +1136,7 @@ final class CaptureController {
         let sourceGeneration = sourceGenerationGate.begin(attempt)
         rebindCoordinator.reset(attempt)
         activeCaptureGeneration = liveGeneration
+        activeCaptureScope = .application
         activeSourceGeneration = sourceGeneration
         onlineRootPID = rootPID
         onlineSelectedIdentity = selectedIdentity
@@ -1116,6 +1204,7 @@ final class CaptureController {
         signalHealthTracker = nil
         signalHealth = nil
         activeCaptureGeneration = nil
+        activeCaptureScope = nil
         activeSourceGeneration = nil
         onlineRootPID = nil
         onlineSelectedIdentity = nil
@@ -1148,7 +1237,14 @@ final class CaptureController {
                    let signal = tracker.snapshot(for: attempt) {
                     self.signalHealth = signal
                 }
-                if self.onlineRootPID != nil, self.onlineSourceAvailable {
+                if self.activeCaptureScope == .systemOutput, self.onlineSourceAvailable {
+                    let snapshot = await self.nativeExecutor.levelSnapshot(for: attempt)
+                    guard self.isCapturing,
+                          self.activeAttempt == attempt,
+                          self.attemptGate.accepts(attempt)
+                    else { return }
+                    self.levelDBFS = snapshot.levelDBFS
+                } else if self.onlineRootPID != nil, self.onlineSourceAvailable {
                     let snapshot = await self.nativeExecutor.levelSnapshot(for: attempt)
                     guard self.isCapturing,
                           self.activeAttempt == attempt,

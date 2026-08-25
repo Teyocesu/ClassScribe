@@ -51,4 +51,22 @@ final class AppAudioCapturePIDTranslationTests: XCTestCase {
         let capture = AppAudioCapture(pids: [], outputFileDescriptor: -1)
         XCTAssertThrowsError(try capture.translatePIDs())
     }
+
+    // MARK: - CATap source policy
+
+    func testSystemOutputFactoryUsesGlobalTapWithExplicitExclusions() {
+        let tap = CATapDescriptionFactory.make(
+            for: .systemOutput(excludingProcessObjectIDs: [7, 9]),
+        )
+
+        XCTAssertEqual(tap.processes, [7, 9])
+    }
+
+    func testApplicationFactoryRemainsProcessMixdown() {
+        let tap = CATapDescriptionFactory.make(
+            for: .application(processObjectIDs: [7, 9]),
+        )
+
+        XCTAssertEqual(tap.processes, [7, 9])
+    }
 }

@@ -165,6 +165,25 @@ public sealed class SessionStateTests
     }
 
     [TestMethod]
+    public void SystemOutputScopeRoundTripsWithoutBecomingApplication()
+    {
+        var metadata = new ClassMetadata
+        {
+            Id = Guid.NewGuid(),
+            Subject = "Física",
+            Mode = CaptureMode.Online,
+            CaptureScope = CaptureScope.SystemOutput,
+            State = ProcessingState.Complete,
+        };
+
+        var json = JsonSerializer.Serialize(metadata);
+        var decoded = JsonSerializer.Deserialize<ClassMetadata>(json)!;
+
+        StringAssert.Contains(json, "\"captureScope\":\"systemOutput\"");
+        Assert.AreEqual(CaptureScope.SystemOutput, decoded.CaptureScope);
+    }
+
+    [TestMethod]
     public void ExplicitUnknownStateDoesNotBecomeReady()
     {
         var json = MetadataNode();

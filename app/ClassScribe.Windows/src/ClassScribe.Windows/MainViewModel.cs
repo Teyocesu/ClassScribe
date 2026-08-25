@@ -375,9 +375,12 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 Subject = Subject.Trim(),
                 StartedAt = startedAt,
                 Mode = SelectedMode.Value,
-                CaptureScope = SelectedMode.Value == CaptureMode.Online
-                    ? CaptureScope.Application
-                    : CaptureScope.Microphone,
+                CaptureScope = SelectedSource.Kind switch
+                {
+                    AudioSourceKind.Process => CaptureScope.Application,
+                    AudioSourceKind.SystemOutput => CaptureScope.SystemOutput,
+                    _ => CaptureScope.Microphone,
+                },
                 Source = SelectedSource.DisplayName,
                 TechnicalVocabulary = Vocabulary.Trim(),
                 Language = SelectedLanguage.Code,

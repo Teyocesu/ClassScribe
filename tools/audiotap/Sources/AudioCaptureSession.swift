@@ -8,6 +8,7 @@ private let logger = Logger(subsystem: "com.meetingtranscriber.audiotap", catego
 @available(macOS 14.2, *)
 public class AudioCaptureSession {
     private var pids: [pid_t]
+    private var source: AppAudioCaptureSource
     private let sampleRate: Int
     private let channels: Int
     private let appOutputURL: URL
@@ -39,7 +40,7 @@ public class AudioCaptureSession {
     /// - Parameter micLiveSink: Optional real-time buffer callback for the mic
     ///   track (mono Float32 at file rate, typically 16 kHz post-resample).
     ///   Called from the AVAudioEngine tap thread — non-blocking.
-    public init(
+    public convenience init(
         pids: [pid_t],
         appOutputURL: URL,
         sampleRate: Int = 48000,
@@ -52,7 +53,40 @@ public class AudioCaptureSession {
         micLiveSink: LiveAudioSink? = nil,
         micDebugFault: DebugTapFault? = nil,
     ) {
-        self.pids = pids
+        self.init(
+            source: .application(processes: pids),
+            appOutputURL: appOutputURL,
+            sampleRate: sampleRate,
+            channels: channels,
+            micOutputURL: micOutputURL,
+            micDeviceUID: micDeviceUID,
+            debugLogging: debugLogging,
+            appLiveSink: appLiveSink,
+            appCallbackGate: appCallbackGate,
+            micLiveSink: micLiveSink,
+            micDebugFault: micDebugFault,
+        )
+    }
+
+    public init(
+        source: AppAudioCaptureSource,
+        appOutputURL: URL,
+        sampleRate: Int = 48000,
+        channels: Int = 2,
+        micOutputURL: URL? = nil,
+        micDeviceUID: String? = nil,
+        debugLogging: Bool = false,
+        appLiveSink: LiveAudioSink? = nil,
+        appCallbackGate: (@Sendable () -> Bool)? = nil,
+        micLiveSink: LiveAudioSink? = nil,
+        micDebugFault: DebugTapFault? = nil,
+    ) {
+        self.source = source
+        if case let .application(processes) = source {
+            self.pids = processes
+        } else {
+            self.pids = []
+        }
         self.sampleRate = sampleRate
         self.channels = channels
         self.appOutputURL = appOutputURL
@@ -78,7 +112,7 @@ public class AudioCaptureSession {
         appFileHandle = handle
         do {
             try startApplicationCapture(
-                pids: pids,
+                source: source,
                 liveSink: appLiveSink,
                 callbackGate: appCallbackGate,
             )
@@ -116,6 +150,18 @@ public class AudioCaptureSession {
         liveSink: LiveAudioSink?,
         callbackGate: (@Sendable () -> Bool)?,
     ) throws {
+        try replaceApplicationCapture(
+            source: .application(processes: pids),
+            liveSink: liveSink,
+            callbackGate: callbackGate,
+        )
+    }
+
+    public func replaceApplicationCapture(
+        source: AppAudioCaptureSource,
+        liveSink: LiveAudioSink?,
+        callbackGate: (@Sendable () -> Bool)?,
+    ) throws {
         guard let handle = appFileHandle else {
             throw NSError(
                 domain: "audiotap", code: -4,
@@ -123,10 +169,15 @@ public class AudioCaptureSession {
             )
         }
         stopApplicationCapture()
-        self.pids = pids
+        self.source = source
+        if case let .application(processes) = source {
+            self.pids = processes
+        } else {
+            self.pids = []
+        }
         do {
             try startApplicationCapture(
-                pids: pids,
+                source: source,
                 liveSink: liveSink,
                 callbackGate: callbackGate,
             )
@@ -148,7 +199,7 @@ public class AudioCaptureSession {
     }
 
     private func startApplicationCapture(
-        pids: [pid_t],
+        source: AppAudioCaptureSource,
         liveSink: LiveAudioSink?,
         callbackGate: (@Sendable () -> Bool)?,
     ) throws {
@@ -159,7 +210,7 @@ public class AudioCaptureSession {
             )
         }
         let capture = AppAudioCapture(
-            pids: pids,
+            source: source,
             outputFileDescriptor: handle.fileDescriptor,
             sampleRate: sampleRate,
             channels: channels,

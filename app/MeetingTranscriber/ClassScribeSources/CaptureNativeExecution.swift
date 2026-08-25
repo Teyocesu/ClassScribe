@@ -339,7 +339,7 @@ final class CaptureNativeRebindDriver: CaptureApplicationRebindDriver, @unchecke
     }
 }
 
-/// Owns application CATap capture objects on one dedicated serial queue. A
+/// Owns native CATap capture objects on one dedicated serial queue. A
 /// slow native call can occupy this queue, but it cannot occupy MainActor. A
 /// second attempt is intentionally queued behind the first attempt's native
 /// cleanup; taps are never overlapped accidentally.
@@ -348,7 +348,14 @@ final class CaptureNativeExecutor: @unchecked Sendable {
         label: "classscribe.capture.native",
         qos: .userInitiated,
     )
-    private var applicationSessions: [SessionAttemptID: AudioCaptureSession] = [:]
+    private var captureSessions: [SessionAttemptID: AudioCaptureSession] = [:]
+    private let systemOutputAuthorizationAuthority: SystemOutputCaptureAuthorizationAuthority
+
+    init(
+        systemOutputAuthorizationAuthority: SystemOutputCaptureAuthorizationAuthority = SystemOutputCaptureAuthorizationAuthority(),
+    ) {
+        self.systemOutputAuthorizationAuthority = systemOutputAuthorizationAuthority
+    }
 
     /// Small injectable boundary used by deterministic lifecycle tests. The
     /// production closures below use the same queue and ownership contract.
@@ -420,9 +427,58 @@ final class CaptureNativeExecutor: @unchecked Sendable {
                 _ = session.stop()
                 throw CancellationError()
             }
-            applicationSessions[attempt] = session
+            captureSessions[attempt] = session
             if work.isCancellationRequested {
-                _ = applicationSessions.removeValue(forKey: attempt)?.stop()
+                _ = captureSessions.removeValue(forKey: attempt)?.stop()
+                throw CancellationError()
+            }
+        }
+    }
+
+    /// Starts a global CATap source only after the attempt-bound capability is
+    /// accepted on the native queue. The exclusion list is derived from the
+    /// running product process and validated PID↔AudioObjectID round trips;
+    /// no application process list is used for the global source.
+    func beginSystemOutputStart(
+        attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
+        authorization: SystemOutputCaptureAuthorization?,
+        outputURL: URL,
+        liveSink: @escaping LiveAudioSink,
+        sourceCallbackGate: @escaping @Sendable () -> Bool,
+    ) -> CaptureNativeWork<Void> {
+        submit(attempt: attempt) { [self] work in
+            guard sourceGeneration.attempt == attempt,
+                  systemOutputAuthorizationAuthority.accepts(authorization, for: attempt)
+            else {
+                throw CaptureError.systemOutputAuthorizationRequired
+            }
+            try Self.checkCancellation(work)
+
+            let exclusions = AppAudioCapture.systemOutputExclusionObjectIDs()
+            let session = AudioCaptureSession(
+                source: .systemOutput(excludingProcessObjectIDs: exclusions),
+                appOutputURL: outputURL,
+                micOutputURL: nil,
+                appLiveSink: liveSink,
+                appCallbackGate: sourceCallbackGate,
+            )
+            do {
+                try session.start()
+            } catch {
+                throw error
+            }
+            guard !work.isCancellationRequested,
+                  systemOutputAuthorizationAuthority.accepts(authorization, for: attempt)
+            else {
+                _ = session.stop()
+                throw CancellationError()
+            }
+            captureSessions[attempt] = session
+            guard !work.isCancellationRequested,
+                  systemOutputAuthorizationAuthority.accepts(authorization, for: attempt)
+            else {
+                _ = captureSessions.removeValue(forKey: attempt)?.stop()
                 throw CancellationError()
             }
         }
@@ -437,11 +493,11 @@ final class CaptureNativeExecutor: @unchecked Sendable {
     ) -> CaptureNativeWork<Void> {
         submit(attempt: attempt) { [self] work in
             guard sourceGeneration.attempt == attempt,
-                  applicationSessions[attempt] != nil else {
+                  captureSessions[attempt] != nil else {
                 throw CancellationError()
             }
             try Self.checkCancellation(work)
-            applicationSessions[attempt]?.stopApplicationCapture()
+            captureSessions[attempt]?.stopApplicationCapture()
         }
     }
 
@@ -460,7 +516,7 @@ final class CaptureNativeExecutor: @unchecked Sendable {
     ) -> CaptureNativeWork<Void> {
         submit(attempt: attempt) { [self] work in
             guard sourceGeneration.attempt == attempt,
-                  let session = applicationSessions[attempt] else {
+                  let session = captureSessions[attempt] else {
                 throw CancellationError()
             }
             let deadline = DispatchTime.now().uptimeNanoseconds
@@ -496,14 +552,14 @@ final class CaptureNativeExecutor: @unchecked Sendable {
 
     func beginStop(attempt: SessionAttemptID) -> CaptureNativeWork<Void> {
         submit(attempt: attempt) { [self] _ in
-            _ = applicationSessions.removeValue(forKey: attempt)?.stop()
+            _ = captureSessions.removeValue(forKey: attempt)?.stop()
         }
     }
 
     func levelSnapshot(for attempt: SessionAttemptID) async -> CaptureNativeLevelSnapshot {
         await withCheckedContinuation { continuation in
             queue.async { [self] in
-                if let session = applicationSessions[attempt] {
+                if let session = captureSessions[attempt] {
                     continuation.resume(returning: CaptureNativeLevelSnapshot(
                         levelDBFS: session.appLevelDBFS,
                         terminalErrorMessage: nil,
