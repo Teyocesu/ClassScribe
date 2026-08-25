@@ -2,8 +2,9 @@
 
 Fecha: 2026-08-25
 
-Baseline correctivo: `v0.8.0-development` = `6c28107bed11bff3b1d70d8242cb1b327f44316b`
-Estado: correctivo de lifecycle/device restart implementado; **FIXED / PARTIAL**.
+Baseline correctivo final: `v0.8.0-development` = `524319e579e954fc374b07c95ab917f1bd53fe3c`
+Estado: correctivo final de Windows session-stop ownership implementado;
+**FIXED / PARTIAL**.
 La revisión independiente y los gates físicos/runtime Windows permanecen
 pendientes; esta caracterización no marca 2C.1 como aprobada.
 
@@ -106,10 +107,21 @@ endpoint actual. La sesión se considera activa por el intento, raw/channel/
 writer y admission state, no por la existencia temporal del recorder.
 `StopAsync` es single-flight: durante un rebind sin recorder cancela capture,
 invalida generación/coordinador/autorización, termina el recorder si existe,
-espera writer/raw y finaliza el `source.raw` existente. Toda publicación final
-de una nueva generación revalida Stop, intento, generación y coordinator. El
-mensaje de no-callback para esta fuente nombra explícitamente la salida del
-sistema.
+espera writer/raw y finaliza el `source.raw` existente. El task compartido se
+publica bajo el mismo lock antes de que el caller owner salga; ningún follower
+ejecuta teardown o finalización propia y todos reciben el mismo resultado/error.
+El stop incompleto también mantiene ownership de sesión durante la ventana
+`FinishCaptureResourcesAsync → FinalizeRawAsync`; sólo un Start posterior a la
+finalización completada puede limpiar el task terminado. La ruta cruda se
+captura por intento y no depende de un campo que un Start siguiente pueda
+reemplazar. Toda publicación final de una nueva generación revalida Stop,
+intento, generación y coordinator. El mensaje de no-callback para esta fuente
+nombra explícitamente la salida del sistema.
+
+La frontera process-loopback adopta el recorder construido sólo después de
+revalidar cancelación y dispone el recurso nativo si esa cancelación gana
+después de `BuildAsync`; no se cambia la identidad strong, la generación ni la
+semántica `WithProcessLoopback`.
 
 ## Persistencia y ownership
 
@@ -131,6 +143,13 @@ Se añadieron pruebas deterministas para:
 - ownership de sesión Windows durante rebind sin recorder, Stop concurrente,
   fallo de build y recuperación, usando la fábrica de recorder del camino de
   producto;
+- `concurrentStopCallsShareOneFinalization`,
+  `concurrentStopFollowersReceiveSameWavePath`,
+  `concurrentStopDoesNotDoubleDisposeRawWriter`,
+  `startRejectedWhileStopFinalizationIsInProgress` y
+  `nextStartAllowedAfterStopFinalizationCompletes` sobre el product path;
+- cleanup post-`BuildAsync` con
+  `processLoopbackBuiltRecorderIsDisposedWhenCancellationWinsAfterBuild`;
 - serialización real del owner macOS, revalidación de self-exclusions en un
   restart y rechazo de traducciones sin objeto válido.
 

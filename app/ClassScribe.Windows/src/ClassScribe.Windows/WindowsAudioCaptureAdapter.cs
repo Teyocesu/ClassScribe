@@ -18,6 +18,30 @@ internal interface IWindowsAudioRecorder : IAsyncDisposable
     void StopRecording();
 }
 
+/// Owns the gap between a native recorder build completing and the product
+/// caller adopting that recorder. Cancellation in that gap must dispose the
+/// built resource before the cancellation escapes.
+internal static class WindowsAudioRecorderOwnership
+{
+    internal static async Task<T> AdoptBuiltRecorderAsync<T>(
+        T recorder,
+        Func<T, ValueTask> disposeAsync,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(disposeAsync);
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return recorder;
+        }
+        catch
+        {
+            await disposeAsync(recorder).ConfigureAwait(false);
+            throw;
+        }
+    }
+}
+
 internal sealed record WindowsRenderEndpoint(string EndpointId, MMDevice? Device);
 
 internal interface IWindowsAudioCaptureFactory
@@ -71,8 +95,12 @@ internal sealed class NAudioWindowsAudioCaptureFactory : IWindowsAudioCaptureFac
             .WithProcessLoopback(rootProcessId, ProcessLoopbackMode.IncludeTargetProcessTree)
             .BuildAsync()
             .ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested();
-        return new NAudioWindowsAudioRecorder(recorder);
+        var adoptedRecorder = await WindowsAudioRecorderOwnership.AdoptBuiltRecorderAsync(
+                recorder,
+                static candidate => candidate.DisposeAsync(),
+                cancellationToken)
+            .ConfigureAwait(false);
+        return new NAudioWindowsAudioRecorder(adoptedRecorder);
     }
 
     public IWindowsAudioRecorder BuildSystemOutputRecorder(WindowsRenderEndpoint endpoint)

@@ -227,6 +227,161 @@ public sealed class WindowsAudioCaptureProductPathTests
         DeleteFolder(recoveryFolder);
     }
 
+    [TestMethod]
+    public async Task concurrentStopCallsShareOneFinalization()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        await StartSystemOutputAsync(capture, folder, attempt);
+
+        var finalization = new FinalizationGate();
+        capture.SetFinalizationHookForTest(finalization.BlockAsync);
+        var firstStop = capture.StopAsync(CancellationToken.None);
+        await finalization.Entered.Task;
+        var secondStop = capture.StopAsync(CancellationToken.None);
+
+        finalization.Release.TrySetResult(true);
+        var paths = await Task.WhenAll(firstStop, secondStop);
+
+        Assert.AreEqual(paths[0], paths[1]);
+        Assert.AreEqual(1, finalization.InvocationCount);
+        DeleteFolder(folder);
+    }
+
+    [TestMethod]
+    public async Task concurrentStopFollowersReceiveSameWavePath()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        await StartSystemOutputAsync(capture, folder, attempt);
+
+        var finalization = new FinalizationGate();
+        capture.SetFinalizationHookForTest(finalization.BlockAsync);
+        var stops = new[]
+        {
+            capture.StopAsync(CancellationToken.None),
+        };
+        await finalization.Entered.Task;
+        var allStops = stops
+            .Append(capture.StopAsync(CancellationToken.None))
+            .Append(capture.StopAsync(CancellationToken.None))
+            .ToArray();
+
+        finalization.Release.TrySetResult(true);
+        var paths = await Task.WhenAll(allStops);
+
+        Assert.IsTrue(paths.All(path => path == paths[0]));
+        Assert.IsTrue(File.Exists(paths[0]));
+        Assert.AreEqual(1, finalization.InvocationCount);
+        DeleteFolder(folder);
+    }
+
+    [TestMethod]
+    public async Task concurrentStopDoesNotDoubleDisposeRawWriter()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        await StartSystemOutputAsync(capture, folder, attempt);
+
+        var recorder = factory.Recorders.Single();
+        var finalization = new FinalizationGate();
+        capture.SetFinalizationHookForTest(finalization.BlockAsync);
+        var firstStop = capture.StopAsync(CancellationToken.None);
+        await finalization.Entered.Task;
+        var secondStop = capture.StopAsync(CancellationToken.None);
+        finalization.Release.TrySetResult(true);
+        await Task.WhenAll(firstStop, secondStop);
+
+        Assert.AreEqual(1, recorder.DisposeCount);
+        Assert.AreEqual(1, finalization.InvocationCount);
+        DeleteFolder(folder);
+    }
+
+    [TestMethod]
+    public async Task startRejectedWhileStopFinalizationIsInProgress()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var secondFolder = NewFolder();
+        var attempt = NewAttempt();
+        var secondAttempt = NewAttempt();
+        await StartSystemOutputAsync(capture, folder, attempt);
+
+        var finalization = new FinalizationGate();
+        capture.SetFinalizationHookForTest(finalization.BlockAsync);
+        var stop = capture.StopAsync(CancellationToken.None);
+        await finalization.Entered.Task;
+
+        var authorization = capture.IssueSystemOutputAuthorizationForTest(secondAttempt);
+        await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
+            capture.StartAsync(
+                SystemSource(),
+                secondFolder,
+                secondAttempt,
+                CancellationToken.None,
+                authorization));
+
+        finalization.Release.TrySetResult(true);
+        await stop;
+        DeleteFolder(folder);
+        DeleteFolder(secondFolder);
+    }
+
+    [TestMethod]
+    public async Task nextStartAllowedAfterStopFinalizationCompletes()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var secondFolder = NewFolder();
+        var attempt = NewAttempt();
+        var secondAttempt = NewAttempt();
+        await StartSystemOutputAsync(capture, folder, attempt);
+
+        var finalization = new FinalizationGate();
+        capture.SetFinalizationHookForTest(finalization.BlockAsync);
+        var firstStop = capture.StopAsync(CancellationToken.None);
+        await finalization.Entered.Task;
+        finalization.Release.TrySetResult(true);
+        var firstWavePath = await firstStop;
+
+        Assert.IsTrue(File.Exists(firstWavePath));
+        Assert.IsFalse(capture.IsRecording);
+        await StartSystemOutputAsync(capture, secondFolder, secondAttempt);
+        Assert.IsTrue(capture.IsRecording);
+        var secondWavePath = await capture.StopAsync(CancellationToken.None);
+
+        Assert.IsTrue(File.Exists(secondWavePath));
+        Assert.AreEqual(2, finalization.InvocationCount);
+        DeleteFolder(folder);
+        DeleteFolder(secondFolder);
+    }
+
+    [TestMethod]
+    public async Task processLoopbackBuiltRecorderIsDisposedWhenCancellationWinsAfterBuild()
+    {
+        var recorder = new FakeWindowsAudioRecorder(new List<string>());
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsExceptionAsync<OperationCanceledException>(async () =>
+        {
+            await WindowsAudioRecorderOwnership.AdoptBuiltRecorderAsync(
+                recorder,
+                static candidate => candidate.DisposeAsync(),
+                cancellation.Token);
+        });
+
+        Assert.AreEqual(1, recorder.DisposeCount);
+    }
+
     private static async Task StartSystemOutputAsync(
         WindowsAudioCapture capture,
         string folder,
@@ -353,6 +508,10 @@ public sealed class WindowsAudioCaptureProductPathTests
 
         public int StartCount { get; private set; }
 
+        private int disposeCount;
+
+        public int DisposeCount => Volatile.Read(ref disposeCount);
+
         public void StartRecording()
         {
             StartCount++;
@@ -367,8 +526,30 @@ public sealed class WindowsAudioCaptureProductPathTests
 
         public ValueTask DisposeAsync()
         {
+            Interlocked.Increment(ref disposeCount);
             lifecycleEvents.Add("dispose");
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class FinalizationGate
+    {
+        private int invocationCount;
+
+        public TaskCompletionSource<bool> Entered { get; } = NewSignal();
+
+        public TaskCompletionSource<bool> Release { get; } = NewSignal();
+
+        public int InvocationCount => Volatile.Read(ref invocationCount);
+
+        public Task BlockAsync(string _, CancellationToken __)
+        {
+            Interlocked.Increment(ref invocationCount);
+            Entered.TrySetResult(true);
+            return Release.Task;
+        }
+
+        private static TaskCompletionSource<bool> NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }

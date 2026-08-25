@@ -49,6 +49,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private CancellationTokenSource? captureCancellation;
     private Task<Exception?>? stopRecorderTask;
     private Task<string>? stopSessionTask;
+    private Func<string, CancellationToken, Task>? finalizationHookForTesting;
     private bool sessionAdmissionOpen;
     private bool stopRequested;
     private readonly CaptureSignalHealthTracker signalHealthTracker =
@@ -79,7 +80,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     }
 
     private bool IsCaptureSessionActiveLocked =>
-        sessionAdmissionOpen
+        (stopSessionTask is not null && !stopSessionTask.IsCompleted)
+            || sessionAdmissionOpen
             || captureAttempt is not null
             || rawStream is not null
             || packetChannel is not null
@@ -521,15 +523,17 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 var completion = new TaskCompletionSource<string>(
                     TaskCreationOptions.RunContinuationsAsynchronously);
                 sessionStopTask = completion.Task;
+                stopSessionTask = sessionStopTask;
                 owner = completion;
             }
         }
 
         if (owner is null)
         {
-            var path = await sessionStopTask.ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
-            return path;
+            // Followers observe the exact shared result/error. The owner's
+            // cancellation token controls cleanup; a follower cannot replace
+            // the single-flight result with its own cancellation.
+            return await sessionStopTask.ConfigureAwait(false);
         }
 
         try
@@ -562,8 +566,12 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
         var stopFailure = await StopCurrentRecorderAsync(cancellationToken).ConfigureAwait(false);
 
-        await FinishCaptureResourcesAsync().ConfigureAwait(false);
-        var wavePath = await FinalizeRawAsync(CancellationToken.None).ConfigureAwait(false);
+        var rawPathForAttempt = await FinishCaptureResourcesAsync().ConfigureAwait(false);
+        var wavePath = await FinalizeRawAsync(
+                rawPathForAttempt
+                    ?? throw new InvalidOperationException("No existe audio crudo para finalizar."),
+                CancellationToken.None)
+            .ConfigureAwait(false);
         if (captureFailure is not null || stopFailure is not null)
         {
             LastWarning = "Windows informó un problema al cerrar la fuente, pero el WAV fue validado y se conservó.";
@@ -844,13 +852,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             systemOutputAuthorizationAuthority.Invalidate(attempt);
         }
         _ = await StopCurrentRecorderAsync(CancellationToken.None).ConfigureAwait(false);
-        await FinishCaptureResourcesAsync().ConfigureAwait(false);
+        var rawPathForAttempt = await FinishCaptureResourcesAsync().ConfigureAwait(false);
 
-        if (rawPath is not null && File.Exists(rawPath))
+        if (rawPathForAttempt is not null && File.Exists(rawPathForAttempt))
         {
             try
             {
-                await FinalizeRawAsync(CancellationToken.None).ConfigureAwait(false);
+                await FinalizeRawAsync(rawPathForAttempt, CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception error) when (error is IOException
                                                or UnauthorizedAccessException
@@ -987,12 +995,14 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         return stopFailure;
     }
 
-    private async Task FinishCaptureResourcesAsync()
+    private async Task<string?> FinishCaptureResourcesAsync()
     {
         SessionAttemptID? finishedAttempt;
+        string? rawPathForAttempt;
         lock (sync)
         {
             finishedAttempt = captureAttempt;
+            rawPathForAttempt = rawPath;
             captureAttempt = null;
             activeSourceGeneration = null;
             activeSource = null;
@@ -1048,16 +1058,35 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 LevelChanged?.Invoke(finishedAttempt, 0);
             }
         }
+
+        return rawPathForAttempt;
     }
 
-    private async Task<string> FinalizeRawAsync(CancellationToken cancellationToken)
+    private async Task<string> FinalizeRawAsync(
+        string source,
+        CancellationToken cancellationToken)
     {
-        var source = rawPath ?? throw new InvalidOperationException("No existe audio crudo para finalizar.");
+        Func<string, CancellationToken, Task>? finalizationHook;
+        lock (sync)
+        {
+            finalizationHook = finalizationHookForTesting;
+        }
+        if (finalizationHook is not null)
+        {
+            await finalizationHook(source, cancellationToken).ConfigureAwait(false);
+        }
+
         PcmWaveFile.ValidateRaw(source);
         var wavePath = Path.Combine(Path.GetDirectoryName(source)!, "source.wav");
         await PcmWaveFile.WrapRawAsync(source, wavePath, cancellationToken).ConfigureAwait(false);
         File.Delete(source);
-        rawPath = null;
+        lock (sync)
+        {
+            if (rawPath == source)
+            {
+                rawPath = null;
+            }
+        }
         return wavePath;
     }
 
@@ -1727,6 +1756,15 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             {
                 return activeRenderEndpointID;
             }
+        }
+    }
+
+    internal void SetFinalizationHookForTest(
+        Func<string, CancellationToken, Task>? hook)
+    {
+        lock (sync)
+        {
+            finalizationHookForTesting = hook;
         }
     }
 
