@@ -43,6 +43,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private string elapsedText = "00:00";
     private double audioLevel;
     private CaptureSignalState captureSignalState = CaptureSignalState.AwaitingCallbacks;
+    private CaptureSignalState? lastPresentedCaptureSignalState;
     private double modelProgress;
     private bool isRecording;
     private bool isBusy;
@@ -358,6 +359,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         var sessionID = Guid.NewGuid();
         var attempt = BeginAttempt(sessionID);
         SignalState = CaptureSignalState.AwaitingCallbacks;
+        lastPresentedCaptureSignalState = null;
         RegisterCaptureCallbacks(attempt);
         var captureStarted = false;
         asrOriginalReference = null;
@@ -1440,13 +1442,16 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        var changed = SignalState != snapshot.State;
         SignalState = snapshot.State;
-        if (!IsRecording || !changed)
+        if (!CaptureSignalPresentationPolicy.ShouldPresent(
+                snapshot.State,
+                lastPresentedCaptureSignalState,
+                IsRecording))
         {
             return;
         }
 
+        lastPresentedCaptureSignalState = snapshot.State;
         StatusText = snapshot.State switch
         {
             CaptureSignalState.AwaitingCallbacks => "Esperando callbacks de audio…",

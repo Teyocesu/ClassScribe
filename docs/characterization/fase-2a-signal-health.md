@@ -1,22 +1,22 @@
 # Fase 2A — Capture health y clasificación de señal
 
-Fecha: 2026-08-24
+Fecha: 2026-08-25
 Alcance: separación de salud del transporte/señal respecto de
 `CapturePhase`, `AsrPhase` y `SessionPhase`, con integración en las rutas activas
-macOS y Windows. No incluye VAD, aceptación ASR, captura global, cambios de
-persistencia ni un nuevo gate físico.
+macOS y Windows. No incluye VAD, una política general de aceptación ASR,
+captura global, cambios de persistencia ni un nuevo gate físico.
 
 ## Estado
 
-**PHASE 2A PARTIAL**
+**PHASE 2A FIXED / PARTIAL**
 
-La implementación y el build release macOS están completos. El harness
-focalizado ejecutó las diez invariantes de clasificación. La suite completa de
-Swift no llegó a ejecutar por un error preexistente de Swift 6 estricto en
-`CaptureNativeExecutionTests.swift:112` (`Thread.isMainThread` no está
-disponible en un contexto async). Windows tiene el tracker, el adaptador WASAPI
-y los tests MSTest escritos, pero el runtime queda
-**SKIPPED — dotnet unavailable** en este host.
+Los hallazgos de revisión de Fase 2A están corregidos. El build release macOS y
+la compilación estricta de tests pasan; el focused relevante ejecutó 24 tests,
+incluidos el gate de ASR vacío/aceptado, la presentación de señal y los tests de
+captura nativa. La suite completa Swift ejecutó 183 tests con **PASS**; sus
+gates físicos/modelos explícitamente condicionados continúan skipped. Windows
+tiene el tracker, el adaptador WASAPI y los tests MSTest escritos, pero el
+runtime queda **SKIPPED — dotnet unavailable** en este host.
 
 Los gates físicos existentes no cambian: CATap de aplicación macOS continúa
 **PASS** según Fase 1C; micrófono macOS continúa **SKIPPED — TCC**; Windows
@@ -36,6 +36,9 @@ físico/runtime continúa **SKIPPED — PHYSICAL WINDOWS / dotnet unavailable**.
 Un callback cuenta como evidencia aunque tenga cero frames o muestras digitales
 cero. La transición `audible → silent` es válida y saludable. Sólo la ausencia
 de callbacks puede producir `noCallbacks`; RMS no se usa como prueba de vida.
+`hasReceivedCallbacks`/`HasReceivedCallbacks` es únicamente evidencia de que
+existió un callback; no se expone un booleano `transportIsHealthy` que mezcle
+espera, stall y contenido. El estado enum es la clasificación autoritativa.
 
 Cada snapshot contiene `SessionAttemptID`, timestamps monotónicos de inicio y
 último callback, conteos acumulados de callbacks/muestras/frames, RMS, energía
@@ -71,11 +74,14 @@ La ruta activa queda:
 
 `CaptureSignalHealthTracker` es lock-protected y se crea por intento. El sink
 comprueba `CaptureAttemptGate`, mide el callback y publica al `AsyncStream` sin
-esperar actor, `MainActor`, archivo, timer o recurso nativo. El startup espera
-el primer callback, no la primera muestra no vacía. El resampler y el handler
-de micrófono también envían un callback vacío cuando el native path está vivo.
-La ruta de micrófono sigue siendo MainActor-owned y conserva su setup/teardown
-legacy; sólo comparte el tracker runtime.
+esperar actor, `MainActor`, archivo, timer o recurso nativo. La ruta online
+espera el primer callback. La ruta de micrófono sigue siendo MainActor-owned y
+conserva `MicCaptureHandler.waitForFirstBuffer()`: sólo publica `isCapturing`
+después de que un número de frames real llegó al escritor WAV. El tracker, sin
+embargo, observa todos los callbacks; un callback de cero frames puede
+clasificarse como `silent`, pero por sí solo no abre la grabación. PCM silencioso
+con frames escritos sí satisface el gate de durabilidad y `terminalError`/los
+diagnósticos de la espera se conservan.
 
 Durante una captura, el timer refresca el snapshot. `silent` y `audible` no
 terminalizan. Un stall `noCallbacks` queda como fallo de salud de captura y el
@@ -89,6 +95,9 @@ audio recibido sigue la ruta normal de recuperación/finalización.
 vacío cuenta como primer callback silencioso. `MainViewModel` conecta el evento
 mediante el `SessionAttemptCallbackLease`, aplica sólo snapshots del intento
 actual y mantiene mensajes distintos para espera, stall, silencio y audio.
+La observación y la presentación están separadas: un estado observado antes de
+`IsRecording = true` no se marca como presentado, y el siguiente snapshot del
+intento se presenta al comenzar la grabación aunque el estado no haya cambiado.
 No se fuerza una abstracción de captura idéntica a macOS.
 
 ## Seguridad de intentos y ASR
@@ -99,10 +108,12 @@ Cada nuevo intento parte en `awaitingCallbacks` con conteos y timestamps nuevos.
 Al cancelar o detener se invalida el tracker; el último snapshot se conserva
 sólo para diagnóstico del intento terminado.
 
-La clasificación no modifica `AsrPhase`. macOS y Windows siguen pasando a
-`transcribing` únicamente después de aceptar un resultado ASR no vacío. Un
-resultado ASR vacío no modifica la salud de captura. `audible` significa
-energía, no voz.
+La clasificación no modifica `AsrPhase`. En macOS, un resultado ASR se recorta
+antes de aceptarse: sólo texto no vacío publica `transcribing`. Un resultado
+vacío o whitespace es una inspección exitosa sin texto; confirma el cursor de
+esa ventana para no reintentarlo indefinidamente, mantiene la captura, evita el
+mensaje de texto actualizado y vuelve a `waitingForSpeech`. La salud de captura
+no se altera; `audible` significa energía, no voz.
 
 ## Voz/VAD diferido
 
@@ -114,14 +125,18 @@ explícitamente diferidos a Fase 3, tal como exige la SPEC.
 
 ## Evidencia ejecutada
 
-- `./scripts/pre-push.sh --with-tests`: build release macOS **PASS**; compiló
-  el tracker y las rutas de AudioTap nuevas.
-- Harness Swift aislado con toolchain local: **PASS (10 invariants)** para
-  awaiting/no-callback inicial, callback cero, silencio continuo, audible,
-  audible→silent, stall, A→B stale/fresh y ASR vacío.
-- La compilación de tests macOS llegó a `CaptureSignalHealthTests.swift`, pero
-  la suite no ejecutó por el error preexistente de
-  `CaptureNativeExecutionTests.swift:112`.
+- `./scripts/pre-push.sh --with-tests`: build release macOS, compilación Swift
+  estricta y suite completa **PASS (183 tests)**. Los skips reportados son gates
+  físicos/modelos existentes, no fallos de Fase 2A.
+- Focused Swift con toolchain local: **PASS (24 tests)**, incluyendo las diez
+  invariantes de salud, `emptyLiveAsrResultDoesNotPublishTranscribing`,
+  `acceptedLiveAsrResultPublishesTranscribing` y los tests de ejecución/cancelación
+  de captura nativa.
+- Gate AudioTap de micrófono: `MicFirstBufferGateTests` mantiene cobertura
+  determinista de que cero frames no abre el gate y frames reales, aun con
+  energía silenciosa, sí lo abren. La ejecución directa del paquete AudioTap
+  queda **SKIPPED — host CLT no expone XCTest compatible con este manifest**;
+  no se presenta como gate físico.
 - Tests Windows `CaptureSignalHealthTests.cs`: escritos, no ejecutados;
   `dotnet`, `csc`, `mcs`, `csi` y `msbuild` no están disponibles.
 - No se ejecutaron GitHub Actions, PRs, tags, releases ni gates físicos nuevos.

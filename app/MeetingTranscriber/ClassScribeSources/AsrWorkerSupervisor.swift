@@ -548,6 +548,11 @@ final class AsrWorkerSupervisor {
         if shouldRun {
             timer.resume()
         } else {
+            // `worker.start` can fail synchronously before this watchdog is
+            // installed. A newly-created DispatchSource starts suspended and
+            // must be resumed before cancellation, otherwise its release
+            // traps in libdispatch.
+            timer.resume()
             timer.cancel()
         }
     }

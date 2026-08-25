@@ -109,7 +109,7 @@ func slowNativeStopDoesNotBlockMainActor() async throws {
 
     // This statement is the control-plane continuation while the native owner
     // is still blocked on teardown.
-    let controlPlaneContinued = Thread.isMainThread
+    let controlPlaneContinued = await MainActor.run { true }
     #expect(controlPlaneContinued)
 
     release.signal()

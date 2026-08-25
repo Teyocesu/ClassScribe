@@ -1,5 +1,19 @@
 import Foundation
 
+/// Keeps an ASR result separate from capture signal health. Energy/audibility
+/// is not enough to publish `AsrPhase.transcribing`; the backend must return
+/// non-whitespace text accepted by this gate.
+enum LiveASRResultGate {
+    static func acceptedText(_ result: String) -> String? {
+        let clean = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        return clean.isEmpty ? nil : clean
+    }
+
+    static func shouldPublishTranscribing(_ result: String) -> Bool {
+        acceptedText(result) != nil
+    }
+}
+
 /// Advances only after an ASR window has produced a usable result. A failed
 /// inference therefore retries the exact same audio range instead of silently
 /// dropping 5.5 seconds of class content.

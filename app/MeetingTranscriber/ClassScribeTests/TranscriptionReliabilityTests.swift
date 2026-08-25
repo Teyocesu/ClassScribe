@@ -2,6 +2,18 @@
 import Foundation
 import Testing
 
+@Test
+func emptyLiveAsrResultDoesNotPublishTranscribing() {
+    #expect(LiveASRResultGate.acceptedText(" \n\t") == nil)
+    #expect(!LiveASRResultGate.shouldPublishTranscribing(" \n\t"))
+}
+
+@Test
+func acceptedLiveAsrResultPublishesTranscribing() {
+    #expect(LiveASRResultGate.acceptedText("  método científico  ") == "método científico")
+    #expect(LiveASRResultGate.shouldPublishTranscribing("  método científico  "))
+}
+
 private actor SingleFlightProbe {
     private(set) var calls = 0
     private var callWaiters: [CheckedContinuation<Void, Never>] = []

@@ -93,8 +93,16 @@ public sealed record CaptureSignalHealthSnapshot(
     double? ElapsedSinceLastCallback)
 {
     public bool HasReceivedCallbacks => CallbackCount > 0;
+}
 
-    public bool TransportIsHealthy => State is CaptureSignalState.Silent or CaptureSignalState.Audible;
+/// Separates observing a structured signal state from presenting its status.
+/// A state observed during startup is still presentable once recording begins.
+public static class CaptureSignalPresentationPolicy
+{
+    public static bool ShouldPresent(
+        CaptureSignalState state,
+        CaptureSignalState? lastPresentedState,
+        bool isRecording) => isRecording && state != lastPresentedState;
 }
 
 /// Thread-safe per-attempt classifier used by the WASAPI callback adapter.

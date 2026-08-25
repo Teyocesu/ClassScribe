@@ -124,15 +124,6 @@ struct CaptureSignalHealthSnapshot: Equatable, Sendable {
     var hasReceivedCallbacks: Bool {
         callbackCount > 0
     }
-
-    /// `silent` is healthy transport; only no callbacks is a capture-health
-    /// failure candidate. Audible intentionally does not mean voice/speech.
-    var transportIsHealthy: Bool {
-        switch state {
-        case .awaitingCallbacks, .noCallbacks: false
-        case .silent, .audible: true
-        }
-    }
 }
 
 /// Lock-protected health tracker owned by exactly one active attempt. The

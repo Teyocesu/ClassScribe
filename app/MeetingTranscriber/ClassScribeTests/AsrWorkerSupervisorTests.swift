@@ -10,6 +10,18 @@ private struct AsrSupervisorTestContext {
     let supervisor: AsrWorkerSupervisor
 }
 
+// The supervisor owns a locked serial state machine, but its public type does
+// not claim Sendable. Tests that intentionally await it from a child task use
+// this narrow reference wrapper instead of changing production concurrency
+// annotations.
+private final class AsrSupervisorReference: @unchecked Sendable {
+    let value: AsrWorkerSupervisor
+
+    init(_ value: AsrWorkerSupervisor) {
+        self.value = value
+    }
+}
+
 private func makeAsrSupervisor(
     scenario: AsrFakeWorkerScenario,
     configuration: AsrWorkerSupervisorConfiguration = .init(
@@ -152,7 +164,10 @@ func incompatibleProtocolRejected() {
 
     #expect(context.supervisor.terminalResult?.reason == .incompatibleProtocol)
     #expect(context.supervisor.state == .unavailableForSession)
-    #expect(context.worker.sentMessages.map(\.messageType) == [.hello, .shutdown])
+    // Protocol rejection is a terminal failure, so the supervisor detaches
+    // and terminates the worker directly; shutdown is reserved for graceful
+    // success/cancellation paths.
+    #expect(context.worker.sentMessages.map(\.messageType) == [.hello])
 }
 
 @Test("Un mensaje malformado no se interpreta como transcript")
@@ -180,7 +195,8 @@ func malformedRawFrameReachesSupervisor() {
 func transportFailureCompletesSupervisor() async {
     let context = makeAsrSupervisor(scenario: .delayedSuccess)
     context.supervisor.start()
-    let waiter = Task { await context.supervisor.waitForTerminal() }
+    let supervisor = AsrSupervisorReference(context.supervisor)
+    let waiter = Task { await supervisor.value.waitForTerminal() }
     context.worker.emitFault(.writeFailed("pipe closed"))
 
     let terminal = await waiter.value
@@ -306,8 +322,9 @@ func multipleWaitersReceiveSameTerminal() async {
     let context = makeAsrSupervisor(scenario: .delayedSuccess)
     context.supervisor.start()
 
-    let first = Task { await context.supervisor.waitForTerminal() }
-    let second = Task { await context.supervisor.waitForTerminal() }
+    let supervisor = AsrSupervisorReference(context.supervisor)
+    let first = Task { await supervisor.value.waitForTerminal() }
+    let second = Task { await supervisor.value.waitForTerminal() }
     await Task.yield()
     context.worker.completeSuccess(text: "shared result")
 

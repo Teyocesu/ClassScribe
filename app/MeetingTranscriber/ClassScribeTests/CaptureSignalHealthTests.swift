@@ -102,7 +102,7 @@ func silentCallbacksKeepStreamHealthy() {
 
     let snapshot = tracker.snapshot(for: attempt)
     #expect(snapshot?.state == .silent)
-    #expect(snapshot?.transportIsHealthy == true)
+    #expect(snapshot?.hasReceivedCallbacks == true)
     #expect(snapshot?.elapsedSinceLastCallback == 0)
 }
 
@@ -139,7 +139,7 @@ func audibleToSilentIsNotFailure() {
 
     let snapshot = tracker.snapshot(for: attempt)
     #expect(snapshot?.state == .silent)
-    #expect(snapshot?.transportIsHealthy == true)
+    #expect(snapshot?.hasReceivedCallbacks == true)
 }
 
 @Test

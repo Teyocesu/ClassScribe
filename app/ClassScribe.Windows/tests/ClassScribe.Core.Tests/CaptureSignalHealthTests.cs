@@ -6,6 +6,19 @@ namespace ClassScribe.Core.Tests;
 public sealed class CaptureSignalHealthTests
 {
     [TestMethod]
+    public void SignalObservedDuringStartupIsPresentedAfterRecordingBegins()
+    {
+        Assert.IsFalse(CaptureSignalPresentationPolicy.ShouldPresent(
+            CaptureSignalState.Silent,
+            CaptureSignalState.Silent,
+            isRecording: false));
+        Assert.IsTrue(CaptureSignalPresentationPolicy.ShouldPresent(
+            CaptureSignalState.Silent,
+            lastPresentedState: null,
+            isRecording: true));
+    }
+
+    [TestMethod]
     public void NoCallbackBeforeBudgetStaysAwaiting()
     {
         var clock = new FakeClock();
@@ -61,7 +74,7 @@ public sealed class CaptureSignalHealthTests
 
         var snapshot = tracker.Snapshot(attempt);
         Assert.AreEqual(CaptureSignalState.Silent, snapshot?.State);
-        Assert.IsTrue(snapshot?.TransportIsHealthy == true);
+        Assert.IsTrue(snapshot?.HasReceivedCallbacks == true);
     }
 
     [TestMethod]
@@ -91,7 +104,7 @@ public sealed class CaptureSignalHealthTests
 
         var snapshot = tracker.Snapshot(attempt);
         Assert.AreEqual(CaptureSignalState.Silent, snapshot?.State);
-        Assert.IsTrue(snapshot?.TransportIsHealthy == true);
+        Assert.IsTrue(snapshot?.HasReceivedCallbacks == true);
     }
 
     [TestMethod]

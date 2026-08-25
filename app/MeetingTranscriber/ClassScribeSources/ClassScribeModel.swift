@@ -1047,6 +1047,24 @@ final class ClassScribeModel {
                         resumeAtLatestWindow = true
                         continue
                     }
+                    guard let acceptedText = LiveASRResultGate.acceptedText(text) else {
+                        // Empty/whitespace ASR is a successful inspection of
+                        // this window, not a transcription result or a capture
+                        // failure. Commit the cursor so silence is not retried
+                        // forever, then keep the ASR axis waiting for speech.
+                        cursor.commit(windowEndingAt: windowEnd)
+                        retryPolicy.recordSuccess()
+                        if self.errorMessage == self.liveTranscriptionError {
+                            self.errorMessage = nil
+                        }
+                        self.liveTranscriptionError = nil
+                        self.state = .recording
+                        self.sessionPhase = .recording
+                        self.capturePhase = .recording
+                        self.asrPhase = .waitingForSpeech
+                        self.statusDetail = "La grabación continúa; esperando voz para actualizar la transcripción."
+                        continue
+                    }
                     let pause = pauseDuration >= 0.55
                     try Task.checkCancellation()
                     guard self.isCurrent(session), self.isRecording else { break }
@@ -1055,7 +1073,7 @@ final class ClassScribeModel {
                         continue
                     }
                     self.accumulator.accept(
-                        text,
+                        acceptedText,
                         start: window.start,
                         end: Double(windowEnd) / 16000,
                         confirmedByPause: pause,

@@ -2,7 +2,7 @@
 
 Fecha: 2026-08-24
 
-Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente** (runtime process-backed macOS **PASS**; runtime Windows **PENDING / SKIPPED — dotnet unavailable**); Fase 1C **ARCHITECTURE APPROVED** (CATap subsystem físico macOS **PASS**; micrófono macOS physical gate pending — TCC; Windows physical/runtime gate pending; process isolation **INCONCLUSIVE / evidence-gated**, no requerida por la evidencia actual). La arquitectura de Fase 1 está **APPROVED**; los physical release gates permanecen pendientes; Fase 2A **PARTIAL** y Fases 2B–2F **NOT STARTED**.
+Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente** (runtime process-backed macOS **PASS**; runtime Windows **PENDING / SKIPPED — dotnet unavailable**); Fase 1C **ARCHITECTURE APPROVED** (CATap subsystem físico macOS **PASS**; micrófono macOS physical gate pending — TCC; Windows physical/runtime gate pending; process isolation **INCONCLUSIVE / evidence-gated**, no requerida por la evidencia actual). La arquitectura de Fase 1 está **APPROVED**; los physical release gates permanecen pendientes; Fase 2A **FIXED / PARTIAL** y Fases 2B–2F **NOT STARTED**.
 SPEC canónica: [`docs/specs/v0.8.0.md`](docs/specs/v0.8.0.md)
 
 Este documento es mutable: ordena trabajo pequeño y verificable. No redefine requisitos. Cada fase se valida localmente con el patrón `focused → subsystem`; los gates con TCC, hardware, llamada real o Windows físico están definidos en la SPEC.
@@ -58,7 +58,7 @@ porque `dotnet` no está instalado. El detalle reproducible existente está en
 
 ## Fase 2 — Captura confiable y audio del equipo
 
-Estado: **FASE 2A PARTIAL**; el resto de Fase 2 permanece **NOT STARTED**.
+Estado: **FASE 2A FIXED / PARTIAL**; el resto de Fase 2 permanece **NOT STARTED**.
 
 Objetivo: diferenciar transporte/señal y agregar global con consentimiento explícito y master fiel.
 
@@ -75,7 +75,7 @@ Objetivo: diferenciar transporte/señal y agregar global con consentimiento expl
 
 Exit gate: los tests prueban que global es inalcanzable sin consentimiento; fixtures/gates físicos demuestran señal, PID lifecycle, master fidelity y recuperación.
 
-Caracterización de Fase 2A: [`docs/characterization/fase-2a-signal-health.md`](docs/characterization/fase-2a-signal-health.md). El build release macOS y el harness focalizado de salud pasan; la suite completa de Swift queda bloqueada por un diagnóstico preexistente en `CaptureNativeExecutionTests.swift:112` con Swift 6 estricto. Las pruebas Windows quedaron escritas, pero no se ejecutaron porque este host no tiene `dotnet`. No se modificaron los gates físicos de Fase 1 ni se ejecutaron GitHub Actions.
+Caracterización de Fase 2A: [`docs/characterization/fase-2a-signal-health.md`](docs/characterization/fase-2a-signal-health.md). Los hallazgos de revisión están corregidos; el build release, la compilación Swift estricta y la suite completa pasan (183 tests), con skips sólo de gates físicos/modelos condicionados. El focused relevante también pasa. Las pruebas Windows quedaron escritas, pero no se ejecutaron porque este host no tiene `dotnet`. No se modificaron los gates físicos de Fase 1 ni se ejecutaron GitHub Actions.
 
 ## Fase 3 — ASR cancelable, backlog e idioma
 

@@ -635,16 +635,22 @@ final class CaptureController {
                 let capture = MicCaptureHandler(outputURL: sourceURL, debugLogging: true, liveSink: sink)
                 try capture.start(deviceUID: microphone.id)
                 do {
-                    _ = try await waitForFirstCallbacks(
-                        after: 0,
-                        timeout: Self.microphoneFirstBufferTimeout,
-                        cancellation: startCancellation,
-                    )
-                    try Task.checkCancellation()
+                    // Signal health observes every callback, including an
+                    // empty callback, but publication still requires the
+                    // legacy durability gate: real frames written to the WAV.
+                    // Keep the attempt-owned cancellation wake while using
+                    // the legacy durability gate. The gate only succeeds
+                    // after real frames have reached the WAV writer.
+                    _ = try await CaptureFirstSampleRace.wait(cancellation: startCancellation) {
+                        try await capture.waitForFirstBuffer(
+                            timeout: Self.microphoneFirstBufferTimeout,
+                        )
+                        return 1
+                    }
                 } catch {
                     // This legacy mic path remains MainActor-owned while its
-                    // physical gate is TCC-blocked; preserve its existing
-                    // deterministic cleanup until it gets its own gate.
+                    // physical gate is TCC-blocked. Preserve terminalError
+                    // and first-buffer diagnostics from waitForFirstBuffer().
                     capture.stop()
                     throw error
                 }
