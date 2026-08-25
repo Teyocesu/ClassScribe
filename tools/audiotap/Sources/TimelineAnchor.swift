@@ -14,9 +14,9 @@ import Foundation
 ///
 /// Survives restarts: it is anchored once on the first buffer and never reset, so
 /// the gap between the last pre-restart buffer and the first post-restart buffer
-/// is bridged automatically. Not thread-safe — drive it from the single capture
-/// callback context.
-struct TimelineAnchor {
+/// is bridged automatically. The session owns one instance across source
+/// incarnations; each AppAudioCapture generation receives the same reference.
+public final class TimelineAnchor: @unchecked Sendable {
     let rate: Int
     private var anchorHostSeconds: Double?
     private var framesWritten = 0
@@ -36,7 +36,7 @@ struct TimelineAnchor {
     /// carrying `frameCount` frames, to keep the written stream aligned to
     /// wall-clock. The first call sets the anchor and inserts nothing. Never
     /// negative — an early/jittered timestamp just appends.
-    mutating func silenceFramesBefore(hostSeconds: Double, frameCount: Int) -> Int {
+    func silenceFramesBefore(hostSeconds: Double, frameCount: Int) -> Int {
         guard let anchor = anchorHostSeconds else {
             anchorHostSeconds = hostSeconds
             framesWritten = frameCount

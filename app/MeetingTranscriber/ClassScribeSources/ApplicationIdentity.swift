@@ -167,6 +167,51 @@ struct MacApplicationStartupPlan: Equatable, Sendable {
     var translatedTargetPIDs: [pid_t] { result.translatedTargetPIDs }
 }
 
+enum MacApplicationRebindDecision: Equatable, Sendable {
+    case noChange
+    case rebind
+    case preserveCurrent
+    case unsupportedWeakIdentity
+}
+
+/// Pure policy for a mid-recording reconciliation. AudioObject/PID ordering is
+/// not identity: only the set of validated target objects and the strong root
+/// incarnation can trigger a rebind. Missing/ambiguous observations preserve
+/// the current tap, while weak identities never auto-rebind.
+enum MacApplicationRebindPolicy {
+    static func decide(
+        selectedIdentity: ApplicationIdentity,
+        currentRootPID: pid_t,
+        currentTargetPIDs: [pid_t],
+        resolution: ApplicationResolutionResult,
+        signalState: CaptureSignalState = .silent,
+    ) -> MacApplicationRebindDecision {
+        guard selectedIdentity.strength == .strong else {
+            return .unsupportedWeakIdentity
+        }
+        guard resolution.state == .resolved,
+              let resolvedPID = resolution.resolvedPID,
+              !resolution.translatedTargetPIDs.isEmpty else {
+            // A transient missing/ambiguous view is recoverable and must not
+            // tear down a currently healthy source.
+            return .preserveCurrent
+        }
+
+        let currentTargets = Set(currentTargetPIDs)
+        let observedTargets = Set(resolution.translatedTargetPIDs)
+        let rootChanged = resolvedPID != currentRootPID
+        let targetSetChanged = currentTargets != observedTargets
+        if rootChanged || targetSetChanged {
+            return .rebind
+        }
+        // `signalState` is intentionally consumed only to document the
+        // no-callback recovery rule: a same-topology source remains the same
+        // source even while a bounded recovery probe is in progress.
+        _ = signalState
+        return .noChange
+    }
+}
+
 /// Owns a detached startup reconciliation task. Cancellation of the caller
 /// must cancel the detached task as well; otherwise the caller can stop
 /// waiting while reconciliation continues without an owner.

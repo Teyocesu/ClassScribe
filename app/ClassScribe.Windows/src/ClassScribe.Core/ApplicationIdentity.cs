@@ -219,8 +219,10 @@ public sealed class WindowsApplicationResolutionException : InvalidOperationExce
     public WindowsApplicationResolution Resolution { get; }
 }
 
-/// Startup-only boundary. There is intentionally no API that swaps the PID of
-/// an already-running recorder; 2B.2 owns that future lifecycle work.
+/// Startup and source-generation build boundaries. The attempt gate protects
+/// session ownership; the source-generation overload additionally protects a
+/// mid-recording rebind from reaching `WithProcessLoopback` after its source
+/// has been superseded.
 public static class WindowsApplicationStartup
 {
     public static async Task<int> ResolveBeforeBuildAsync(
@@ -268,6 +270,33 @@ public static class WindowsApplicationStartup
 
         cancellationToken.ThrowIfCancellationRequested();
         if (!isCurrentAttempt(attempt))
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+
+        return await buildAsync().ConfigureAwait(false);
+    }
+
+    public static async Task<T> BuildProcessLoopbackIfCurrentSourceGenerationAsync<T>(
+        SessionAttemptID attempt,
+        CaptureSourceGeneration generation,
+        Func<SessionAttemptID, CaptureSourceGeneration, bool> isCurrentSourceGeneration,
+        Func<Task<T>> buildAsync,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(attempt);
+        ArgumentNullException.ThrowIfNull(generation);
+        ArgumentNullException.ThrowIfNull(isCurrentSourceGeneration);
+        ArgumentNullException.ThrowIfNull(buildAsync);
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!isCurrentSourceGeneration(attempt, generation))
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!isCurrentSourceGeneration(attempt, generation))
         {
             throw new OperationCanceledException(cancellationToken);
         }

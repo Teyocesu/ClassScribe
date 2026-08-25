@@ -452,6 +452,8 @@ final class CaptureController {
     let liveStore = LiveAudioBufferStore()
     private let nativeExecutor = CaptureNativeExecutor()
     private let attemptGate = CaptureAttemptGate()
+    private let sourceGenerationGate = CaptureSourceGenerationGate()
+    private let rebindCoordinator = CaptureRebindCoordinator()
     private let microphoneCaptureOwner = CaptureStartupResourceOwner<MicCaptureHandler> { $0.stop() }
     private var microphoneCapture: MicCaptureHandler? {
         microphoneCaptureOwner.ownedResource
@@ -470,7 +472,17 @@ final class CaptureController {
     private var liveBufferContinuation: AsyncStream<LiveAudioBuffer>.Continuation?
     private var liveBufferTask: Task<Void, Never>?
     private var activeCaptureGeneration: UUID?
+    private var activeSourceGeneration: CaptureSourceGeneration?
     private var onlineRootPID: pid_t?
+    private var onlineSelectedIdentity: ApplicationIdentity?
+    private var onlineTargetPIDs: Set<pid_t> = []
+    private var onlineProbeTask: Task<Void, Never>?
+    private var onlineRebindTask: Task<Void, Never>?
+    private var onlineProbeToken: UUID?
+    private var onlineRebindToken: UUID?
+    private var lastOnlineProbeUptime: TimeInterval = 0
+    private var onlineRecoveryDeadline: TimeInterval?
+    private var onlineRebindFailureCount = 0
     private var signalHealthTracker: CaptureSignalHealthTracker?
 
     var isBusy: Bool {
@@ -550,7 +562,17 @@ final class CaptureController {
         try Task.checkCancellation()
         guard activeAttempt == attempt else { throw CancellationError() }
         activeCaptureGeneration = nil
+        activeSourceGeneration = nil
         onlineRootPID = nil
+        onlineSelectedIdentity = nil
+        onlineTargetPIDs = []
+        onlineProbeTask?.cancel()
+        onlineProbeTask = nil
+        onlineRebindTask?.cancel()
+        onlineRebindTask = nil
+        lastOnlineProbeUptime = 0
+        onlineRecoveryDeadline = nil
+        onlineRebindFailureCount = 0
         let sourceURL = folder.appendingPathComponent("source.wav")
         // The pump normally drains far faster than real time. A generous bound
         // still prevents unbounded memory if the process is heavily starved;
@@ -655,11 +677,30 @@ final class CaptureController {
                 try Task.checkCancellation()
                 guard activeAttempt == attempt else { throw CancellationError() }
                 let rawURL = folder.appendingPathComponent("source.raw")
+                let sourceGeneration = sourceGenerationGate.begin(attempt)
+                let callbackSourceGate = sourceGenerationGate
+                let sourceCallbackGate: @Sendable () -> Bool = {
+                    callbackSourceGate.accepts(attempt, generation: sourceGeneration)
+                }
+                let applicationSink: LiveAudioSink = { buffer in
+                    guard callbackAttemptGate.accepts(attempt),
+                          callbackSourceGate.accepts(attempt, generation: sourceGeneration)
+                    else { return }
+                    _ = signalTracker.recordCallback(
+                        for: attempt,
+                        measurement: CaptureSignalMeasurement(
+                            samples: buffer.samples,
+                            channelCount: buffer.channelCount,
+                        ),
+                    )
+                    _ = liveContinuation.yield(buffer)
+                }
                 let elapsed = Double(
                     DispatchTime.now().uptimeNanoseconds - reconciliationStarted,
                 ) / 1_000_000_000
                 let nativeStart = nativeExecutor.beginApplicationStart(
                     attempt: attempt,
+                    sourceGeneration: sourceGeneration,
                     rootPID: rootPID,
                     pids: startupPlan.topologyPIDs,
                     outputURL: rawURL,
@@ -668,7 +709,8 @@ final class CaptureController {
                     // performs its own immediate revalidation just before
                     // CATapDescription is constructed.
                     registrationTimeout: max(0, Self.onlineProcessRegistrationTimeout - elapsed),
-                    liveSink: sink,
+                    liveSink: applicationSink,
+                    sourceCallbackGate: sourceCallbackGate,
                 )
                 nativeStartWork = nativeStart
                 observeNativeCompletion(nativeStart, kind: .start)
@@ -684,6 +726,10 @@ final class CaptureController {
                 guard activeAttempt == attempt else { throw CancellationError() }
                 rawOnlineURL = rawURL
                 onlineRootPID = rootPID
+                onlineSelectedIdentity = selectedIdentity
+                onlineTargetPIDs = Set(startupPlan.translatedTargetPIDs)
+                activeSourceGeneration = sourceGeneration
+                onlineRecoveryDeadline = nil
                 activeCaptureGeneration = liveGeneration
 
             case .inPerson:
@@ -748,6 +794,12 @@ final class CaptureController {
             let lastHealth = signalTracker.snapshot(for: attempt)
             signalTracker.invalidate(attempt)
             signalHealth = lastHealth
+            sourceGenerationGate.invalidate(attempt)
+            rebindCoordinator.cancel(attempt)
+            onlineProbeTask?.cancel()
+            onlineProbeTask = nil
+            onlineRebindTask?.cancel()
+            onlineRebindTask = nil
             if let currentTracker = signalHealthTracker, currentTracker === signalTracker {
                 signalHealthTracker = nil
             }
@@ -755,7 +807,10 @@ final class CaptureController {
                 activeAttempt = nil
                 attemptGate.invalidate(attempt)
                 activeCaptureGeneration = nil
+                activeSourceGeneration = nil
                 onlineRootPID = nil
+                onlineSelectedIdentity = nil
+                onlineTargetPIDs = []
             }
             let nativeStop = requestNativeStop(for: attempt)
             await nativeStop.waitForCompletion()
@@ -770,13 +825,22 @@ final class CaptureController {
         guard isStarting, activeAttempt == attempt else { return }
         activeAttempt = nil
         attemptGate.invalidate(attempt)
+        sourceGenerationGate.invalidate(attempt)
+        rebindCoordinator.cancel(attempt)
         startCancellation?.cancel()
         nativeStartWork?.cancel()
         signalHealthTracker?.invalidate(attempt)
         signalHealth = nil
         signalHealthTracker = nil
         activeCaptureGeneration = nil
+        activeSourceGeneration = nil
         onlineRootPID = nil
+        onlineSelectedIdentity = nil
+        onlineTargetPIDs = []
+        onlineProbeTask?.cancel()
+        onlineProbeTask = nil
+        onlineRebindTask?.cancel()
+        onlineRebindTask = nil
         levelTimer?.invalidate()
         levelTimer = nil
         stopLiveBufferPump()
@@ -805,10 +869,19 @@ final class CaptureController {
             }
             activeAttempt = nil
             attemptGate.invalidate(stoppedAttempt)
+            sourceGenerationGate.invalidate(stoppedAttempt)
+            rebindCoordinator.cancel(stoppedAttempt)
         }
         signalHealthTracker = nil
         activeCaptureGeneration = nil
+        activeSourceGeneration = nil
         onlineRootPID = nil
+        onlineSelectedIdentity = nil
+        onlineTargetPIDs = []
+        onlineProbeTask?.cancel()
+        onlineProbeTask = nil
+        onlineRebindTask?.cancel()
+        onlineRebindTask = nil
         levelTimer?.invalidate()
         levelTimer = nil
         let rawToWrap = rawOnlineURL
@@ -921,13 +994,6 @@ final class CaptureController {
                 if let tracker = self.signalHealthTracker,
                    let signal = tracker.snapshot(for: attempt) {
                     self.signalHealth = signal
-                    // A callback stall is a capture-health failure candidate;
-                    // silent callbacks remain healthy and never enter this
-                    // branch.
-                    if signal.state == .noCallbacks {
-                        self.reportTerminalFailure(CaptureError.captureCallbacksStalled.localizedDescription)
-                        return
-                    }
                 }
                 if self.onlineRootPID != nil {
                     let snapshot = await self.nativeExecutor.levelSnapshot(for: attempt)
@@ -937,6 +1003,7 @@ final class CaptureController {
                     else { return }
                     self.levelDBFS = snapshot.levelDBFS
                     self.checkOnlineFrameProgress(for: attempt)
+                    self.scheduleApplicationProbe(for: attempt)
                 } else if let microphoneCapture = self.microphoneCapture {
                     if let error = microphoneCapture.terminalError {
                         self.terminateMicrophoneCapture(error.localizedDescription)
@@ -954,7 +1021,278 @@ final class CaptureController {
               activeAttempt == attempt
         else { return }
         if let onlineRootPID, !Self.processIsRunning(onlineRootPID) {
-            reportTerminalFailure(CaptureError.applicationAudioStopped.localizedDescription)
+            scheduleApplicationProbe(for: attempt, forcedSignalState: .noCallbacks)
+        }
+    }
+
+    private func scheduleApplicationProbe(
+        for attempt: SessionAttemptID,
+        forcedSignalState: CaptureSignalState? = nil,
+    ) {
+        guard isCapturing,
+              activeAttempt == attempt,
+              let selectedIdentity = onlineSelectedIdentity,
+              let previousPID = onlineRootPID,
+              onlineRebindTask == nil,
+              onlineProbeTask == nil
+        else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastOnlineProbeUptime < 1.0 {
+            return
+        }
+        lastOnlineProbeUptime = now
+        let probeToken = UUID()
+        onlineProbeToken = probeToken
+        let currentRootPID = previousPID
+        let currentTargets = Array(onlineTargetPIDs)
+        let signalState = forcedSignalState
+            ?? signalHealthTracker?.snapshot(for: attempt)?.state
+            ?? .silent
+        if signalState == .noCallbacks, onlineRecoveryDeadline == nil {
+            onlineRecoveryDeadline = now + 6
+        }
+
+        let probeTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.onlineProbeToken == probeToken {
+                    self.onlineProbeTask = nil
+                    self.onlineProbeToken = nil
+                }
+            }
+            guard let self else { return }
+            do {
+                let plan = try await self.reconcileApplication(
+                    selectedIdentity: selectedIdentity,
+                    previousPID: previousPID,
+                    attempt: attempt,
+                    timeout: 1.0,
+                )
+                guard self.isCapturing,
+                      self.activeAttempt == attempt,
+                      self.attemptGate.accepts(attempt),
+                      self.onlineProbeToken == probeToken
+                else { return }
+                let decision = MacApplicationRebindPolicy.decide(
+                    selectedIdentity: selectedIdentity,
+                    currentRootPID: currentRootPID,
+                    currentTargetPIDs: currentTargets,
+                    resolution: plan.result,
+                    signalState: signalState,
+                )
+                switch decision {
+                case .rebind:
+                    self.beginApplicationRebind(
+                        plan: plan,
+                        attempt: attempt,
+                        signalState: signalState,
+                    )
+                case .preserveCurrent, .noChange, .unsupportedWeakIdentity:
+                    if signalState == .noCallbacks,
+                       let deadline = self.onlineRecoveryDeadline,
+                       ProcessInfo.processInfo.systemUptime >= deadline {
+                        self.reportTerminalFailure(CaptureError.captureCallbacksStalled.localizedDescription)
+                    }
+                }
+            } catch {
+                guard self.isCapturing,
+                      self.activeAttempt == attempt,
+                      self.onlineProbeToken == probeToken
+                else { return }
+                if signalState == .noCallbacks,
+                   let deadline = self.onlineRecoveryDeadline,
+                   ProcessInfo.processInfo.systemUptime >= deadline {
+                    self.reportTerminalFailure(CaptureError.applicationAudioStopped.localizedDescription)
+                }
+            }
+        }
+        if onlineProbeToken == probeToken {
+            onlineProbeTask = probeTask
+        }
+    }
+
+    private func reconcileApplication(
+        selectedIdentity: ApplicationIdentity,
+        previousPID: pid_t,
+        attempt: SessionAttemptID,
+        timeout: TimeInterval,
+    ) async throws -> MacApplicationStartupPlan {
+        let callbackAttemptGate = attemptGate
+        let reconciliationTask = Task.detached(priority: .userInitiated) {
+            try await MacApplicationStartupReconciler.reconcile(
+                selectedIdentity: selectedIdentity,
+                previousPID: previousPID,
+                attempt: attempt,
+                timeout: timeout,
+                pollInterval: 0.05,
+                candidates: {
+                    var observed = MacApplicationIdentityResolver.liveCandidates(excluding: getpid())
+                    if selectedIdentity.strength == .weak,
+                       Self.processIsRunning(previousPID),
+                       !observed.contains(where: { $0.pid == previousPID }) {
+                        observed.append(MacApplicationProcessSnapshot(
+                            pid: previousPID,
+                            identity: selectedIdentity,
+                            displayName: "selected-source",
+                        ))
+                    }
+                    return observed
+                },
+                topology: { candidate in
+                    if let bundleURL = candidate.identity.bundleURL {
+                        return ProcessTreeEnumerator.pidsRooted(in: bundleURL)
+                    }
+                    if let executableURL = candidate.identity.executableURL {
+                        return ProcessTreeEnumerator.pidsRooted(inExecutableURL: executableURL)
+                    }
+                    return []
+                },
+                translatedTargets: { pids in
+                    AppAudioCapture.validatedAudioProcessPIDs(in: pids)
+                },
+                isCurrentAttempt: { callbackAttemptGate.accepts($0) },
+            )
+        }
+        return try await MacApplicationStartupTask.value(of: reconciliationTask)
+    }
+
+    private func beginApplicationRebind(
+        plan: MacApplicationStartupPlan,
+        attempt: SessionAttemptID,
+        signalState: CaptureSignalState,
+    ) {
+        guard rebindCoordinator.begin(attempt),
+              onlineRebindTask == nil,
+              let oldGeneration = activeSourceGeneration,
+              let selectedIdentity = onlineSelectedIdentity,
+              let cancellation = startCancellation,
+              let liveContinuation = liveBufferContinuation,
+              let oldRootPID = onlineRootPID
+        else { return }
+
+        let rebindToken = UUID()
+        onlineRebindToken = rebindToken
+        let oldTargets = Array(onlineTargetPIDs)
+        onlineRebindTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.onlineRebindToken == rebindToken {
+                    self.rebindCoordinator.end(attempt)
+                    self.onlineRebindTask = nil
+                    self.onlineRebindToken = nil
+                }
+            }
+            guard let self else { return }
+            do {
+                let initialDecision = MacApplicationRebindPolicy.decide(
+                    selectedIdentity: selectedIdentity,
+                    currentRootPID: oldRootPID,
+                    currentTargetPIDs: oldTargets,
+                    resolution: plan.result,
+                    signalState: signalState,
+                )
+                guard initialDecision == .rebind,
+                      let nextGeneration = self.sourceGenerationGate.advance(attempt)
+                else { return }
+                self.activeSourceGeneration = nextGeneration
+
+                let stopOld = self.nativeExecutor.beginApplicationSourceStop(
+                    attempt: attempt,
+                    sourceGeneration: oldGeneration,
+                )
+                try await stopOld.value()
+                guard self.isCapturing,
+                      self.activeAttempt == attempt,
+                      self.attemptGate.accepts(attempt),
+                      self.rebindCoordinator.canPublish(attempt),
+                      self.onlineRebindToken == rebindToken
+                else { return }
+
+                // Re-resolve after the old tap has drained. This is the
+                // handoff gate immediately before CATap construction.
+                let refreshed = try await self.reconcileApplication(
+                    selectedIdentity: selectedIdentity,
+                    previousPID: oldRootPID,
+                    attempt: attempt,
+                    timeout: Self.onlineProcessRegistrationTimeout,
+                )
+                let refreshedDecision = MacApplicationRebindPolicy.decide(
+                    selectedIdentity: selectedIdentity,
+                    currentRootPID: oldRootPID,
+                    currentTargetPIDs: oldTargets,
+                    resolution: refreshed.result,
+                    signalState: signalState,
+                )
+                guard refreshedDecision == .rebind,
+                      let rootPID = refreshed.rootPID,
+                      !refreshed.topologyPIDs.isEmpty,
+                      !refreshed.translatedTargetPIDs.isEmpty
+                else {
+                    throw CaptureError.applicationAudioUnavailable
+                }
+
+                let freshTracker = CaptureSignalHealthTracker(
+                    attempt: attempt,
+                    thresholds: .macOSApplication,
+                )
+                self.signalHealthTracker = freshTracker
+                self.signalHealth = freshTracker.snapshot(for: attempt)
+                let callbackSourceGate = self.sourceGenerationGate
+                let callbackAttemptGate = self.attemptGate
+                let sourceCallbackGate: @Sendable () -> Bool = {
+                    callbackSourceGate.accepts(attempt, generation: nextGeneration)
+                }
+                let applicationSink: LiveAudioSink = { buffer in
+                    guard callbackAttemptGate.accepts(attempt),
+                          callbackSourceGate.accepts(attempt, generation: nextGeneration)
+                    else { return }
+                    _ = freshTracker.recordCallback(
+                        for: attempt,
+                        measurement: CaptureSignalMeasurement(
+                            samples: buffer.samples,
+                            channelCount: buffer.channelCount,
+                        ),
+                    )
+                    _ = liveContinuation.yield(buffer)
+                }
+                let baseline = await self.liveStore.callbackCount()
+                let nativeRebind = self.nativeExecutor.beginApplicationRebind(
+                    attempt: attempt,
+                    sourceGeneration: nextGeneration,
+                    rootPID: rootPID,
+                    pids: refreshed.topologyPIDs,
+                    registrationTimeout: Self.onlineProcessRegistrationTimeout,
+                    liveSink: applicationSink,
+                    sourceCallbackGate: sourceCallbackGate,
+                )
+                try await nativeRebind.value()
+                _ = try await self.waitForFirstCallbacks(
+                    after: baseline,
+                    timeout: Self.onlineFirstBufferTimeout,
+                    cancellation: cancellation,
+                )
+                guard self.isCapturing,
+                      self.activeAttempt == attempt,
+                      self.attemptGate.accepts(attempt),
+                      self.sourceGenerationGate.accepts(attempt, generation: nextGeneration),
+                      self.rebindCoordinator.canPublish(attempt),
+                      self.onlineRebindToken == rebindToken
+                else { return }
+                self.onlineRootPID = rootPID
+                self.onlineTargetPIDs = Set(refreshed.translatedTargetPIDs)
+                self.activeSourceGeneration = nextGeneration
+                self.onlineRecoveryDeadline = nil
+                self.onlineRebindFailureCount = 0
+            } catch {
+                guard self.isCapturing,
+                      self.activeAttempt == attempt,
+                      self.rebindCoordinator.canPublish(attempt),
+                      self.onlineRebindToken == rebindToken
+                else { return }
+                self.onlineRebindFailureCount += 1
+                if self.onlineRebindFailureCount >= 2 {
+                    self.reportTerminalFailure(CaptureError.applicationAudioUnavailable.localizedDescription)
+                }
+            }
         }
     }
 

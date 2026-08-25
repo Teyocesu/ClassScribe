@@ -318,13 +318,18 @@ final class CaptureNativeExecutor: @unchecked Sendable {
 
     func beginApplicationStart(
         attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
         rootPID: pid_t,
         pids: [pid_t],
         outputURL: URL,
         registrationTimeout: TimeInterval,
         liveSink: @escaping LiveAudioSink,
+        sourceCallbackGate: @escaping @Sendable () -> Bool,
     ) -> CaptureNativeWork<Void> {
         submit(attempt: attempt) { [self] work in
+            guard sourceGeneration.attempt == attempt else {
+                throw CancellationError()
+            }
             let deadline = DispatchTime.now().uptimeNanoseconds
                 + UInt64(max(0, registrationTimeout) * 1_000_000_000)
             while !work.isCancellationRequested {
@@ -346,6 +351,7 @@ final class CaptureNativeExecutor: @unchecked Sendable {
                 appOutputURL: outputURL,
                 micOutputURL: nil,
                 appLiveSink: liveSink,
+                appCallbackGate: sourceCallbackGate,
             )
             do {
                 try session.start()
@@ -359,6 +365,72 @@ final class CaptureNativeExecutor: @unchecked Sendable {
             applicationSessions[attempt] = session
             if work.isCancellationRequested {
                 _ = applicationSessions.removeValue(forKey: attempt)?.stop()
+                throw CancellationError()
+            }
+        }
+    }
+
+    /// Stops the current CATap generation while retaining the session-owned
+    /// `source.raw` descriptor and timeline. The serial queue guarantees that
+    /// the old IOProc is fully drained before a rebind build can begin.
+    func beginApplicationSourceStop(
+        attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
+    ) -> CaptureNativeWork<Void> {
+        submit(attempt: attempt) { [self] work in
+            guard sourceGeneration.attempt == attempt,
+                  applicationSessions[attempt] != nil else {
+                throw CancellationError()
+            }
+            try Self.checkCancellation(work)
+            applicationSessions[attempt]?.stopApplicationCapture()
+        }
+    }
+
+    /// Builds the next CATap generation against the already-open session file.
+    /// Registration is revalidated immediately before native construction and
+    /// cancellation after construction stops the new generation without
+    /// publishing it to the session owner.
+    func beginApplicationRebind(
+        attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
+        rootPID: pid_t,
+        pids: [pid_t],
+        registrationTimeout: TimeInterval,
+        liveSink: @escaping LiveAudioSink,
+        sourceCallbackGate: @escaping @Sendable () -> Bool,
+    ) -> CaptureNativeWork<Void> {
+        submit(attempt: attempt) { [self] work in
+            guard sourceGeneration.attempt == attempt,
+                  let session = applicationSessions[attempt] else {
+                throw CancellationError()
+            }
+            let deadline = DispatchTime.now().uptimeNanoseconds
+                + UInt64(max(0, registrationTimeout) * 1_000_000_000)
+            while !work.isCancellationRequested {
+                if AppAudioCapture.hasRegisteredAudioProcess(in: pids) {
+                    break
+                }
+                guard Self.processIsRunning(rootPID) else {
+                    throw CaptureError.noProcesses
+                }
+                guard DispatchTime.now().uptimeNanoseconds < deadline else {
+                    throw CaptureError.applicationAudioUnavailable
+                }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            try Self.checkCancellation(work)
+            do {
+                try session.replaceApplicationCapture(
+                    pids: pids,
+                    liveSink: liveSink,
+                    callbackGate: sourceCallbackGate,
+                )
+            } catch {
+                throw error
+            }
+            if work.isCancellationRequested {
+                session.stopApplicationCapture()
                 throw CancellationError()
             }
         }

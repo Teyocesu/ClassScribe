@@ -7,7 +7,7 @@ private let logger = Logger(subsystem: "com.meetingtranscriber.audiotap", catego
 /// Replaces the CLI entry point — call `start()` and `stop()` directly from the host app.
 @available(macOS 14.2, *)
 public class AudioCaptureSession {
-    private let pids: [pid_t]
+    private var pids: [pid_t]
     private let sampleRate: Int
     private let channels: Int
     private let appOutputURL: URL
@@ -15,6 +15,7 @@ public class AudioCaptureSession {
     private let micDeviceUID: String?
     private let debugLogging: Bool
     private let appLiveSink: LiveAudioSink?
+    private let appCallbackGate: (@Sendable () -> Bool)?
     private let micLiveSink: LiveAudioSink?
     // Inert in production (nil); an e2e build injects one to verify the mic
     // installTap NSException recovery (issue #379). Forwarded to MicCaptureHandler.
@@ -23,6 +24,10 @@ public class AudioCaptureSession {
     private var appCapture: AppAudioCapture?
     private var micCapture: MicCaptureHandler?
     private var appFileHandle: FileHandle?
+    private let appTimelineAnchor = TimelineAnchor(rate: Int(speechSampleRate))
+    private var appFirstFrameTicks: UInt64 = 0
+    private var appOutputSampleRate = 0
+    private var appOutputChannels = 0
 
     /// - Parameter pids: PIDs to capture audio from. For Electron/WebView2
     ///   apps (Teams 2.x, Slack, Discord) this should include the root PID
@@ -43,6 +48,7 @@ public class AudioCaptureSession {
         micDeviceUID: String? = nil,
         debugLogging: Bool = false,
         appLiveSink: LiveAudioSink? = nil,
+        appCallbackGate: (@Sendable () -> Bool)? = nil,
         micLiveSink: LiveAudioSink? = nil,
         micDebugFault: DebugTapFault? = nil,
     ) {
@@ -54,6 +60,7 @@ public class AudioCaptureSession {
         self.micDeviceUID = micDeviceUID
         self.debugLogging = debugLogging
         self.appLiveSink = appLiveSink
+        self.appCallbackGate = appCallbackGate
         self.micLiveSink = micLiveSink
         self.micDebugFault = micDebugFault
     }
@@ -68,23 +75,18 @@ public class AudioCaptureSession {
             attributes: [.posixPermissions: 0o600],
         )
         let handle = try FileHandle(forWritingTo: appOutputURL)
-
-        let capture = AppAudioCapture(
-            pids: pids,
-            outputFileDescriptor: handle.fileDescriptor,
-            sampleRate: sampleRate,
-            channels: channels,
-            debugLogging: debugLogging,
-            liveSink: appLiveSink,
-        )
+        appFileHandle = handle
         do {
-            try capture.start()
+            try startApplicationCapture(
+                pids: pids,
+                liveSink: appLiveSink,
+                callbackGate: appCallbackGate,
+            )
         } catch {
             try? handle.close()
+            appFileHandle = nil
             throw error
         }
-        appFileHandle = handle
-        appCapture = capture
 
         // Start mic capture if requested
         if let micURL = micOutputURL {
@@ -105,6 +107,88 @@ public class AudioCaptureSession {
         logger.info("Capture session started (PIDs \(self.pids), rate: \(self.sampleRate), channels: \(self.channels))")
     }
 
+    /// Replaces only the native application source. The session-owned file
+    /// descriptor, timeline anchor, and live store remain untouched. The old
+    /// CATap is synchronously stopped and its IOProc queue drained by
+    /// `AppAudioCapture.stop()` before the new tap is started.
+    public func replaceApplicationCapture(
+        pids: [pid_t],
+        liveSink: LiveAudioSink?,
+        callbackGate: (@Sendable () -> Bool)?,
+    ) throws {
+        guard let handle = appFileHandle else {
+            throw NSError(
+                domain: "audiotap", code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Capture session has no durable app output"],
+            )
+        }
+        stopApplicationCapture()
+        self.pids = pids
+        do {
+            try startApplicationCapture(
+                pids: pids,
+                liveSink: liveSink,
+                callbackGate: callbackGate,
+            )
+        } catch {
+            // The existing raw file and its current length are deliberately
+            // left intact so the caller can preserve a recoverable session.
+            _ = handle
+            throw error
+        }
+    }
+
+    /// Stops the current native app source but leaves the session file open so
+    /// a subsequent source generation can append at the same offset.
+    public func stopApplicationCapture() {
+        guard let capture = appCapture else { return }
+        capture.stop()
+        rememberApplicationReadings(capture)
+        appCapture = nil
+    }
+
+    private func startApplicationCapture(
+        pids: [pid_t],
+        liveSink: LiveAudioSink?,
+        callbackGate: (@Sendable () -> Bool)?,
+    ) throws {
+        guard let handle = appFileHandle else {
+            throw NSError(
+                domain: "audiotap", code: -5,
+                userInfo: [NSLocalizedDescriptionKey: "Capture session output is not open"],
+            )
+        }
+        let capture = AppAudioCapture(
+            pids: pids,
+            outputFileDescriptor: handle.fileDescriptor,
+            sampleRate: sampleRate,
+            channels: channels,
+            debugLogging: debugLogging,
+            liveSink: liveSink,
+            timelineAnchor: appTimelineAnchor,
+            sourceCallbackGate: callbackGate,
+        )
+        try capture.start()
+        appCapture = capture
+        rememberApplicationReadings(capture)
+    }
+
+    private func rememberApplicationReadings(_ capture: AppAudioCapture) {
+        if capture.appFirstFrameTime > 0 {
+            if appFirstFrameTicks == 0 {
+                appFirstFrameTicks = capture.appFirstFrameTime
+            } else {
+                appFirstFrameTicks = min(appFirstFrameTicks, capture.appFirstFrameTime)
+            }
+        }
+        if capture.outputSampleRate > 0 {
+            appOutputSampleRate = capture.outputSampleRate
+        }
+        if capture.outputChannels > 0 {
+            appOutputChannels = capture.outputChannels
+        }
+    }
+
     /// Instantaneous app-audio level in dBFS, decayed to -120 when no buffer has
     /// arrived in the last 0.5 s. Drives the menu-bar asymmetric-silence indicator.
     public var appLevelDBFS: Double {
@@ -119,7 +203,7 @@ public class AudioCaptureSession {
 
     /// Stop all capture and return the result.
     public func stop() -> AudioCaptureResult {
-        appCapture?.stop()
+        stopApplicationCapture()
         micCapture?.stop()
 
         // Gather the raw per-track readings and hand the delay/rate/channel
@@ -131,9 +215,9 @@ public class AudioCaptureSession {
             micOutputURL: micOutputURL,
             configured: (sampleRate: sampleRate, channels: channels),
             app: .init(
-                firstFrameTicks: appCapture?.appFirstFrameTime ?? 0,
-                sampleRate: appCapture?.outputSampleRate ?? 0,
-                channels: appCapture?.outputChannels ?? 0,
+                firstFrameTicks: appFirstFrameTicks,
+                sampleRate: appOutputSampleRate,
+                channels: appOutputChannels,
             ),
             mic: .init(
                 recorded: micCapture != nil,
@@ -143,7 +227,6 @@ public class AudioCaptureSession {
 
         try? appFileHandle?.close()
         appFileHandle = nil
-        appCapture = nil
         micCapture = nil
 
         logger.info("Capture session stopped (rate: \(result.actualSampleRate), channels: \(result.actualChannels), micDelay: \(result.micDelay))")

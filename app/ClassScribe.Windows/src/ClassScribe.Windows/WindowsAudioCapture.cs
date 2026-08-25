@@ -14,6 +14,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private const int SnapshotCapacity = BytesPerSecond * 45;
     private readonly object sync = new();
     private readonly Queue<byte[]> recentPackets = new();
+    private readonly CaptureSourceGenerationGate sourceGenerationGate = new();
+    private readonly CaptureRebindCoordinator rebindCoordinator = new();
     private WasapiRecorder? recorder;
     private MMDevice? selectedDevice;
     private Channel<byte[]>? packetChannel;
@@ -24,10 +26,21 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private Exception? captureFailure;
     private string? rawPath;
     private SessionAttemptID? captureAttempt;
+    private CaptureSourceGeneration? activeSourceGeneration;
+    private AudioSourceOption? activeSource;
+    private int? activeRootProcessId;
     private CaptureDataAvailableHandler? dataAvailableHandler;
     private EventHandler<StoppedEventArgs>? recordingStoppedHandler;
     private long capturedBytes;
     private int recentBytes;
+    private long? lastPacketTimestamp;
+    private int lastPacketBytes;
+    private Task? monitorTask;
+    private long lastProbeTimestamp;
+    private int rebindFailureCount;
+    private SessionAttemptID? noCallbackReportedAttempt;
+    private CancellationTokenSource? captureCancellation;
+    private Task<Exception?>? stopRecorderTask;
     private readonly CaptureSignalHealthTracker signalHealthTracker =
         new(CaptureSignalThresholds.Windows);
 
@@ -191,10 +204,20 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         LastWarning = null;
         capturedBytes = 0;
         recentBytes = 0;
+        lastPacketTimestamp = null;
+        lastPacketBytes = 0;
+        lastProbeTimestamp = 0;
+        rebindFailureCount = 0;
+        noCallbackReportedAttempt = null;
+        captureCancellation = new CancellationTokenSource();
+        var sourceGeneration = sourceGenerationGate.Begin(attempt);
         recentPackets.Clear();
         lock (sync)
         {
             captureAttempt = attempt;
+            activeSourceGeneration = sourceGeneration;
+            activeSource = source;
+            activeRootProcessId = source.ProcessId;
         }
         signalHealthTracker.Begin(attempt);
         PublishSignalHealth(attempt);
@@ -224,15 +247,21 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                     EnumerateProcessIncarnations,
                     cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
-                recorder = await WindowsApplicationStartup.BuildProcessLoopbackIfCurrentAttemptAsync(
+                var builtRecorder = await WindowsApplicationStartup.BuildProcessLoopbackIfCurrentSourceGenerationAsync(
                     attempt,
-                    IsCurrentAttempt,
+                    sourceGeneration,
+                    IsCurrentSourceGeneration,
                     () => builder
                         .WithProcessLoopback(
                             checked((uint)resolvedRootPID),
                             ProcessLoopbackMode.IncludeTargetProcessTree)
                         .BuildAsync(),
                     cancellationToken).ConfigureAwait(false);
+                lock (sync)
+                {
+                    activeRootProcessId = resolvedRootPID;
+                }
+                recorder = builtRecorder;
             }
             else
             {
@@ -249,32 +278,14 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 recorder = builder.WithDevice(selectedDevice).Build();
             }
 
-            var callbackAttempt = attempt;
-            dataAvailableHandler = (buffer, flags, devicePosition, qpcPosition) =>
-                HandleDataAvailable(callbackAttempt, buffer, flags, devicePosition, qpcPosition);
-            recordingStoppedHandler = (sender, eventArgs) =>
-                HandleRecordingStopped(callbackAttempt, sender, eventArgs);
-            recorder.DataAvailable += dataAvailableHandler!;
-            recorder.RecordingStopped += recordingStoppedHandler!;
-            recorder.StartRecording();
-
-            try
-            {
-                await firstPacket.Task
-                    .WaitAsync(
-                        TimeSpan.FromSeconds(CaptureSignalThresholds.Windows.InitialCallbackBudgetSeconds),
-                        cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (TimeoutException error)
-            {
-                PublishSignalHealth(attempt);
-                throw new IOException(
-                    source.Kind == AudioSourceKind.Process
-                        ? "Windows no entregó audio. Reproduce sonido en la aplicación seleccionada y vuelve a intentarlo."
-                        : "Windows no entregó audio del micrófono seleccionado.",
-                    error);
-            }
+            var generationRecorder = recorder
+                ?? throw new InvalidOperationException("Windows no construyó el recorder de la fuente.");
+            await StartRecorderGenerationAsync(
+                generationRecorder,
+                source,
+                attempt,
+                sourceGeneration,
+                cancellationToken).ConfigureAwait(false);
         }
         catch
         {
@@ -290,6 +301,79 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 // audio remains available to the history recovery path.
             }
             throw;
+        }
+    }
+
+    private bool IsCurrentSourceGeneration(
+        SessionAttemptID attempt,
+        CaptureSourceGeneration generation)
+    {
+        lock (sync)
+        {
+            return captureAttempt == attempt
+                && activeSourceGeneration == generation
+                && sourceGenerationGate.Accepts(attempt, generation);
+        }
+    }
+
+    private async Task StartRecorderGenerationAsync(
+        WasapiRecorder generationRecorder,
+        AudioSourceOption source,
+        SessionAttemptID attempt,
+        CaptureSourceGeneration generation,
+        CancellationToken cancellationToken)
+    {
+        var generationFirstPacket = NewSignal();
+        var generationStopped = NewSignal();
+        CaptureDataAvailableHandler dataHandler = (buffer, flags, devicePosition, qpcPosition) =>
+            HandleDataAvailable(
+                attempt,
+                generation,
+                generationFirstPacket,
+                buffer,
+                flags,
+                devicePosition,
+                qpcPosition);
+        EventHandler<StoppedEventArgs> stoppedHandler = (sender, eventArgs) =>
+            HandleRecordingStopped(attempt, generation, generationStopped, sender, eventArgs);
+
+        if (!IsCurrentSourceGeneration(attempt, generation))
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+        lock (sync)
+        {
+            recorder = generationRecorder;
+            firstPacket = generationFirstPacket;
+            stopped = generationStopped;
+            dataAvailableHandler = dataHandler;
+            recordingStoppedHandler = stoppedHandler;
+        }
+
+        generationRecorder.DataAvailable += dataHandler;
+        generationRecorder.RecordingStopped += stoppedHandler;
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsCurrentSourceGeneration(attempt, generation))
+            {
+                throw new OperationCanceledException(cancellationToken);
+            }
+            generationRecorder.StartRecording();
+            await generationFirstPacket.Task
+                .WaitAsync(
+                    TimeSpan.FromSeconds(CaptureSignalThresholds.Windows.InitialCallbackBudgetSeconds),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException error)
+        {
+            PublishSignalHealth(attempt);
+            throw new IOException(
+                source.Kind == AudioSourceKind.Process
+                    ? "Windows no entregó audio. Reproduce sonido en la aplicación seleccionada y vuelve a intentarlo."
+                    : "Windows no entregó audio del micrófono seleccionado.",
+                error);
         }
     }
 
@@ -336,20 +420,23 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
     public async Task<string> StopAsync(CancellationToken cancellationToken)
     {
-        var currentRecorder = recorder
-            ?? throw new InvalidOperationException("No hay una grabación activa.");
-        Exception? stopFailure = null;
-        try
+        if (recorder is null)
         {
-            currentRecorder.StopRecording();
-            await stopped.Task.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
+            throw new InvalidOperationException("No hay una grabación activa.");
         }
-        catch (Exception error) when (error is TimeoutException
-                                           or InvalidOperationException
-                                           or OperationCanceledException)
+
+        SessionAttemptID? stoppingAttempt;
+        lock (sync)
         {
-            stopFailure = error;
+            stoppingAttempt = captureAttempt;
         }
+        if (stoppingAttempt is not null)
+        {
+            captureCancellation?.Cancel();
+            sourceGenerationGate.Invalidate(stoppingAttempt);
+            rebindCoordinator.Cancel(stoppingAttempt);
+        }
+        var stopFailure = await StopCurrentRecorderAsync(cancellationToken).ConfigureAwait(false);
 
         await FinishCaptureResourcesAsync().ConfigureAwait(false);
         var wavePath = await FinalizeRawAsync(CancellationToken.None).ConfigureAwait(false);
@@ -380,12 +467,14 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
     private void HandleDataAvailable(
         SessionAttemptID attempt,
+        CaptureSourceGeneration generation,
+        TaskCompletionSource generationFirstPacket,
         ReadOnlySpan<byte> buffer,
         AudioClientBufferFlags flags,
         long devicePosition,
         long qpcPosition)
     {
-        if (captureAttempt != attempt)
+        if (!IsCurrentSourceGeneration(attempt, generation))
         {
             return;
         }
@@ -399,45 +488,96 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             return;
         }
         PublishSignalHealth(attempt);
+        long? previousTimestamp;
+        int previousPacketBytes;
+        lock (sync)
+        {
+            previousTimestamp = lastPacketTimestamp;
+            previousPacketBytes = lastPacketBytes;
+        }
         if (buffer.Length == 0)
         {
-            firstPacket.TrySetResult();
+            generationFirstPacket.TrySetResult();
             LevelChanged?.Invoke(attempt, 0);
             return;
         }
 
-        var copy = buffer.ToArray();
-        if (packetChannel?.Writer.TryWrite(copy) != true)
+        var callbackTimestamp = Stopwatch.GetTimestamp();
+        var gapBytes = CaptureGapSilence.ComputeBytes(
+            previousTimestamp,
+            callbackTimestamp,
+            BytesPerSecond,
+            previousPacketBytes);
+        if (gapBytes > 0)
         {
-            captureFailure ??= new IOException("El disco no pudo guardar el audio con suficiente rapidez.");
-            TryStopRecorder();
+            var gap = new byte[gapBytes];
+            if (!TryQueuePacket(gap))
+            {
+                return;
+            }
+            AddDurablePacketToSnapshot(gap);
+        }
+
+        var copy = buffer.ToArray();
+        if (!TryQueuePacket(copy))
+        {
             return;
         }
 
-        Interlocked.Add(ref capturedBytes, copy.Length);
+        AddDurablePacketToSnapshot(copy);
         lock (sync)
         {
-            recentPackets.Enqueue(copy);
-            recentBytes += copy.Length;
+            lastPacketTimestamp = callbackTimestamp;
+            lastPacketBytes = copy.Length;
+        }
+
+        generationFirstPacket.TrySetResult();
+        LevelChanged?.Invoke(attempt, CalculateLevel(copy));
+    }
+
+    private bool TryQueuePacket(byte[] packet)
+    {
+        if (packetChannel?.Writer.TryWrite(packet) == true)
+        {
+            return true;
+        }
+
+        captureFailure ??= new IOException("El disco no pudo guardar el audio con suficiente rapidez.");
+        TryStopRecorder();
+        return false;
+    }
+
+    private void AddDurablePacketToSnapshot(byte[] packet)
+    {
+        Interlocked.Add(ref capturedBytes, packet.Length);
+        lock (sync)
+        {
+            recentPackets.Enqueue(packet);
+            recentBytes += packet.Length;
             while (recentBytes > SnapshotCapacity && recentPackets.TryDequeue(out var removed))
             {
                 recentBytes -= removed.Length;
             }
         }
-
-        firstPacket.TrySetResult();
-        LevelChanged?.Invoke(attempt, CalculateLevel(copy));
     }
 
-    private void HandleRecordingStopped(SessionAttemptID attempt, object? sender, StoppedEventArgs eventArgs)
+    private void HandleRecordingStopped(
+        SessionAttemptID attempt,
+        CaptureSourceGeneration generation,
+        TaskCompletionSource generationStopped,
+        object? sender,
+        StoppedEventArgs eventArgs)
     {
-        if (captureAttempt != attempt)
+        _ = sender;
+        // The generation-local waiter may be released after the gate advances;
+        // only the current generation may mutate health/fault state.
+        generationStopped.TrySetResult();
+        if (!IsCurrentSourceGeneration(attempt, generation))
         {
             return;
         }
 
         captureFailure ??= eventArgs.Exception;
-        stopped.TrySetResult();
         if (eventArgs.Exception is not null)
         {
             CaptureFaulted?.Invoke(attempt, eventArgs.Exception);
@@ -471,19 +611,18 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
     private async Task AbortAsync()
     {
-        TryStopRecorder();
-        try
+        SessionAttemptID? attempt;
+        lock (sync)
         {
-            if (recorder is not null)
-            {
-                await stopped.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
-            }
+            attempt = captureAttempt;
         }
-        catch (TimeoutException)
+        if (attempt is not null)
         {
-            // Disposal below forcibly releases a capture that failed to stop.
+            captureCancellation?.Cancel();
+            sourceGenerationGate.Invalidate(attempt);
+            rebindCoordinator.Cancel(attempt);
         }
-
+        _ = await StopCurrentRecorderAsync(CancellationToken.None).ConfigureAwait(false);
         await FinishCaptureResourcesAsync().ConfigureAwait(false);
 
         if (rawPath is not null && File.Exists(rawPath))
@@ -501,30 +640,133 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
     }
 
+    private async Task<Exception?> StopCurrentRecorderAsync(CancellationToken cancellationToken)
+    {
+        Task<Exception?> stopTask;
+        TaskCompletionSource<Exception?>? owner = null;
+        lock (sync)
+        {
+            if (stopRecorderTask is not null)
+            {
+                stopTask = stopRecorderTask;
+            }
+            else
+            {
+                var completion = new TaskCompletionSource<Exception?>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                stopTask = completion.Task;
+                stopRecorderTask = stopTask;
+                owner = completion;
+            }
+        }
+
+        if (owner is null)
+        {
+            // A concurrent Stop/rebind shares the same native teardown. The
+            // owner already receives the session cancellation token, so a
+            // follower must wait for cleanup instead of abandoning it.
+            return await stopTask.ConfigureAwait(false);
+        }
+
+        try
+        {
+            var result = await StopCurrentRecorderCoreAsync(cancellationToken)
+                .ConfigureAwait(false);
+            owner.TrySetResult(result);
+            return result;
+        }
+        catch (Exception error)
+        {
+            owner.TrySetException(error);
+            throw;
+        }
+        finally
+        {
+            lock (sync)
+            {
+                if (ReferenceEquals(stopRecorderTask, stopTask))
+                {
+                    stopRecorderTask = null;
+                }
+            }
+        }
+    }
+
+    private async Task<Exception?> StopCurrentRecorderCoreAsync(CancellationToken cancellationToken)
+    {
+        WasapiRecorder? currentRecorder;
+        TaskCompletionSource generationStopped;
+        CaptureDataAvailableHandler? currentDataHandler;
+        EventHandler<StoppedEventArgs>? currentStoppedHandler;
+        lock (sync)
+        {
+            currentRecorder = recorder;
+            generationStopped = stopped;
+            currentDataHandler = dataAvailableHandler;
+            currentStoppedHandler = recordingStoppedHandler;
+        }
+        if (currentRecorder is null)
+        {
+            return null;
+        }
+
+        Exception? stopFailure = null;
+        try
+        {
+            currentRecorder.StopRecording();
+            await generationStopped.Task
+                .WaitAsync(TimeSpan.FromSeconds(10), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is TimeoutException
+                                           or InvalidOperationException
+                                           or OperationCanceledException)
+        {
+            stopFailure = error;
+        }
+
+        if (currentDataHandler is not null)
+        {
+            currentRecorder.DataAvailable -= currentDataHandler;
+        }
+        if (currentStoppedHandler is not null)
+        {
+            currentRecorder.RecordingStopped -= currentStoppedHandler;
+        }
+        lock (sync)
+        {
+            if (ReferenceEquals(recorder, currentRecorder))
+            {
+                recorder = null;
+                dataAvailableHandler = null;
+                recordingStoppedHandler = null;
+            }
+        }
+        try
+        {
+            await currentRecorder.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException)
+        {
+            stopFailure ??= error;
+        }
+        return stopFailure;
+    }
+
     private async Task FinishCaptureResourcesAsync()
     {
-        var currentRecorder = recorder;
         SessionAttemptID? finishedAttempt;
         lock (sync)
         {
             finishedAttempt = captureAttempt;
             captureAttempt = null;
+            activeSourceGeneration = null;
+            activeSource = null;
+            activeRootProcessId = null;
+            monitorTask = null;
+            activeProbeToken = null;
+            captureCancellation = null;
         }
-        recorder = null;
-        if (currentRecorder is not null)
-        {
-            if (dataAvailableHandler is not null)
-            {
-                currentRecorder.DataAvailable -= dataAvailableHandler;
-            }
-
-            if (recordingStoppedHandler is not null)
-            {
-                currentRecorder.RecordingStopped -= recordingStoppedHandler;
-            }
-        }
-        dataAvailableHandler = null;
-        recordingStoppedHandler = null;
 
         packetChannel?.Writer.TryComplete();
         try
@@ -557,18 +799,6 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 }
             }
 
-            if (currentRecorder is not null)
-            {
-                try
-                {
-                    await currentRecorder.DisposeAsync().ConfigureAwait(false);
-                }
-                catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException)
-                {
-                    captureFailure ??= error;
-                }
-            }
-
             selectedDevice?.Dispose();
             selectedDevice = null;
             packetChannel = null;
@@ -592,6 +822,294 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         rawPath = null;
         return wavePath;
     }
+
+    private void ScheduleApplicationProbe(
+        SessionAttemptID attempt,
+        CaptureSignalHealthSnapshot snapshot)
+    {
+        AudioSourceOption? source;
+        int? rootPID;
+        CancellationToken cancellationToken;
+        lock (sync)
+        {
+            source = activeSource;
+            rootPID = activeRootProcessId;
+            cancellationToken = captureCancellation?.Token ?? CancellationToken.None;
+            if (monitorTask is not null
+                || captureAttempt != attempt
+                || source is null
+                || source.Kind != AudioSourceKind.Process
+                || source.Identity is null
+                || rootPID is null)
+            {
+                return;
+            }
+        }
+
+        var now = Stopwatch.GetTimestamp();
+        if (now - Interlocked.Read(ref lastProbeTimestamp)
+                < Stopwatch.Frequency)
+        {
+            return;
+        }
+        Interlocked.Exchange(ref lastProbeTimestamp, now);
+        var selectedSource = source!;
+        var selectedRootPID = rootPID!.Value;
+        var probeToken = Guid.NewGuid();
+        var placeholder = Task.CompletedTask;
+        lock (sync)
+        {
+            if (monitorTask is not null)
+            {
+                return;
+            }
+            activeProbeToken = probeToken;
+            monitorTask = placeholder;
+        }
+
+        var probeTask = ProbeApplicationAsync(
+            selectedSource,
+            selectedRootPID,
+            attempt,
+            snapshot.State,
+            cancellationToken,
+            probeToken);
+        lock (sync)
+        {
+            if (activeProbeToken == probeToken
+                && ReferenceEquals(monitorTask, placeholder))
+            {
+                monitorTask = probeTask;
+            }
+        }
+    }
+
+    private async Task ProbeApplicationAsync(
+        AudioSourceOption source,
+        int rootPID,
+        SessionAttemptID attempt,
+        CaptureSignalState signalState,
+        CancellationToken cancellationToken,
+        Guid probeToken)
+    {
+        try
+        {
+            if (source.Identity is null)
+            {
+                return;
+            }
+            var resolution = await WindowsApplicationStartup.ResolveBeforeBuildAsync(
+                source.Identity,
+                rootPID,
+                EnumerateProcessIncarnations,
+                cancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(1), cancellationToken)
+                .ConfigureAwait(false);
+            if (!IsCurrentAttempt(attempt))
+            {
+                return;
+            }
+
+            if (source.Identity.Strength == ApplicationIdentityStrength.Strong
+                && resolution != rootPID)
+            {
+                await RebindApplicationAsync(source, attempt, resolution, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (WindowsApplicationResolutionException)
+        {
+            // Missing/ambiguous/weak evidence never gets converted into a
+            // sibling PID. The current durable stream remains available.
+        }
+        catch (TimeoutException)
+        {
+            // A bounded probe may be retried by the health timer; it never
+            // blocks teardown or silently selects an unverified process.
+        }
+        catch (OperationCanceledException)
+        {
+            // Stop/session replacement owns cancellation and cleanup.
+        }
+        finally
+        {
+            lock (sync)
+            {
+                if (monitorTask is not null && probeToken == activeProbeToken)
+                {
+                    monitorTask = null;
+                    activeProbeToken = null;
+                }
+            }
+        }
+    }
+
+    private Guid? activeProbeToken;
+
+    private async Task<bool> RebindApplicationAsync(
+        AudioSourceOption source,
+        SessionAttemptID attempt,
+        int resolvedRootPID,
+        CancellationToken cancellationToken)
+    {
+        if (source.Identity is null
+            || source.Identity.Strength != ApplicationIdentityStrength.Strong)
+        {
+            return false;
+        }
+        if (!rebindCoordinator.Begin(attempt))
+        {
+            return false;
+        }
+
+        WasapiRecorder? builtRecorder = null;
+        try
+        {
+            CaptureSourceGeneration? oldGeneration;
+            int? oldRootPID;
+            lock (sync)
+            {
+                oldGeneration = activeSourceGeneration;
+                oldRootPID = activeRootProcessId;
+            }
+            if (oldGeneration is null || oldRootPID is null)
+            {
+                return false;
+            }
+
+            var nextGeneration = sourceGenerationGate.Advance(attempt);
+            if (nextGeneration is null)
+            {
+                return false;
+            }
+            lock (sync)
+            {
+                activeSourceGeneration = nextGeneration;
+            }
+
+            // Old callbacks are rejected before stop. The generation-local
+            // stopped event still releases StopCurrentRecorderAsync without
+            // mutating the new health/source state.
+            var stopFailure = await StopCurrentRecorderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (!IsCurrentSourceGeneration(attempt, nextGeneration)
+                || !rebindCoordinator.CanPublish(attempt))
+            {
+                return false;
+            }
+            if (stopFailure is not null)
+            {
+                captureFailure ??= stopFailure;
+            }
+
+            var refreshedRootPID = await WindowsApplicationStartup.ResolveBeforeBuildAsync(
+                source.Identity,
+                resolvedRootPID,
+                EnumerateProcessIncarnations,
+                cancellationToken)
+                .WaitAsync(TimeSpan.FromSeconds(3), cancellationToken)
+                .ConfigureAwait(false);
+            if (refreshedRootPID == oldRootPID)
+            {
+                throw new IOException("La encarnación de la aplicación no cambió de forma verificable.");
+            }
+            if (!IsCurrentSourceGeneration(attempt, nextGeneration))
+            {
+                return false;
+            }
+
+            signalHealthTracker.Begin(attempt);
+            PublishSignalHealth(attempt);
+            var builder = new WasapiRecorderBuilder()
+                .WithSharedMode()
+                .WithEventSync()
+                .WithFormat(new WaveFormat(PcmWaveFile.SampleRate, PcmWaveFile.BitsPerSample, PcmWaveFile.Channels))
+                .WithBufferLength(100)
+                .WithMmcssThreadPriority("Audio");
+            builtRecorder = await WindowsApplicationStartup.BuildProcessLoopbackIfCurrentSourceGenerationAsync(
+                attempt,
+                nextGeneration,
+                IsCurrentSourceGeneration,
+                () => builder
+                    .WithProcessLoopback(
+                        checked((uint)refreshedRootPID),
+                        ProcessLoopbackMode.IncludeTargetProcessTree)
+                    .BuildAsync(),
+                cancellationToken).ConfigureAwait(false);
+            await StartRecorderGenerationAsync(
+                builtRecorder,
+                source,
+                attempt,
+                nextGeneration,
+                cancellationToken).ConfigureAwait(false);
+            builtRecorder = null;
+            if (!IsCurrentSourceGeneration(attempt, nextGeneration)
+                || !rebindCoordinator.CanPublish(attempt))
+            {
+                return false;
+            }
+            lock (sync)
+            {
+                activeRootProcessId = refreshedRootPID;
+                activeSource = source;
+            }
+            rebindFailureCount = 0;
+            return true;
+        }
+        catch (Exception error) when (error is IOException
+                                           or InvalidOperationException
+                                           or WindowsApplicationResolutionException
+                                           or TimeoutException
+                                           or OperationCanceledException)
+        {
+            if (builtRecorder is not null)
+            {
+                bool attachedToSession;
+                lock (sync)
+                {
+                    attachedToSession = ReferenceEquals(recorder, builtRecorder);
+                }
+                if (attachedToSession)
+                {
+                    _ = await StopCurrentRecorderAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    try
+                    {
+                        await builtRecorder.DisposeAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception disposeError) when (disposeError is InvalidOperationException or System.Runtime.InteropServices.COMException)
+                    {
+                        captureFailure ??= disposeError;
+                    }
+                }
+            }
+            if (IsCurrentAttempt(attempt) && rebindCoordinator.CanPublish(attempt))
+            {
+                rebindFailureCount++;
+                if (rebindFailureCount >= 2)
+                {
+                    CaptureFaulted?.Invoke(attempt, error);
+                }
+            }
+            return false;
+        }
+        finally
+        {
+            rebindCoordinator.End(attempt);
+        }
+    }
+
+    // Test/product seam: the public wrapper keeps the rebind boundary
+    // deterministic without exposing native recorder types to Core tests.
+    internal Task<bool> RebindApplicationForTestAsync(
+        AudioSourceOption source,
+        SessionAttemptID attempt,
+        int resolvedRootPID,
+        CancellationToken cancellationToken = default) =>
+        RebindApplicationAsync(source, attempt, resolvedRootPID, cancellationToken);
 
     private void TryStopRecorder()
     {
@@ -631,6 +1149,24 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         if (snapshot is not null)
         {
             SignalHealthChanged?.Invoke(attempt, snapshot);
+            bool isProcessSource;
+            lock (sync)
+            {
+                isProcessSource = activeSource?.Kind == AudioSourceKind.Process;
+            }
+            if (isProcessSource)
+            {
+                ScheduleApplicationProbe(attempt, snapshot);
+            }
+            if (snapshot.State == CaptureSignalState.NoCallbacks
+                && snapshot.ElapsedSinceStart >= CaptureSignalThresholds.Windows.InitialCallbackBudgetSeconds + 6
+                && noCallbackReportedAttempt != attempt)
+            {
+                noCallbackReportedAttempt = attempt;
+                CaptureFaulted?.Invoke(
+                    attempt,
+                    new IOException("Windows dejó de entregar callbacks de audio; el audio recibido se conserva."));
+            }
         }
 
         return snapshot;

@@ -19,7 +19,7 @@ private let logger = Logger(subsystem: "com.meetingtranscriber.audiotap", catego
 public class AppAudioCapture: @unchecked Sendable {
     /// `internal` (not `private`) so the cross-file `+PIDTranslation`
     /// extension can read it; it's not otherwise touched from outside.
-    let pids: [pid_t]
+    private(set) var pids: [pid_t]
     /// `sampleRate` and `liveSink` are `internal` (not `private`) so the
     /// cross-file `+LiveSink` extension can populate the live buffer struct.
     let sampleRate: Int
@@ -29,6 +29,7 @@ public class AppAudioCapture: @unchecked Sendable {
     /// can drive the throttled dBFS log line.
     let debugLogging: Bool
     let liveSink: LiveAudioSink?
+    let sourceCallbackGate: (@Sendable () -> Bool)?
     /// Resamples + downmixes each captured buffer to 16 kHz mono in the IOProc
     /// (issue #379 follow-up — see `writeCapturedBuffer` in `+Resampling`).
     /// `internal` (not `private`) so that cross-file extension can reach it.
@@ -39,7 +40,7 @@ public class AppAudioCapture: @unchecked Sendable {
     /// the file instead of an under-run that drifts against the mic track (issue
     /// #379 follow-up — see `writeCapturedBuffer` in `+Resampling`). `internal`
     /// for that cross-file extension; touched only on `writeQueue`.
-    var timelineAnchor = TimelineAnchor(rate: Int(speechSampleRate))
+    let timelineAnchor: TimelineAnchor
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
@@ -126,6 +127,8 @@ public class AppAudioCapture: @unchecked Sendable {
         channels: Int = 2,
         debugLogging: Bool = false,
         liveSink: LiveAudioSink? = nil,
+        timelineAnchor: TimelineAnchor? = nil,
+        sourceCallbackGate: (@Sendable () -> Bool)? = nil,
     ) {
         self.pids = pids
         self.outputFileDescriptor = outputFileDescriptor
@@ -133,6 +136,8 @@ public class AppAudioCapture: @unchecked Sendable {
         self.channels = channels
         self.debugLogging = debugLogging
         self.liveSink = liveSink
+        self.timelineAnchor = timelineAnchor ?? TimelineAnchor(rate: Int(speechSampleRate))
+        self.sourceCallbackGate = sourceCallbackGate
         resampler = StreamingMonoResampler(targetRate: Int(speechSampleRate))
     }
 
@@ -397,7 +402,8 @@ public class AppAudioCapture: @unchecked Sendable {
         let ioProcStatus = AudioDeviceCreateIOProcIDWithBlock(
             &newProcID, aggregateID, writeQueue,
         ) { [weak self] _, inInputData, inInputTime, _, _ in
-            guard let self, self.isRunning else { return }
+            guard let self, self.isRunning,
+                  self.sourceCallbackGate?() ?? true else { return }
             let abl = inInputData.pointee
 
             // Log format on first callback
