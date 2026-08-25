@@ -90,3 +90,6 @@ scripts/fixtures/package-lock.json
 
 # Developer ID provisioning profiles (account artifacts, like the signing cert)
 signing/
+
+# Local review patches
+phase-*.patch
