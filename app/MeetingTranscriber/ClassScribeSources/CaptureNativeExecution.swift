@@ -281,6 +281,64 @@ struct CaptureNativeLevelSnapshot: Sendable {
     let terminalErrorMessage: String?
 }
 
+/// Product seam for the online mid-recording handoff. The default adapter
+/// delegates to the serial native executor; lifecycle tests can inject a
+/// deterministic implementation without constructing CoreAudio objects.
+protocol CaptureApplicationRebindDriver: AnyObject, Sendable {
+    func stopApplicationSource(
+        attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
+    ) async throws
+
+    func startApplicationSource(
+        attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
+        rootPID: pid_t,
+        pids: [pid_t],
+        registrationTimeout: TimeInterval,
+        liveSink: @escaping LiveAudioSink,
+        sourceCallbackGate: @escaping @Sendable () -> Bool,
+    ) async throws
+}
+
+final class CaptureNativeRebindDriver: CaptureApplicationRebindDriver, @unchecked Sendable {
+    private let executor: CaptureNativeExecutor
+
+    init(executor: CaptureNativeExecutor) {
+        self.executor = executor
+    }
+
+    func stopApplicationSource(
+        attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
+    ) async throws {
+        try await executor.beginApplicationSourceStop(
+            attempt: attempt,
+            sourceGeneration: sourceGeneration,
+        ).value()
+    }
+
+    func startApplicationSource(
+        attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
+        rootPID: pid_t,
+        pids: [pid_t],
+        registrationTimeout: TimeInterval,
+        liveSink: @escaping LiveAudioSink,
+        sourceCallbackGate: @escaping @Sendable () -> Bool,
+    ) async throws {
+        try await executor.beginApplicationRebind(
+            attempt: attempt,
+            sourceGeneration: sourceGeneration,
+            rootPID: rootPID,
+            pids: pids,
+            registrationTimeout: registrationTimeout,
+            liveSink: liveSink,
+            sourceCallbackGate: sourceCallbackGate,
+        ).value()
+    }
+}
+
 /// Owns application CATap capture objects on one dedicated serial queue. A
 /// slow native call can occupy this queue, but it cannot occupy MainActor. A
 /// second attempt is intentionally queued behind the first attempt's native

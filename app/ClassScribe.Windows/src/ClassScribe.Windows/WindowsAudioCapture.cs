@@ -11,6 +11,11 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 {
     private const int BytesPerSecond = PcmWaveFile.SampleRate * PcmWaveFile.Channels
         * (PcmWaveFile.BitsPerSample / 8);
+    // The rebind budget is: native stop (10 s) + identity resolution (3 s) +
+    // first callback (10 s), with margin for scheduler/driver variance. A
+    // longer handoff is an explicit capture fault, never a silently shortened
+    // recording.
+    private static readonly TimeSpan RebindGapSafetyBound = TimeSpan.FromSeconds(30);
     private const int SnapshotCapacity = BytesPerSecond * 45;
     private readonly object sync = new();
     private readonly Queue<byte[]> recentPackets = new();
@@ -33,8 +38,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private EventHandler<StoppedEventArgs>? recordingStoppedHandler;
     private long capturedBytes;
     private int recentBytes;
-    private long? lastPacketTimestamp;
-    private int lastPacketBytes;
+    private readonly CaptureHandoffTimeline packetTimeline = new(BytesPerSecond);
     private Task? monitorTask;
     private long lastProbeTimestamp;
     private int rebindFailureCount;
@@ -204,13 +208,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         LastWarning = null;
         capturedBytes = 0;
         recentBytes = 0;
-        lastPacketTimestamp = null;
-        lastPacketBytes = 0;
+        packetTimeline.Reset();
         lastProbeTimestamp = 0;
         rebindFailureCount = 0;
         noCallbackReportedAttempt = null;
         captureCancellation = new CancellationTokenSource();
         var sourceGeneration = sourceGenerationGate.Begin(attempt);
+        packetTimeline.BeginGeneration(sourceGeneration, Stopwatch.GetTimestamp());
         recentPackets.Clear();
         lock (sync)
         {
@@ -482,19 +486,19 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         _ = flags;
         _ = devicePosition;
         _ = qpcPosition;
+        // The first check admits the callback. A rebind can advance the source
+        // generation immediately afterwards, so recheck before health mutation
+        // and again immediately before the durable writer boundary.
+        if (!IsCurrentSourceGeneration(attempt, generation))
+        {
+            return;
+        }
         var measurement = CaptureSignalMeasurement.FromPcm16(buffer, PcmWaveFile.Channels);
         if (!signalHealthTracker.TryRecordCallback(attempt, measurement))
         {
             return;
         }
         PublishSignalHealth(attempt);
-        long? previousTimestamp;
-        int previousPacketBytes;
-        lock (sync)
-        {
-            previousTimestamp = lastPacketTimestamp;
-            previousPacketBytes = lastPacketBytes;
-        }
         if (buffer.Length == 0)
         {
             generationFirstPacket.TrySetResult();
@@ -502,37 +506,102 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             return;
         }
 
-        var callbackTimestamp = Stopwatch.GetTimestamp();
-        var gapBytes = CaptureGapSilence.ComputeBytes(
-            previousTimestamp,
-            callbackTimestamp,
-            BytesPerSecond,
-            previousPacketBytes);
-        if (gapBytes > 0)
+        var copy = buffer.ToArray();
+        // This is the durable boundary: normal callbacks never consult a
+        // clock, and only a new generation can have a pending handoff plan.
+        if (!IsCurrentSourceGeneration(attempt, generation))
         {
-            var gap = new byte[gapBytes];
-            if (!TryQueuePacket(gap))
+            return;
+        }
+
+        var plan = packetTimeline.PreparePacket(
+            generation,
+            copy.Length,
+            RebindGapSafetyBound);
+        if (plan.IsRejected)
+        {
+            return;
+        }
+
+        if (plan.HandoffGap.IsExplicitFailure)
+        {
+            var error = new IOException(
+                $"La pausa de rebind ({plan.HandoffGap.GapSeconds:F1}s) excede el límite seguro de {RebindGapSafetyBound.TotalSeconds:F0}s.");
+            generationFirstPacket.TrySetException(error);
+            FailCapture(attempt, error);
+            return;
+        }
+
+        if (plan.HandoffGap.SilenceBytes > 0)
+        {
+            if (!TryQueueSilence(attempt, generation, plan.HandoffGap.SilenceBytes))
             {
                 return;
             }
-            AddDurablePacketToSnapshot(gap);
         }
 
-        var copy = buffer.ToArray();
-        if (!TryQueuePacket(copy))
+        // Keep the check adjacent to the actual packet enqueue. It closes the
+        // paused-callback race where an old callback passed the first gate and
+        // the generation advanced while it was copying the buffer.
+        if (!IsCurrentSourceGeneration(attempt, generation)
+            || !TryQueuePacket(copy))
         {
             return;
         }
 
         AddDurablePacketToSnapshot(copy);
-        lock (sync)
-        {
-            lastPacketTimestamp = callbackTimestamp;
-            lastPacketBytes = copy.Length;
-        }
+        packetTimeline.CommitPacket(plan);
 
         generationFirstPacket.TrySetResult();
         LevelChanged?.Invoke(attempt, CalculateLevel(copy));
+    }
+
+    private bool TryQueueSilence(
+        SessionAttemptID attempt,
+        CaptureSourceGeneration generation,
+        int silenceBytes)
+    {
+        const int maximumChunkBytes = 64 * 1024;
+        var remaining = silenceBytes & ~1;
+        while (remaining > 0)
+        {
+            if (!IsCurrentSourceGeneration(attempt, generation))
+            {
+                return false;
+            }
+
+            var chunkBytes = Math.Min(remaining, maximumChunkBytes) & ~1;
+            var silence = new byte[chunkBytes];
+            if (!TryQueuePacket(silence))
+            {
+                return false;
+            }
+
+            AddDurablePacketToSnapshot(silence);
+            remaining -= chunkBytes;
+        }
+
+        return true;
+    }
+
+    private void FailCapture(SessionAttemptID attempt, Exception error)
+    {
+        var shouldPublish = false;
+        lock (sync)
+        {
+            if (captureFailure is null)
+            {
+                captureFailure = error;
+                shouldPublish = true;
+            }
+        }
+
+        if (shouldPublish)
+        {
+            CaptureFaulted?.Invoke(attempt, error);
+        }
+
+        TryStopRecorder();
     }
 
     private bool TryQueuePacket(byte[] packet)
@@ -804,6 +873,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             packetChannel = null;
             writerTask = null;
             rawStream = null;
+            packetTimeline.Reset();
             if (finishedAttempt is not null)
             {
                 signalHealthTracker.Invalidate(finishedAttempt);
@@ -1001,6 +1071,11 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             {
                 captureFailure ??= stopFailure;
             }
+
+            // The old recorder is fully stopped and its callbacks drained at
+            // this point. Capture one handoff boundary; ordinary callbacks do
+            // not sample Stopwatch and cannot manufacture jitter silence.
+            packetTimeline.MarkHandoff(nextGeneration, Stopwatch.GetTimestamp());
 
             var refreshedRootPID = await WindowsApplicationStartup.ResolveBeforeBuildAsync(
                 source.Identity,

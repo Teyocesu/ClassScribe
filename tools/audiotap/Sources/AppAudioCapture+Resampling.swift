@@ -43,6 +43,11 @@ public extension AppAudioCapture {
     internal func writeCapturedBuffer(
         fd: Int32, data: UnsafeMutableRawPointer, byteCount: Int, hostTicks: UInt64,
     ) {
+        // The IOProc entry check admits a callback, but a generation advance
+        // may happen while the callback is preparing the resampler. Recheck at
+        // the durable boundary so an admitted old callback cannot write after
+        // the handoff has invalidated its source generation.
+        guard sourceCallbackGate?() ?? true else { return }
         guard resampler != nil else {
             writeAllToFileHandle(fd, data, count: byteCount)
             forwardToLiveSink(data: data, byteCount: byteCount)
@@ -75,9 +80,11 @@ public extension AppAudioCapture {
         // is alive. Forward an empty callback so signal health records a live
         // silent transport instead of waiting for a non-empty buffer.
         guard !mono16k.isEmpty else {
+            guard sourceCallbackGate?() ?? true else { return }
             forwardToLiveSink(monoSamples: [])
             return
         }
+        guard sourceCallbackGate?() ?? true else { return }
         fillTimelineGap(fd: fd, hostTicks: hostTicks, outputFrames: mono16k.count)
         Self.writeFloats(mono16k, to: fd)
         forwardToLiveSink(monoSamples: mono16k)

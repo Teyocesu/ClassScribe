@@ -230,6 +230,147 @@ public sealed class CaptureSourceGenerationTests
     }
 
     [TestMethod]
+    public void normalCallbackJitterDoesNotInsertSilence()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var generation = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(generation, 0);
+
+        var first = timeline.PreparePacket(generation, 3_200);
+        timeline.CommitPacket(first);
+        // The ordinary callback path has no wall-clock sample. A callback that
+        // arrives late is still a normal packet and cannot manufacture a gap.
+        var jittered = timeline.PreparePacket(generation, 3_200);
+
+        Assert.IsTrue(jittered.IsAccepted);
+        Assert.AreEqual(CaptureGapDisposition.NoGap, jittered.HandoffGap.Disposition);
+        Assert.AreEqual(0, jittered.HandoffGap.SilenceBytes);
+    }
+
+    [TestMethod]
+    public void rebindGapIsInsertedExactlyOnce()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var oldGeneration = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(oldGeneration, 0);
+        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.CommitPacket(oldPacket);
+
+        var newGeneration = gate.Advance(attempt)!;
+        timeline.MarkHandoff(newGeneration, Stopwatch.Frequency * 3);
+        var firstNewPacket = timeline.PreparePacket(newGeneration, 3_200);
+        timeline.CommitPacket(firstNewPacket);
+        var secondNewPacket = timeline.PreparePacket(newGeneration, 3_200);
+
+        Assert.AreEqual(CaptureGapDisposition.Silence, firstNewPacket.HandoffGap.Disposition);
+        Assert.AreEqual(64_000, firstNewPacket.HandoffGap.SilenceBytes);
+        Assert.AreEqual(CaptureGapDisposition.NoGap, secondNewPacket.HandoffGap.Disposition);
+        Assert.AreEqual(0, secondNewPacket.HandoffGap.SilenceBytes);
+    }
+
+    [TestMethod]
+    public void zeroLengthCallbackDoesNotConsumePendingRebindGap()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var oldGeneration = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(oldGeneration, 0);
+        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.CommitPacket(oldPacket);
+        var newGeneration = gate.Advance(attempt)!;
+        timeline.MarkHandoff(newGeneration, Stopwatch.Frequency * 3);
+
+        var empty = timeline.PreparePacket(newGeneration, 0);
+        var firstNonEmpty = timeline.PreparePacket(newGeneration, 3_200);
+
+        Assert.IsTrue(empty.IsEmpty);
+        Assert.AreEqual(CaptureGapDisposition.NoGap, empty.HandoffGap.Disposition);
+        Assert.AreEqual(CaptureGapDisposition.Silence, firstNonEmpty.HandoffGap.Disposition);
+        Assert.AreEqual(64_000, firstNonEmpty.HandoffGap.SilenceBytes);
+    }
+
+    [TestMethod]
+    public void staleOldGenerationCannotConsumePendingGap()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var oldGeneration = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(oldGeneration, 0);
+        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.CommitPacket(oldPacket);
+        var newGeneration = gate.Advance(attempt)!;
+        timeline.MarkHandoff(newGeneration, Stopwatch.Frequency * 3);
+
+        var stale = timeline.PreparePacket(oldGeneration, 3_200);
+        var current = timeline.PreparePacket(newGeneration, 3_200);
+
+        Assert.IsTrue(stale.IsRejected);
+        Assert.AreEqual(CaptureGapDisposition.Silence, current.HandoffGap.Disposition);
+        Assert.AreEqual(64_000, current.HandoffGap.SilenceBytes);
+    }
+
+    [TestMethod]
+    public void gapBeyondSafetyBoundIsExplicitNotSilentSuccess()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var oldGeneration = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(oldGeneration, 0);
+        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.CommitPacket(oldPacket);
+        var newGeneration = gate.Advance(attempt)!;
+        timeline.MarkHandoff(newGeneration, Stopwatch.Frequency * 40);
+
+        var firstNewPacket = timeline.PreparePacket(
+            newGeneration,
+            3_200,
+            TimeSpan.FromSeconds(30));
+
+        Assert.IsTrue(firstNewPacket.RequiresExplicitFailure);
+        Assert.AreEqual(CaptureGapDisposition.ExceedsSafetyBound, firstNewPacket.HandoffGap.Disposition);
+        Assert.AreEqual(0, firstNewPacket.HandoffGap.SilenceBytes);
+    }
+
+    [TestMethod]
+    public void pausedOldGenerationCannotCommitAfterGenerationAdvance()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var oldGeneration = gate.Begin(attempt);
+        var entered = new ManualResetEventSlim();
+        var release = new ManualResetEventSlim();
+        var writes = 0;
+        var callback = Task.Run(() =>
+        {
+            if (!gate.Accepts(attempt, oldGeneration))
+            {
+                return;
+            }
+
+            entered.Set();
+            release.Wait();
+            if (gate.Accepts(attempt, oldGeneration))
+            {
+                Interlocked.Increment(ref writes);
+            }
+        });
+
+        Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(1)));
+        _ = gate.Advance(attempt);
+        release.Set();
+        callback.GetAwaiter().GetResult();
+
+        Assert.AreEqual(0, Volatile.Read(ref writes));
+    }
+
+    [TestMethod]
     public async Task stopDuringBuildCannotPublishNewRecorder()
     {
         var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);

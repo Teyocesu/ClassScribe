@@ -429,6 +429,13 @@ struct AudioProcessStartupWaiter {
     }
 }
 
+typealias CaptureApplicationReconcile = @Sendable (
+    _ selectedIdentity: ApplicationIdentity,
+    _ previousPID: pid_t,
+    _ attempt: SessionAttemptID,
+    _ timeout: TimeInterval
+) async throws -> MacApplicationStartupPlan
+
 @MainActor
 @Observable
 final class CaptureController {
@@ -450,7 +457,9 @@ final class CaptureController {
     private(set) var isStarting = false
 
     let liveStore = LiveAudioBufferStore()
-    private let nativeExecutor = CaptureNativeExecutor()
+    private let nativeExecutor: CaptureNativeExecutor
+    private let rebindDriver: any CaptureApplicationRebindDriver
+    private let applicationReconcileOverride: CaptureApplicationReconcile?
     private let attemptGate = CaptureAttemptGate()
     private let sourceGenerationGate = CaptureSourceGenerationGate()
     private let rebindCoordinator = CaptureRebindCoordinator()
@@ -478,12 +487,24 @@ final class CaptureController {
     private var onlineTargetPIDs: Set<pid_t> = []
     private var onlineProbeTask: Task<Void, Never>?
     private var onlineRebindTask: Task<Void, Never>?
+    private var onlineRebindCancellation: CaptureStartCancellation?
     private var onlineProbeToken: UUID?
     private var onlineRebindToken: UUID?
+    private var onlineSourceAvailable = false
     private var lastOnlineProbeUptime: TimeInterval = 0
     private var onlineRecoveryDeadline: TimeInterval?
     private var onlineRebindFailureCount = 0
     private var signalHealthTracker: CaptureSignalHealthTracker?
+
+    init(
+        rebindDriver: (any CaptureApplicationRebindDriver)? = nil,
+        applicationReconcile: CaptureApplicationReconcile? = nil,
+    ) {
+        let executor = CaptureNativeExecutor()
+        nativeExecutor = executor
+        self.rebindDriver = rebindDriver ?? CaptureNativeRebindDriver(executor: executor)
+        applicationReconcileOverride = applicationReconcile
+    }
 
     var isBusy: Bool {
         isCapturing
@@ -533,6 +554,16 @@ final class CaptureController {
     ) async throws -> URL {
         guard !isBusy else { throw CaptureError.notRecording }
         try Task.checkCancellation()
+        if let previousAttempt = activeAttempt {
+            attemptGate.invalidate(previousAttempt)
+            sourceGenerationGate.invalidate(previousAttempt)
+            rebindCoordinator.cancel(previousAttempt)
+        }
+        onlineRebindCancellation?.cancel()
+        onlineRebindTask?.cancel()
+        onlineRebindCancellation = nil
+        onlineRebindTask = nil
+        onlineRebindToken = nil
         isStarting = true
         activeAttempt = attempt
         attemptGate.begin(attempt)
@@ -566,8 +597,11 @@ final class CaptureController {
         onlineRootPID = nil
         onlineSelectedIdentity = nil
         onlineTargetPIDs = []
+        onlineSourceAvailable = false
         onlineProbeTask?.cancel()
         onlineProbeTask = nil
+        onlineRebindCancellation?.cancel()
+        onlineRebindCancellation = nil
         onlineRebindTask?.cancel()
         onlineRebindTask = nil
         lastOnlineProbeUptime = 0
@@ -729,6 +763,7 @@ final class CaptureController {
                 onlineSelectedIdentity = selectedIdentity
                 onlineTargetPIDs = Set(startupPlan.translatedTargetPIDs)
                 activeSourceGeneration = sourceGeneration
+                onlineSourceAvailable = true
                 onlineRecoveryDeadline = nil
                 activeCaptureGeneration = liveGeneration
 
@@ -798,8 +833,11 @@ final class CaptureController {
             rebindCoordinator.cancel(attempt)
             onlineProbeTask?.cancel()
             onlineProbeTask = nil
+            onlineRebindCancellation?.cancel()
+            onlineRebindCancellation = nil
             onlineRebindTask?.cancel()
             onlineRebindTask = nil
+            onlineRebindToken = nil
             if let currentTracker = signalHealthTracker, currentTracker === signalTracker {
                 signalHealthTracker = nil
             }
@@ -811,6 +849,7 @@ final class CaptureController {
                 onlineRootPID = nil
                 onlineSelectedIdentity = nil
                 onlineTargetPIDs = []
+                onlineSourceAvailable = false
             }
             let nativeStop = requestNativeStop(for: attempt)
             await nativeStop.waitForCompletion()
@@ -828,6 +867,8 @@ final class CaptureController {
         sourceGenerationGate.invalidate(attempt)
         rebindCoordinator.cancel(attempt)
         startCancellation?.cancel()
+        onlineRebindCancellation?.cancel()
+        onlineRebindCancellation = nil
         nativeStartWork?.cancel()
         signalHealthTracker?.invalidate(attempt)
         signalHealth = nil
@@ -837,10 +878,12 @@ final class CaptureController {
         onlineRootPID = nil
         onlineSelectedIdentity = nil
         onlineTargetPIDs = []
+        onlineSourceAvailable = false
         onlineProbeTask?.cancel()
         onlineProbeTask = nil
         onlineRebindTask?.cancel()
         onlineRebindTask = nil
+        onlineRebindToken = nil
         levelTimer?.invalidate()
         levelTimer = nil
         stopLiveBufferPump()
@@ -872,16 +915,20 @@ final class CaptureController {
             sourceGenerationGate.invalidate(stoppedAttempt)
             rebindCoordinator.cancel(stoppedAttempt)
         }
+        onlineRebindCancellation?.cancel()
+        onlineRebindCancellation = nil
         signalHealthTracker = nil
         activeCaptureGeneration = nil
         activeSourceGeneration = nil
         onlineRootPID = nil
         onlineSelectedIdentity = nil
         onlineTargetPIDs = []
+        onlineSourceAvailable = false
         onlineProbeTask?.cancel()
         onlineProbeTask = nil
         onlineRebindTask?.cancel()
         onlineRebindTask = nil
+        onlineRebindToken = nil
         levelTimer?.invalidate()
         levelTimer = nil
         let rawToWrap = rawOnlineURL
@@ -983,6 +1030,108 @@ final class CaptureController {
         return terminalCaptureFailure
     }
 
+    // Product lifecycle seam used by focused tests. It prepares the same
+    // attempt/source-generation/live-buffer ownership that a successful online
+    // start publishes, while leaving native CATap work injectable.
+    @MainActor
+    func prepareOnlineRebindLifecycleForTest(
+        attempt: SessionAttemptID,
+        selectedIdentity: ApplicationIdentity,
+        rootPID: pid_t,
+        targetPIDs: [pid_t],
+        sourceAvailable: Bool = true,
+        includeLiveContinuation: Bool = true,
+    ) async {
+        stopLiveBufferPump()
+        let liveGeneration = await liveStore.reset()
+        activeAttempt = attempt
+        attemptGate.begin(attempt)
+        let sourceGeneration = sourceGenerationGate.begin(attempt)
+        rebindCoordinator.reset(attempt)
+        activeCaptureGeneration = liveGeneration
+        activeSourceGeneration = sourceGeneration
+        onlineRootPID = rootPID
+        onlineSelectedIdentity = selectedIdentity
+        onlineTargetPIDs = Set(targetPIDs)
+        onlineSourceAvailable = sourceAvailable
+        onlineRecoveryDeadline = nil
+        onlineRebindFailureCount = 0
+        onlineRebindToken = nil
+        onlineRebindCancellation = nil
+        onlineRebindTask = nil
+        terminalCaptureFailure = nil
+        isStarting = false
+        isCapturing = true
+        signalHealthTracker = CaptureSignalHealthTracker(
+            attempt: attempt,
+            thresholds: .macOSApplication,
+        )
+        signalHealth = signalHealthTracker?.snapshot(for: attempt)
+
+        guard includeLiveContinuation else { return }
+        let (liveStream, liveContinuation) = AsyncStream<LiveAudioBuffer>.makeStream()
+        liveBufferContinuation = liveContinuation
+        liveBufferTask = Task.detached(priority: .userInitiated) { [liveStore] in
+            for await buffer in liveStream {
+                guard !Task.isCancelled else { break }
+                await liveStore.append(buffer, generation: liveGeneration)
+            }
+        }
+    }
+
+    @MainActor
+    @discardableResult
+    func beginApplicationRebindForTest(
+        plan: MacApplicationStartupPlan,
+        attempt: SessionAttemptID,
+        signalState: CaptureSignalState = .silent,
+    ) -> Bool {
+        beginApplicationRebind(plan: plan, attempt: attempt, signalState: signalState)
+        return onlineRebindTask != nil
+    }
+
+    @MainActor
+    func waitForApplicationRebindForTest() async {
+        let task = onlineRebindTask
+        await task?.value
+    }
+
+    @MainActor
+    func cancelApplicationRebindForTest(for attempt: SessionAttemptID) {
+        guard activeAttempt == attempt else { return }
+        sourceGenerationGate.invalidate(attempt)
+        rebindCoordinator.cancel(attempt)
+        onlineRebindCancellation?.cancel()
+        onlineRebindTask?.cancel()
+        onlineRebindToken = nil
+    }
+
+    @MainActor
+    func cleanupOnlineRebindLifecycleForTest(for attempt: SessionAttemptID) {
+        cancelApplicationRebindForTest(for: attempt)
+        isCapturing = false
+        activeAttempt = nil
+        attemptGate.invalidate(attempt)
+        signalHealthTracker?.invalidate(attempt)
+        signalHealthTracker = nil
+        signalHealth = nil
+        activeCaptureGeneration = nil
+        activeSourceGeneration = nil
+        onlineRootPID = nil
+        onlineSelectedIdentity = nil
+        onlineTargetPIDs = []
+        onlineSourceAvailable = false
+        stopLiveBufferPump()
+    }
+
+    var onlineSourceAvailableForTest: Bool { onlineSourceAvailable }
+
+    var onlineRecoveryPendingForTest: Bool { onlineRecoveryDeadline != nil }
+
+    var onlineRebindFirstCallbackWaitActiveForTest: Bool {
+        onlineRebindCancellation?.hasActiveWaiter == true
+    }
+
     private func startLevelTimer() {
         levelTimer?.invalidate()
         levelTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
@@ -995,7 +1144,7 @@ final class CaptureController {
                    let signal = tracker.snapshot(for: attempt) {
                     self.signalHealth = signal
                 }
-                if self.onlineRootPID != nil {
+                if self.onlineRootPID != nil, self.onlineSourceAvailable {
                     let snapshot = await self.nativeExecutor.levelSnapshot(for: attempt)
                     guard self.isCapturing,
                           self.activeAttempt == attempt,
@@ -1004,6 +1153,15 @@ final class CaptureController {
                     self.levelDBFS = snapshot.levelDBFS
                     self.checkOnlineFrameProgress(for: attempt)
                     self.scheduleApplicationProbe(for: attempt)
+                } else if self.onlineSelectedIdentity != nil {
+                    // The old native source may already have been destroyed
+                    // while a bounded post-stop resolution/recovery is in
+                    // flight. Do not expose a source-less session as healthy
+                    // and do not query a native level snapshot that has no tap.
+                    self.scheduleApplicationProbe(
+                        for: attempt,
+                        forcedSignalState: .noCallbacks,
+                    )
                 } else if let microphoneCapture = self.microphoneCapture {
                     if let error = microphoneCapture.terminalError {
                         self.terminateMicrophoneCapture(error.localizedDescription)
@@ -1088,9 +1246,19 @@ final class CaptureController {
                         signalState: signalState,
                     )
                 case .preserveCurrent, .noChange, .unsupportedWeakIdentity:
-                    if signalState == .noCallbacks,
-                       let deadline = self.onlineRecoveryDeadline,
-                       ProcessInfo.processInfo.systemUptime >= deadline {
+                    if !self.onlineSourceAvailable,
+                       selectedIdentity.strength == .strong {
+                        // After old-source teardown, even a same-topology
+                        // observation is a recovery candidate: the session is
+                        // source-less and must build a fresh tap.
+                        self.beginApplicationRebind(
+                            plan: plan,
+                            attempt: attempt,
+                            signalState: signalState,
+                        )
+                    } else if signalState == .noCallbacks,
+                              let deadline = self.onlineRecoveryDeadline,
+                              ProcessInfo.processInfo.systemUptime >= deadline {
                         self.reportTerminalFailure(CaptureError.captureCallbacksStalled.localizedDescription)
                     }
                 }
@@ -1117,6 +1285,15 @@ final class CaptureController {
         attempt: SessionAttemptID,
         timeout: TimeInterval,
     ) async throws -> MacApplicationStartupPlan {
+        if let applicationReconcileOverride {
+            return try await applicationReconcileOverride(
+                selectedIdentity,
+                previousPID,
+                attempt,
+                timeout,
+            )
+        }
+
         let callbackAttemptGate = attemptGate
         let reconciliationTask = Task.detached(priority: .userInitiated) {
             try await MacApplicationStartupReconciler.reconcile(
@@ -1156,19 +1333,49 @@ final class CaptureController {
         return try await MacApplicationStartupTask.value(of: reconciliationTask)
     }
 
+    private static func isValidStrongApplicationPlan(
+        _ plan: MacApplicationStartupPlan,
+        selectedIdentity: ApplicationIdentity,
+    ) -> Bool {
+        selectedIdentity.strength == .strong
+            && plan.result.state == .resolved
+            && plan.rootPID != nil
+            && !plan.topologyPIDs.isEmpty
+            && !plan.translatedTargetPIDs.isEmpty
+    }
+
     private func beginApplicationRebind(
         plan: MacApplicationStartupPlan,
         attempt: SessionAttemptID,
         signalState: CaptureSignalState,
     ) {
-        guard rebindCoordinator.begin(attempt),
-              onlineRebindTask == nil,
+        guard onlineRebindTask == nil,
               let oldGeneration = activeSourceGeneration,
               let selectedIdentity = onlineSelectedIdentity,
-              let cancellation = startCancellation,
               let liveContinuation = liveBufferContinuation,
               let oldRootPID = onlineRootPID
         else { return }
+
+        let sourceWasAvailable = onlineSourceAvailable
+        if sourceWasAvailable {
+            guard MacApplicationRebindPolicy.decide(
+                selectedIdentity: selectedIdentity,
+                currentRootPID: oldRootPID,
+                currentTargetPIDs: Array(onlineTargetPIDs),
+                resolution: plan.result,
+                signalState: signalState,
+            ) == .rebind else { return }
+        } else {
+            // After the destructive point there is no old tap to preserve.
+            // A strong identity may recover even when the latest observation
+            // is temporarily missing/ambiguous; the task will re-resolve
+            // before constructing the next source.
+            guard selectedIdentity.strength == .strong else { return }
+        }
+
+        guard rebindCoordinator.begin(attempt) else { return }
+        let rebindCancellation = CaptureStartCancellation()
+        onlineRebindCancellation = rebindCancellation
 
         let rebindToken = UUID()
         onlineRebindToken = rebindToken
@@ -1179,54 +1386,99 @@ final class CaptureController {
                     self.rebindCoordinator.end(attempt)
                     self.onlineRebindTask = nil
                     self.onlineRebindToken = nil
+                    self.onlineRebindCancellation = nil
                 }
             }
             guard let self else { return }
             do {
-                let initialDecision = MacApplicationRebindPolicy.decide(
+                // Confirm the observation while the existing tap is still
+                // alive. A transient helper row must not destroy a healthy
+                // source merely because it disappeared before handoff.
+                let confirmed = try await self.reconcileApplication(
                     selectedIdentity: selectedIdentity,
-                    currentRootPID: oldRootPID,
-                    currentTargetPIDs: oldTargets,
-                    resolution: plan.result,
-                    signalState: signalState,
-                )
-                guard initialDecision == .rebind,
-                      let nextGeneration = self.sourceGenerationGate.advance(attempt)
-                else { return }
-                self.activeSourceGeneration = nextGeneration
-
-                let stopOld = self.nativeExecutor.beginApplicationSourceStop(
+                    previousPID: oldRootPID,
                     attempt: attempt,
-                    sourceGeneration: oldGeneration,
+                    timeout: 1.0,
                 )
-                try await stopOld.value()
                 guard self.isCapturing,
                       self.activeAttempt == attempt,
                       self.attemptGate.accepts(attempt),
                       self.rebindCoordinator.canPublish(attempt),
-                      self.onlineRebindToken == rebindToken
+                      self.onlineRebindToken == rebindToken,
+                      !rebindCancellation.isCancelled
                 else { return }
 
-                // Re-resolve after the old tap has drained. This is the
-                // handoff gate immediately before CATap construction.
-                let refreshed = try await self.reconcileApplication(
-                    selectedIdentity: selectedIdentity,
-                    previousPID: oldRootPID,
-                    attempt: attempt,
-                    timeout: Self.onlineProcessRegistrationTimeout,
-                )
-                let refreshedDecision = MacApplicationRebindPolicy.decide(
-                    selectedIdentity: selectedIdentity,
-                    currentRootPID: oldRootPID,
-                    currentTargetPIDs: oldTargets,
-                    resolution: refreshed.result,
-                    signalState: signalState,
-                )
-                guard refreshedDecision == .rebind,
-                      let rootPID = refreshed.rootPID,
-                      !refreshed.topologyPIDs.isEmpty,
-                      !refreshed.translatedTargetPIDs.isEmpty
-                else {
+                if sourceWasAvailable {
+                    let confirmedDecision = MacApplicationRebindPolicy.decide(
+                        selectedIdentity: selectedIdentity,
+                        currentRootPID: oldRootPID,
+                        currentTargetPIDs: oldTargets,
+                        resolution: confirmed.result,
+                        signalState: signalState,
+                    )
+                    guard confirmedDecision == .rebind else {
+                        // The topology returned to the old observation. Keep
+                        // the current tap intact and let the next probe retry.
+                        return
+                    }
+                } else {
+                    guard Self.isValidStrongApplicationPlan(confirmed, selectedIdentity: selectedIdentity) else {
+                        throw CaptureError.applicationAudioUnavailable
+                    }
+                }
+
+                guard let nextGeneration = self.sourceGenerationGate.advance(attempt) else {
+                    throw CancellationError()
+                }
+                self.activeSourceGeneration = nextGeneration
+
+                let refreshed: MacApplicationStartupPlan
+                if sourceWasAvailable {
+                    do {
+                        try await self.rebindDriver.stopApplicationSource(
+                            attempt: attempt,
+                            sourceGeneration: oldGeneration,
+                        )
+                    } catch {
+                        // A failed stop is not evidence that the old tap is
+                        // still healthy. The generation is already stale, so
+                        // keep the control plane source-less and let the
+                        // bounded recovery path decide what can be rebuilt.
+                        self.onlineSourceAvailable = false
+                        if self.onlineRecoveryDeadline == nil {
+                            self.onlineRecoveryDeadline = ProcessInfo.processInfo.systemUptime + 6
+                        }
+                        throw error
+                    }
+                    guard self.isCapturing,
+                          self.activeAttempt == attempt,
+                          self.attemptGate.accepts(attempt),
+                          self.rebindCoordinator.canPublish(attempt),
+                          self.onlineRebindToken == rebindToken,
+                          !rebindCancellation.isCancelled
+                    else { return }
+                    self.onlineSourceAvailable = false
+                    if self.onlineRecoveryDeadline == nil {
+                        self.onlineRecoveryDeadline = ProcessInfo.processInfo.systemUptime + 6
+                    }
+                    self.signalHealthTracker?.invalidate(attempt)
+                    self.signalHealth = nil
+
+                    // The old tap is gone now. A same-topology result is
+                    // valid: it still needs a fresh CATap over the session.
+                    refreshed = try await self.reconcileApplication(
+                        selectedIdentity: selectedIdentity,
+                        previousPID: oldRootPID,
+                        attempt: attempt,
+                        timeout: Self.onlineProcessRegistrationTimeout,
+                    )
+                } else {
+                    refreshed = confirmed
+                }
+                guard Self.isValidStrongApplicationPlan(refreshed, selectedIdentity: selectedIdentity) else {
+                    throw CaptureError.applicationAudioUnavailable
+                }
+                guard let rootPID = refreshed.rootPID else {
                     throw CaptureError.applicationAudioUnavailable
                 }
 
@@ -1255,7 +1507,7 @@ final class CaptureController {
                     _ = liveContinuation.yield(buffer)
                 }
                 let baseline = await self.liveStore.callbackCount()
-                let nativeRebind = self.nativeExecutor.beginApplicationRebind(
+                try await self.rebindDriver.startApplicationSource(
                     attempt: attempt,
                     sourceGeneration: nextGeneration,
                     rootPID: rootPID,
@@ -1264,11 +1516,10 @@ final class CaptureController {
                     liveSink: applicationSink,
                     sourceCallbackGate: sourceCallbackGate,
                 )
-                try await nativeRebind.value()
                 _ = try await self.waitForFirstCallbacks(
                     after: baseline,
                     timeout: Self.onlineFirstBufferTimeout,
-                    cancellation: cancellation,
+                    cancellation: rebindCancellation,
                 )
                 guard self.isCapturing,
                       self.activeAttempt == attempt,
@@ -1280,6 +1531,7 @@ final class CaptureController {
                 self.onlineRootPID = rootPID
                 self.onlineTargetPIDs = Set(refreshed.translatedTargetPIDs)
                 self.activeSourceGeneration = nextGeneration
+                self.onlineSourceAvailable = true
                 self.onlineRecoveryDeadline = nil
                 self.onlineRebindFailureCount = 0
             } catch {

@@ -20,6 +20,78 @@ private final class GenerationTestCounter: @unchecked Sendable {
     }
 }
 
+private final class TestRebindDriver: CaptureApplicationRebindDriver, @unchecked Sendable {
+    private let emitFirstCallback: Bool
+    private var stopCountValue = 0
+    private var startCountValue = 0
+
+    init(emitFirstCallback: Bool = true) {
+        self.emitFirstCallback = emitFirstCallback
+    }
+
+    var stopCount: Int {
+        return stopCountValue
+    }
+
+    var startCount: Int {
+        return startCountValue
+    }
+
+    func stopApplicationSource(
+        attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
+    ) async throws {
+        _ = attempt
+        _ = sourceGeneration
+        stopCountValue += 1
+    }
+
+    func startApplicationSource(
+        attempt: SessionAttemptID,
+        sourceGeneration: CaptureSourceGeneration,
+        rootPID: pid_t,
+        pids: [pid_t],
+        registrationTimeout: TimeInterval,
+        liveSink: @escaping LiveAudioSink,
+        sourceCallbackGate: @escaping @Sendable () -> Bool,
+    ) async throws {
+        _ = attempt
+        _ = sourceGeneration
+        _ = rootPID
+        _ = pids
+        _ = registrationTimeout
+        _ = sourceCallbackGate
+        startCountValue += 1
+        let shouldEmit = emitFirstCallback
+        if shouldEmit {
+            liveSink(LiveAudioBuffer(
+                samples: [0],
+                channelCount: 1,
+                sampleRate: 16_000,
+                hostTime: 0,
+            ))
+        }
+    }
+}
+
+private final class TestApplicationReconcileSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var plans: [MacApplicationStartupPlan]
+
+    init(_ plans: [MacApplicationStartupPlan]) {
+        self.plans = plans
+    }
+
+    func next() throws -> MacApplicationStartupPlan {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !plans.isEmpty else {
+            throw CaptureError.applicationAudioUnavailable
+        }
+        return plans.removeFirst()
+    }
+}
+
 private func generationResolution(
     state: ApplicationResolutionState = .resolved,
     rootPID: pid_t? = 200,
@@ -40,6 +112,18 @@ private func generationResolution(
 
 private func strongTestIdentity() -> ApplicationIdentity {
     ApplicationIdentity(bundleIdentifier: "com.example.class")
+}
+
+private func missingResolution() -> MacApplicationStartupPlan {
+    MacApplicationStartupPlan(
+        result: generationResolution(state: .missing, rootPID: nil, targets: []),
+    )
+}
+
+private func startupPlan(rootPID: pid_t, targets: [pid_t]) -> MacApplicationStartupPlan {
+    MacApplicationStartupPlan(
+        result: generationResolution(rootPID: rootPID, targets: targets),
+    )
 }
 
 @Test
@@ -287,6 +371,190 @@ func rebindFailurePreservesExistingAudio() throws {
     // A failed source generation changes no durable session file; the
     // existing evidence remains readable for recovery/finalization.
     #expect(try Data(contentsOf: url) == original)
+}
+
+@MainActor
+@Test
+func successfulStartupCleanupDoesNotDisableMidRecordingRebind() async {
+    let attempt = SessionAttemptID(generation: 1)
+    let identity = strongTestIdentity()
+    let changed = startupPlan(rootPID: 200, targets: [200, 300])
+    let driver = TestRebindDriver()
+    let sequence = TestApplicationReconcileSequence([changed, changed])
+    let controller = CaptureController(
+        rebindDriver: driver,
+        applicationReconcile: { _, _, _, _ in try sequence.next() },
+    )
+    await controller.prepareOnlineRebindLifecycleForTest(
+        attempt: attempt,
+        selectedIdentity: identity,
+        rootPID: 200,
+        targetPIDs: [200],
+    )
+
+    #expect(controller.beginApplicationRebindForTest(plan: changed, attempt: attempt))
+    await controller.waitForApplicationRebindForTest()
+
+    #expect(driver.stopCount == 1)
+    #expect(driver.startCount == 1)
+    #expect(controller.onlineSourceAvailableForTest)
+    controller.cleanupOnlineRebindLifecycleForTest(for: attempt)
+}
+
+@MainActor
+@Test
+func failedRebindPrerequisiteDoesNotLeakCoordinatorOwnership() async {
+    let attempt = SessionAttemptID(generation: 1)
+    let identity = strongTestIdentity()
+    let changed = startupPlan(rootPID: 200, targets: [200, 300])
+    let driver = TestRebindDriver()
+    let sequence = TestApplicationReconcileSequence([changed, changed])
+    let controller = CaptureController(
+        rebindDriver: driver,
+        applicationReconcile: { _, _, _, _ in try sequence.next() },
+    )
+    await controller.prepareOnlineRebindLifecycleForTest(
+        attempt: attempt,
+        selectedIdentity: identity,
+        rootPID: 200,
+        targetPIDs: [200],
+        includeLiveContinuation: false,
+    )
+
+    #expect(!controller.beginApplicationRebindForTest(plan: changed, attempt: attempt))
+
+    await controller.prepareOnlineRebindLifecycleForTest(
+        attempt: attempt,
+        selectedIdentity: identity,
+        rootPID: 200,
+        targetPIDs: [200],
+    )
+    #expect(controller.beginApplicationRebindForTest(plan: changed, attempt: attempt))
+    await controller.waitForApplicationRebindForTest()
+
+    #expect(driver.startCount == 1)
+    controller.cleanupOnlineRebindLifecycleForTest(for: attempt)
+}
+
+@MainActor
+@Test
+func stopCancelsRebindFirstCallbackWait() async {
+    let attempt = SessionAttemptID(generation: 1)
+    let identity = strongTestIdentity()
+    let changed = startupPlan(rootPID: 200, targets: [200, 300])
+    let driver = TestRebindDriver(emitFirstCallback: false)
+    let sequence = TestApplicationReconcileSequence([changed, changed])
+    let controller = CaptureController(
+        rebindDriver: driver,
+        applicationReconcile: { _, _, _, _ in try sequence.next() },
+    )
+    await controller.prepareOnlineRebindLifecycleForTest(
+        attempt: attempt,
+        selectedIdentity: identity,
+        rootPID: 200,
+        targetPIDs: [200],
+    )
+
+    #expect(controller.beginApplicationRebindForTest(plan: changed, attempt: attempt))
+    for _ in 0 ..< 100 {
+        if controller.onlineRebindFirstCallbackWaitActiveForTest { break }
+        await Task.yield()
+    }
+    #expect(controller.onlineRebindFirstCallbackWaitActiveForTest)
+
+    controller.cancelApplicationRebindForTest(for: attempt)
+    await controller.waitForApplicationRebindForTest()
+
+    #expect(!controller.onlineRebindFirstCallbackWaitActiveForTest)
+    #expect(!controller.onlineSourceAvailableForTest)
+    controller.cleanupOnlineRebindLifecycleForTest(for: attempt)
+}
+
+@MainActor
+@Test
+func transientHelperAppearanceDoesNotDestroyHealthySource() async {
+    let attempt = SessionAttemptID(generation: 1)
+    let identity = strongTestIdentity()
+    let changed = startupPlan(rootPID: 200, targets: [200, 300])
+    let original = startupPlan(rootPID: 200, targets: [200])
+    let driver = TestRebindDriver()
+    let sequence = TestApplicationReconcileSequence([original])
+    let controller = CaptureController(
+        rebindDriver: driver,
+        applicationReconcile: { _, _, _, _ in try sequence.next() },
+    )
+    await controller.prepareOnlineRebindLifecycleForTest(
+        attempt: attempt,
+        selectedIdentity: identity,
+        rootPID: 200,
+        targetPIDs: [200],
+    )
+
+    #expect(controller.beginApplicationRebindForTest(plan: changed, attempt: attempt))
+    await controller.waitForApplicationRebindForTest()
+
+    #expect(driver.stopCount == 0)
+    #expect(driver.startCount == 0)
+    #expect(controller.onlineSourceAvailableForTest)
+    controller.cleanupOnlineRebindLifecycleForTest(for: attempt)
+}
+
+@MainActor
+@Test
+func topologyReturnsToOriginalAfterOldStopStillStartsSource() async {
+    let attempt = SessionAttemptID(generation: 1)
+    let identity = strongTestIdentity()
+    let changed = startupPlan(rootPID: 200, targets: [200, 300])
+    let original = startupPlan(rootPID: 200, targets: [200])
+    let driver = TestRebindDriver()
+    let sequence = TestApplicationReconcileSequence([changed, original])
+    let controller = CaptureController(
+        rebindDriver: driver,
+        applicationReconcile: { _, _, _, _ in try sequence.next() },
+    )
+    await controller.prepareOnlineRebindLifecycleForTest(
+        attempt: attempt,
+        selectedIdentity: identity,
+        rootPID: 200,
+        targetPIDs: [200],
+    )
+
+    #expect(controller.beginApplicationRebindForTest(plan: changed, attempt: attempt))
+    await controller.waitForApplicationRebindForTest()
+
+    #expect(driver.stopCount == 1)
+    #expect(driver.startCount == 1)
+    #expect(controller.onlineSourceAvailableForTest)
+    controller.cleanupOnlineRebindLifecycleForTest(for: attempt)
+}
+
+@MainActor
+@Test
+func failedPostStopResolutionCannotLeaveHealthyStateWithNoNativeSource() async {
+    let attempt = SessionAttemptID(generation: 1)
+    let identity = strongTestIdentity()
+    let changed = startupPlan(rootPID: 200, targets: [200, 300])
+    let driver = TestRebindDriver()
+    let sequence = TestApplicationReconcileSequence([changed, missingResolution()])
+    let controller = CaptureController(
+        rebindDriver: driver,
+        applicationReconcile: { _, _, _, _ in try sequence.next() },
+    )
+    await controller.prepareOnlineRebindLifecycleForTest(
+        attempt: attempt,
+        selectedIdentity: identity,
+        rootPID: 200,
+        targetPIDs: [200],
+    )
+
+    #expect(controller.beginApplicationRebindForTest(plan: changed, attempt: attempt))
+    await controller.waitForApplicationRebindForTest()
+
+    #expect(driver.stopCount == 1)
+    #expect(driver.startCount == 0)
+    #expect(!controller.onlineSourceAvailableForTest)
+    #expect(controller.onlineRecoveryPendingForTest)
+    controller.cleanupOnlineRebindLifecycleForTest(for: attempt)
 }
 
 private final class TestGenerationClock: @unchecked Sendable, CaptureMonotonicClock {
