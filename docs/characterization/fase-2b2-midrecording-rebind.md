@@ -84,14 +84,16 @@ El rebind cierra la admisión y drena el callback viejo antes de detener y
 disponer su recorder; la generación vieja permanece actual durante todo ese
 stop/drain. Conserva el mismo `source.raw`/writer, avanza la generación y arma
 el handoff sólo después del drain, vuelve a resolver y revalida el root antes
-de construir la nueva encarnación. `CaptureHandoffTimeline` toma
-`Stopwatch.GetTimestamp()` únicamente en el primer callback no vacío aceptado
-de la nueva generación: el gap se mide desde el final durable de N hasta la
-llegada de ese PCM, por lo que incluye resolve/build/start/first-callback.
-Los callbacks normales de una misma generación nunca rellenan jitter; un
-callback vacío no consume el gap y un callback stale no puede consumirlo. El
-silencio se escribe en chunks acotados. El presupuesto de 30 s aplica al gap
-total: si se supera, produce un fault explícito y detiene la captura; no se
+de construir la nueva encarnación. `CaptureHandoffTimeline` comienza la
+generación sin timestamp: `Stopwatch.GetTimestamp()` se toma únicamente en el
+primer callback no vacío aceptado, tanto para anclar el primer PCM de la sesión
+como para cerrar el handoff de la nueva generación. El gap se mide desde el
+final durable de N hasta la llegada de ese PCM, por lo que incluye
+resolve/build/start/first-callback sin convertir la latencia inicial en un gap
+futuro. Los callbacks normales avanzan sólo por duración de bytes; un callback
+vacío no ancla ni consume el handoff y un callback stale no puede consumirlo.
+El silencio se escribe en chunks acotados. El presupuesto de 30 s aplica al
+gap total: si se supera, produce un fault explícito y detiene la captura; no se
 devuelve `0` fingiendo éxito.
 
 El seam de writer se usa desde `WindowsAudioCapture` y cubre también el
@@ -121,6 +123,9 @@ post-stop fallida deja una recuperación explícita sin fuente nativa saludable
 y un stop/drain pausado no permite publicar N+1 antes de liberar callbacks
 viejos (`pausedMacCallbackCannotWriteOrPublishAfterGenerationSwitch`). En
 Windows, los tests ejercitan `CaptureHandoffTimeline`, el lease de callback,
+el ancla inicial (`initialStartupDelayDoesNotBecomeFutureRebindGap`,
+`zeroLengthStartupCallbacksDoNotAnchorTimeline`,
+`initialFirstPcmAnchorsOnlyOnce`, `initialDelayCannotTriggerFalseSafetyBound`),
 el gap hasta el primer PCM (`handoffGapIncludesResolveBuildAndFirstCallbackDelay`),
 el fault sobre 30 s (`buildDelayBeyondSafetyBoundProducesExplicitFault`) y el
 writer boundary usado por `WindowsAudioCapture`

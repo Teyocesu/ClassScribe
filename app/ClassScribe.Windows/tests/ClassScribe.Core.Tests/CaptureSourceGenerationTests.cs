@@ -236,9 +236,12 @@ public sealed class CaptureSourceGenerationTests
         var gate = new CaptureSourceGenerationGate();
         var generation = gate.Begin(attempt);
         var timeline = new CaptureHandoffTimeline(32_000);
-        timeline.BeginGeneration(generation, 0);
+        timeline.BeginGeneration(generation);
 
-        var first = timeline.PreparePacket(generation, 3_200);
+        var first = timeline.PreparePacket(
+            generation,
+            3_200,
+            arrivalTimestamp: () => 0);
         timeline.CommitPacket(first);
         // The ordinary callback path has no wall-clock sample. A callback that
         // arrives late is still a normal packet and cannot manufacture a gap.
@@ -250,14 +253,133 @@ public sealed class CaptureSourceGenerationTests
     }
 
     [TestMethod]
+    public void initialStartupDelayDoesNotBecomeFutureRebindGap()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var oldGeneration = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(oldGeneration);
+
+        // The first real PCM arrives at T5 and contains 10 s of durable audio,
+        // so the old durable end is T15—not T10 from StartAsync.
+        var firstOldPacket = timeline.PreparePacket(
+            oldGeneration,
+            320_000,
+            arrivalTimestamp: () => Stopwatch.Frequency * 5);
+        timeline.CommitPacket(firstOldPacket);
+        Assert.AreEqual(Stopwatch.Frequency * 15, timeline.Snapshot.LastPacketEndTimestamp);
+
+        var newGeneration = gate.Advance(attempt)!;
+        timeline.MarkHandoff(newGeneration);
+        var firstNewPacket = timeline.PreparePacket(
+            newGeneration,
+            3_200,
+            arrivalTimestamp: () => Stopwatch.Frequency * 17);
+
+        Assert.AreEqual(CaptureGapDisposition.Silence, firstNewPacket.HandoffGap.Disposition);
+        Assert.AreEqual(64_000, firstNewPacket.HandoffGap.SilenceBytes);
+    }
+
+    [TestMethod]
+    public void zeroLengthStartupCallbacksDoNotAnchorTimeline()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var generation = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(generation);
+        var arrivalCalls = 0;
+        Func<long> firstArrival = () =>
+        {
+            arrivalCalls++;
+            return Stopwatch.Frequency * 20;
+        };
+
+        Assert.IsTrue(timeline.PreparePacket(generation, 0, firstArrival).IsEmpty);
+        Assert.IsTrue(timeline.PreparePacket(generation, 0, firstArrival).IsEmpty);
+        Assert.AreEqual(0, arrivalCalls);
+
+        var first = timeline.PreparePacket(generation, 3_200, firstArrival);
+        timeline.CommitPacket(first);
+
+        Assert.AreEqual(1, arrivalCalls);
+        Assert.AreEqual(
+            Stopwatch.Frequency * 20 + Stopwatch.Frequency / 10,
+            timeline.Snapshot.LastPacketEndTimestamp);
+    }
+
+    [TestMethod]
+    public void initialFirstPcmAnchorsOnlyOnce()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var generation = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(generation);
+        var arrivalCalls = 0;
+        Func<long> arrival = () =>
+        {
+            arrivalCalls++;
+            return arrivalCalls == 1
+                ? Stopwatch.Frequency * 5
+                : Stopwatch.Frequency * 100;
+        };
+
+        var first = timeline.PreparePacket(generation, 3_200, arrival);
+        timeline.CommitPacket(first);
+        var second = timeline.PreparePacket(generation, 3_200, arrival);
+        timeline.CommitPacket(second);
+        var third = timeline.PreparePacket(generation, 3_200, arrival);
+        timeline.CommitPacket(third);
+
+        Assert.AreEqual(1, arrivalCalls);
+        Assert.AreEqual(CaptureGapDisposition.NoGap, second.HandoffGap.Disposition);
+        Assert.AreEqual(CaptureGapDisposition.NoGap, third.HandoffGap.Disposition);
+        Assert.AreEqual(
+            Stopwatch.Frequency * 5 + Stopwatch.Frequency * 3 / 10,
+            timeline.Snapshot.LastPacketEndTimestamp);
+    }
+
+    [TestMethod]
+    public void initialDelayCannotTriggerFalseSafetyBound()
+    {
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var gate = new CaptureSourceGenerationGate();
+        var oldGeneration = gate.Begin(attempt);
+        var timeline = new CaptureHandoffTimeline(32_000);
+        timeline.BeginGeneration(oldGeneration);
+        var firstOldPacket = timeline.PreparePacket(
+            oldGeneration,
+            32_000,
+            arrivalTimestamp: () => Stopwatch.Frequency * 40);
+        timeline.CommitPacket(firstOldPacket);
+
+        var newGeneration = gate.Advance(attempt)!;
+        timeline.MarkHandoff(newGeneration);
+        var firstNewPacket = timeline.PreparePacket(
+            newGeneration,
+            3_200,
+            arrivalTimestamp: () => Stopwatch.Frequency * 42,
+            maximumGap: TimeSpan.FromSeconds(30));
+
+        Assert.IsFalse(firstNewPacket.RequiresExplicitFailure);
+        Assert.AreEqual(CaptureGapDisposition.Silence, firstNewPacket.HandoffGap.Disposition);
+        Assert.AreEqual(32_000, firstNewPacket.HandoffGap.SilenceBytes);
+    }
+
+    [TestMethod]
     public void rebindGapIsInsertedExactlyOnce()
     {
         var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
         var gate = new CaptureSourceGenerationGate();
         var oldGeneration = gate.Begin(attempt);
         var timeline = new CaptureHandoffTimeline(32_000);
-        timeline.BeginGeneration(oldGeneration, 0);
-        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.BeginGeneration(oldGeneration);
+        var oldPacket = timeline.PreparePacket(
+            oldGeneration,
+            32_000,
+            arrivalTimestamp: () => 0);
         timeline.CommitPacket(oldPacket);
 
         var newGeneration = gate.Advance(attempt)!;
@@ -265,7 +387,7 @@ public sealed class CaptureSourceGenerationTests
         var firstNewPacket = timeline.PreparePacket(
             newGeneration,
             3_200,
-            handoffArrivalTimestamp: () => Stopwatch.Frequency * 3);
+            arrivalTimestamp: () => Stopwatch.Frequency * 3);
         timeline.CommitPacket(firstNewPacket);
         var secondNewPacket = timeline.PreparePacket(newGeneration, 3_200);
 
@@ -282,8 +404,11 @@ public sealed class CaptureSourceGenerationTests
         var gate = new CaptureSourceGenerationGate();
         var oldGeneration = gate.Begin(attempt);
         var timeline = new CaptureHandoffTimeline(32_000);
-        timeline.BeginGeneration(oldGeneration, 0);
-        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.BeginGeneration(oldGeneration);
+        var oldPacket = timeline.PreparePacket(
+            oldGeneration,
+            32_000,
+            arrivalTimestamp: () => 0);
         timeline.CommitPacket(oldPacket);
         var newGeneration = gate.Advance(attempt)!;
         timeline.MarkHandoff(newGeneration);
@@ -292,7 +417,7 @@ public sealed class CaptureSourceGenerationTests
         var firstNonEmpty = timeline.PreparePacket(
             newGeneration,
             3_200,
-            handoffArrivalTimestamp: () => Stopwatch.Frequency * 3);
+            arrivalTimestamp: () => Stopwatch.Frequency * 3);
 
         Assert.IsTrue(empty.IsEmpty);
         Assert.AreEqual(CaptureGapDisposition.NoGap, empty.HandoffGap.Disposition);
@@ -307,8 +432,11 @@ public sealed class CaptureSourceGenerationTests
         var gate = new CaptureSourceGenerationGate();
         var oldGeneration = gate.Begin(attempt);
         var timeline = new CaptureHandoffTimeline(32_000);
-        timeline.BeginGeneration(oldGeneration, 0);
-        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.BeginGeneration(oldGeneration);
+        var oldPacket = timeline.PreparePacket(
+            oldGeneration,
+            32_000,
+            arrivalTimestamp: () => 0);
         timeline.CommitPacket(oldPacket);
         var newGeneration = gate.Advance(attempt)!;
         timeline.MarkHandoff(newGeneration);
@@ -317,7 +445,7 @@ public sealed class CaptureSourceGenerationTests
         var current = timeline.PreparePacket(
             newGeneration,
             3_200,
-            handoffArrivalTimestamp: () => Stopwatch.Frequency * 3);
+            arrivalTimestamp: () => Stopwatch.Frequency * 3);
 
         Assert.IsTrue(stale.IsRejected);
         Assert.AreEqual(CaptureGapDisposition.Silence, current.HandoffGap.Disposition);
@@ -331,8 +459,11 @@ public sealed class CaptureSourceGenerationTests
         var gate = new CaptureSourceGenerationGate();
         var oldGeneration = gate.Begin(attempt);
         var timeline = new CaptureHandoffTimeline(32_000);
-        timeline.BeginGeneration(oldGeneration, 0);
-        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.BeginGeneration(oldGeneration);
+        var oldPacket = timeline.PreparePacket(
+            oldGeneration,
+            32_000,
+            arrivalTimestamp: () => 0);
         timeline.CommitPacket(oldPacket);
         var newGeneration = gate.Advance(attempt)!;
         timeline.MarkHandoff(newGeneration);
@@ -340,7 +471,7 @@ public sealed class CaptureSourceGenerationTests
         var firstNewPacket = timeline.PreparePacket(
             newGeneration,
             3_200,
-            handoffArrivalTimestamp: () => Stopwatch.Frequency * 40,
+            arrivalTimestamp: () => Stopwatch.Frequency * 40,
             maximumGap: TimeSpan.FromSeconds(30));
 
         Assert.IsTrue(firstNewPacket.RequiresExplicitFailure);
@@ -387,8 +518,11 @@ public sealed class CaptureSourceGenerationTests
         var gate = new CaptureSourceGenerationGate();
         var oldGeneration = gate.Begin(attempt);
         var timeline = new CaptureHandoffTimeline(32_000);
-        timeline.BeginGeneration(oldGeneration, 0);
-        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.BeginGeneration(oldGeneration);
+        var oldPacket = timeline.PreparePacket(
+            oldGeneration,
+            32_000,
+            arrivalTimestamp: () => 0);
         timeline.CommitPacket(oldPacket);
 
         var newGeneration = gate.Advance(attempt)!;
@@ -396,7 +530,7 @@ public sealed class CaptureSourceGenerationTests
         var firstNewPacket = timeline.PreparePacket(
             newGeneration,
             3_200,
-            handoffArrivalTimestamp: () => Stopwatch.Frequency * 6);
+            arrivalTimestamp: () => Stopwatch.Frequency * 6);
 
         // The durable old end is 1 s and the first accepted new PCM arrives
         // at 6 s: resolve/build/start/first-callback delay contributes 5 s.
@@ -411,8 +545,11 @@ public sealed class CaptureSourceGenerationTests
         var gate = new CaptureSourceGenerationGate();
         var oldGeneration = gate.Begin(attempt);
         var timeline = new CaptureHandoffTimeline(32_000);
-        timeline.BeginGeneration(oldGeneration, 0);
-        var oldPacket = timeline.PreparePacket(oldGeneration, 32_000);
+        timeline.BeginGeneration(oldGeneration);
+        var oldPacket = timeline.PreparePacket(
+            oldGeneration,
+            32_000,
+            arrivalTimestamp: () => 0);
         timeline.CommitPacket(oldPacket);
 
         var newGeneration = gate.Advance(attempt)!;
@@ -420,7 +557,7 @@ public sealed class CaptureSourceGenerationTests
         var firstNewPacket = timeline.PreparePacket(
             newGeneration,
             3_200,
-            handoffArrivalTimestamp: () => Stopwatch.Frequency * 32,
+            arrivalTimestamp: () => Stopwatch.Frequency * 32,
             maximumGap: TimeSpan.FromSeconds(30));
 
         Assert.IsTrue(firstNewPacket.RequiresExplicitFailure);

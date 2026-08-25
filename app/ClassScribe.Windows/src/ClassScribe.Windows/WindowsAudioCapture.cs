@@ -215,7 +215,9 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         noCallbackReportedAttempt = null;
         captureCancellation = new CancellationTokenSource();
         var sourceGeneration = sourceGenerationGate.Begin(attempt);
-        packetTimeline.BeginGeneration(sourceGeneration, Stopwatch.GetTimestamp());
+        // Startup latency is not durable audio. The timeline anchors only
+        // when the first non-empty PCM callback reaches the writer boundary.
+        packetTimeline.BeginGeneration(sourceGeneration);
         recentPackets.Clear();
         lock (sync)
         {
@@ -553,7 +555,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         var plan = packetTimeline.PreparePacket(
             generation,
             copy.Length,
-            handoffArrivalTimestamp: Stopwatch.GetTimestamp,
+            arrivalTimestamp: Stopwatch.GetTimestamp,
             maximumGap: RebindGapSafetyBound);
         if (plan.IsRejected)
         {

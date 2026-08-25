@@ -3,9 +3,9 @@ using System.Diagnostics;
 namespace ClassScribe.Core;
 
 /// The durable packet writer's handoff state. It deliberately has no wall-clock
-/// sampling on ordinary callbacks: only the first non-empty callback of a new
-/// generation samples the monotonic arrival boundary and consumes the pending
-/// gap.
+/// sampling on ordinary callbacks: only the first non-empty callback of the
+/// initial or a newly handed-off generation samples its monotonic arrival
+/// boundary. Later callbacks advance only by durable PCM duration.
 public sealed class CaptureHandoffTimeline
 {
     private readonly object sync = new();
@@ -34,17 +34,12 @@ public sealed class CaptureHandoffTimeline
         }
     }
 
-    public void BeginGeneration(CaptureSourceGeneration generation, long boundaryTimestamp)
+    public void BeginGeneration(CaptureSourceGeneration generation)
     {
         ArgumentNullException.ThrowIfNull(generation);
         lock (sync)
         {
             activeGeneration = generation;
-            if (lastPacketEndTimestamp is null)
-            {
-                lastPacketEndTimestamp = boundaryTimestamp;
-            }
-
             pendingHandoff = null;
         }
     }
@@ -62,7 +57,7 @@ public sealed class CaptureHandoffTimeline
     public CapturePacketWritePlan PreparePacket(
         CaptureSourceGeneration generation,
         int byteCount,
-        Func<long>? handoffArrivalTimestamp = null,
+        Func<long>? arrivalTimestamp = null,
         TimeSpan maximumGap = default)
     {
         ArgumentNullException.ThrowIfNull(generation);
@@ -88,19 +83,20 @@ public sealed class CaptureHandoffTimeline
             {
                 return CapturePacketWritePlan.Rejected(generation, byteCount);
             }
-            var handoffArrival = handoff is null
-                ? null
-                : handoffArrivalTimestamp?.Invoke()
+            var needsArrivalTimestamp = lastPacketEndTimestamp is null || handoff is not null;
+            var arrival = needsArrivalTimestamp
+                ? arrivalTimestamp?.Invoke()
                     ?? throw new InvalidOperationException(
-                        "El primer PCM de un handoff necesita su timestamp de llegada.");
+                        "El primer PCM aceptado necesita su timestamp de llegada.")
+                : null;
             var assessment = handoff is null
                 ? new CaptureGapAssessment(CaptureGapDisposition.NoGap, 0, 0)
                 : CaptureGapSilence.Assess(
                     lastPacketEndTimestamp,
-                    handoffArrival,
+                    arrival!.Value,
                     bytesPerSecond,
                     maximumGap: maximumGap);
-            var baseTimestamp = handoffArrival ?? lastPacketEndTimestamp;
+            var baseTimestamp = arrival ?? lastPacketEndTimestamp;
             var packetEndTimestamp = baseTimestamp is null
                 ? null
                 : checked(baseTimestamp.Value + DurationTicks(byteCount));

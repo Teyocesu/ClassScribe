@@ -68,7 +68,7 @@ Objetivo: diferenciar transporte/señal y agregar global con consentimiento expl
 - [ ] Fase 2A: ejecutar runtime/tests Windows; **SKIPPED — dotnet unavailable**.
 - [x] Fase 2B.1: separar identidad lógica de encarnación PID y reconciliar aplicación/topología durante startup; validar AudioObjectIDs justo antes del handoff CATap y revalidar el root Windows antes de `BuildAsync`.
 - [x] Fase 2B.2 **FIXED / PARTIAL**: macOS rebind durante grabación con confirmación → stop/drain de la generación vieja → avance de generación → salud fresca → build/start, recuperación post-stop explícita y seams de lifecycle; el gate físico PID lifecycle permanece pendiente.
-- [x] Fase 2B.2 **FIXED / PARTIAL**: Windows rebind durante grabación con drenaje de callbacks antes del cambio, writer/generation seam, gap desde el primer PCM no vacío hasta un máximo total de 30 s y reconstrucción por root reemplazado; runtime físico **SKIPPED — dotnet/csc unavailable**.
+- [x] Fase 2B.2 **FIXED / PARTIAL**: Windows rebind durante grabación con drenaje de callbacks antes del cambio, timeline durable anclado al primer PCM no vacío inicial o post-handoff, gap total máximo de 30 s y reconstrucción por root reemplazado; runtime físico **SKIPPED — dotnet/csc unavailable**.
 - [ ] Implementar global CATap y WASAPI loopback con exclusión/self y device lifecycle correspondientes.
 - [ ] Implementar modal de privacidad y CTA `Capturar audio del equipo`, sin transición automática posible.
 - [ ] Separar master source-rate/stereo del derivado ASR 16 kHz mono.
