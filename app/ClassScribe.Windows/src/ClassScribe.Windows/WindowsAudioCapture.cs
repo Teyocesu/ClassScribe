@@ -192,7 +192,10 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         capturedBytes = 0;
         recentBytes = 0;
         recentPackets.Clear();
-        captureAttempt = attempt;
+        lock (sync)
+        {
+            captureAttempt = attempt;
+        }
         signalHealthTracker.Begin(attempt);
         PublishSignalHealth(attempt);
 
@@ -221,12 +224,15 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                     EnumerateProcessIncarnations,
                     cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
-                recorder = await builder
-                    .WithProcessLoopback(
-                        checked((uint)resolvedRootPID),
-                        ProcessLoopbackMode.IncludeTargetProcessTree)
-                    .BuildAsync()
-                    .ConfigureAwait(false);
+                recorder = await WindowsApplicationStartup.BuildProcessLoopbackIfCurrentAttemptAsync(
+                    attempt,
+                    IsCurrentAttempt,
+                    () => builder
+                        .WithProcessLoopback(
+                            checked((uint)resolvedRootPID),
+                            ProcessLoopbackMode.IncludeTargetProcessTree)
+                        .BuildAsync(),
+                    cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -364,6 +370,14 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private static TaskCompletionSource NewSignal() =>
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    private bool IsCurrentAttempt(SessionAttemptID attempt)
+    {
+        lock (sync)
+        {
+            return captureAttempt == attempt;
+        }
+    }
+
     private void HandleDataAvailable(
         SessionAttemptID attempt,
         ReadOnlySpan<byte> buffer,
@@ -490,9 +504,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private async Task FinishCaptureResourcesAsync()
     {
         var currentRecorder = recorder;
-        var finishedAttempt = captureAttempt;
+        SessionAttemptID? finishedAttempt;
+        lock (sync)
+        {
+            finishedAttempt = captureAttempt;
+            captureAttempt = null;
+        }
         recorder = null;
-        captureAttempt = null;
         if (currentRecorder is not null)
         {
             if (dataAvailableHandler is not null)

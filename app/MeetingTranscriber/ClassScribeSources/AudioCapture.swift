@@ -484,6 +484,7 @@ final class CaptureController {
 
     func refreshSources() {
         let ownPID = ProcessInfo.processInfo.processIdentifier
+        var seenIdentityIDs = Set<String>()
         applications = NSWorkspace.shared.runningApplications.compactMap { app in
             guard app.activationPolicy == .regular,
                   app.processIdentifier != ownPID,
@@ -499,6 +500,7 @@ final class CaptureController {
                 processID: app.processIdentifier,
             )
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        .filter { seenIdentityIDs.insert($0.logicalIdentityID).inserted }
 
         let discovery = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.microphone],
@@ -594,7 +596,7 @@ final class CaptureController {
                 let selectedIdentity = application.identity
                 let previousPID = application.processID
                 let callbackAttemptGate = attemptGate
-                let startupPlan = try await Task.detached(priority: .userInitiated) {
+                let reconciliationTask = Task.detached(priority: .userInitiated) {
                     try await MacApplicationStartupReconciler.reconcile(
                         selectedIdentity: selectedIdentity,
                         previousPID: previousPID,
@@ -631,7 +633,9 @@ final class CaptureController {
                         },
                         isCurrentAttempt: { callbackAttemptGate.accepts($0) },
                     )
-                }.value
+                }
+                let startupPlan = try await MacApplicationStartupTask.value(of: reconciliationTask)
+                try Task.checkCancellation()
                 guard activeAttempt == attempt else { throw CancellationError() }
                 switch startupPlan.result.state {
                 case .missing:
@@ -648,6 +652,8 @@ final class CaptureController {
                       !startupPlan.translatedTargetPIDs.isEmpty else {
                     throw CaptureError.applicationAudioUnavailable
                 }
+                try Task.checkCancellation()
+                guard activeAttempt == attempt else { throw CancellationError() }
                 let rawURL = folder.appendingPathComponent("source.raw")
                 let elapsed = Double(
                     DispatchTime.now().uptimeNanoseconds - reconciliationStarted,

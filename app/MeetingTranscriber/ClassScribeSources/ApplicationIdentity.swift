@@ -167,6 +167,21 @@ struct MacApplicationStartupPlan: Equatable, Sendable {
     var translatedTargetPIDs: [pid_t] { result.translatedTargetPIDs }
 }
 
+/// Owns a detached startup reconciliation task. Cancellation of the caller
+/// must cancel the detached task as well; otherwise the caller can stop
+/// waiting while reconciliation continues without an owner.
+enum MacApplicationStartupTask {
+    static func value(
+        of task: Task<MacApplicationStartupPlan, Error>,
+    ) async throws -> MacApplicationStartupPlan {
+        try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+}
+
 enum MacApplicationIdentityResolver {
     static func resolve(
         selectedIdentity: ApplicationIdentity,

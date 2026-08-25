@@ -127,7 +127,7 @@ final class ClassScribeModel {
         capture = injectedCapture ?? CaptureController()
         capture.refreshSources()
         history = store.history()
-        selectedApplicationIdentityID = capture.applications.first?.id
+        selectedApplicationIdentityID = capture.applications.first?.logicalIdentityID
         selectedMicrophoneID = capture.microphones.first?.id
     }
 
@@ -156,7 +156,7 @@ final class ClassScribeModel {
     }
 
     var selectedApplication: RunningApplication? {
-        capture.applications.first { $0.id == selectedApplicationIdentityID }
+        capture.applications.first { $0.logicalIdentityID == selectedApplicationIdentityID }
     }
 
     var selectedMicrophone: MicrophoneOption? {
@@ -281,7 +281,7 @@ final class ClassScribeModel {
     func refreshSources() {
         capture.refreshSources()
         if selectedApplication == nil {
-            selectedApplicationIdentityID = capture.applications.first?.id
+            selectedApplicationIdentityID = capture.applications.first?.logicalIdentityID
         }
         if selectedMicrophone == nil {
             selectedMicrophoneID = capture.microphones.first?.id

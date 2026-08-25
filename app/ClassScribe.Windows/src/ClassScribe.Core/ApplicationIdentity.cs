@@ -140,17 +140,6 @@ public static class WindowsApplicationResolver
             .ToArray();
         var matchIds = strongMatches.Select(static candidate => candidate.ProcessId).ToArray();
 
-        if (strongMatches.Length > 1)
-        {
-            return new WindowsApplicationResolution(
-                ApplicationResolutionState.Ambiguous,
-                selectedIdentity.StableKey,
-                previousProcessId,
-                null,
-                strongMatches.Length,
-                matchIds);
-        }
-
         if (previousProcessId is not null)
         {
             var previous = candidates.FirstOrDefault(
@@ -161,6 +150,17 @@ public static class WindowsApplicationResolver
             {
                 return Resolved(selectedIdentity, previousProcessId, previous, strongMatches.Length, matchIds);
             }
+        }
+
+        if (strongMatches.Length > 1)
+        {
+            return new WindowsApplicationResolution(
+                ApplicationResolutionState.Ambiguous,
+                selectedIdentity.StableKey,
+                previousProcessId,
+                null,
+                strongMatches.Length,
+                matchIds);
         }
 
         if (!selectedIdentity.HasStrongIdentity)
@@ -243,6 +243,36 @@ public static class WindowsApplicationStartup
         }
 
         return resolution.ResolvedProcessId.Value;
+    }
+
+    /// The final ownership gate for process-loopback construction. The
+    /// delegate is invoked synchronously after the attempt and cancellation
+    /// checks, so a stale startup cannot reach WithProcessLoopback/BuildAsync.
+    /// The Windows capture product calls this at the actual recorder-build
+    /// boundary; it is not a publication-only helper.
+    public static async Task<T> BuildProcessLoopbackIfCurrentAttemptAsync<T>(
+        SessionAttemptID attempt,
+        Func<SessionAttemptID, bool> isCurrentAttempt,
+        Func<Task<T>> buildAsync,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(attempt);
+        ArgumentNullException.ThrowIfNull(isCurrentAttempt);
+        ArgumentNullException.ThrowIfNull(buildAsync);
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!isCurrentAttempt(attempt))
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!isCurrentAttempt(attempt))
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+
+        return await buildAsync().ConfigureAwait(false);
     }
 
     public static bool TryPublishResolution(

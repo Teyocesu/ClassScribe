@@ -14,6 +14,12 @@ private final class IdentityTestCounter: @unchecked Sendable {
         value += 1
         return value
     }
+
+    var current: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
 }
 
 private func strongIdentity(
@@ -166,6 +172,64 @@ func staleAttemptCannotPublishResolvedTopology() async {
             isProcessAlive: { _ in true },
         )
     }
+}
+
+@Test
+func parentTaskCancellationStopsStartupReconciliation() async {
+    let identity = strongIdentity()
+    let attempt = SessionAttemptID(generation: 1)
+    let reconciliationStarted = IdentityTestCounter()
+    let nativeStartInvocations = IdentityTestCounter()
+    let parent = Task { () throws -> Void in
+        let reconciliationTask = Task.detached(priority: .userInitiated) {
+            try await MacApplicationStartupReconciler.reconcile(
+                selectedIdentity: identity,
+                previousPID: 101,
+                attempt: attempt,
+                timeout: 60,
+                pollInterval: 0.001,
+                candidates: {
+                    _ = reconciliationStarted.increment()
+                    return []
+                },
+                topology: { _ in [] },
+                translatedTargets: { _ in [] },
+                isCurrentAttempt: { _ in true },
+                isProcessAlive: { _ in true },
+            )
+        }
+
+        _ = try await MacApplicationStartupTask.value(of: reconciliationTask)
+        try Task.checkCancellation()
+        _ = nativeStartInvocations.increment()
+    }
+
+    for _ in 0 ..< 1_000 where reconciliationStarted.current == 0 {
+        await Task.yield()
+    }
+    #expect(reconciliationStarted.current > 0)
+
+    parent.cancel()
+    do {
+        try await parent.value
+        Issue.record("La cancelación del padre no detuvo el startup")
+    } catch is CancellationError {
+        // Expected: the owned reconciliation task observes cancellation.
+    } catch {
+        Issue.record("Error inesperado al cancelar startup: \(error)")
+    }
+
+    #expect(nativeStartInvocations.current == 0)
+}
+
+@Test
+func applicationRowsSeparateLogicalIdentityFromIncarnationID() {
+    let identity = strongIdentity()
+    let first = RunningApplication(identity: identity, name: "Class", processID: 101)
+    let second = RunningApplication(identity: identity, name: "Class", processID: 202)
+
+    #expect(first.logicalIdentityID == second.logicalIdentityID)
+    #expect(first.id != second.id)
 }
 
 @Test

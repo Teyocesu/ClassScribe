@@ -19,7 +19,7 @@ public sealed class ApplicationIdentityTests
     }
 
     [TestMethod]
-    public void expiredPidUniqueStrongReplacementResolves()
+    public void expiredRootWithUniqueStrongReplacementResolves()
     {
         var identity = StrongIdentity();
         var result = WindowsApplicationResolver.Resolve(
@@ -51,7 +51,7 @@ public sealed class ApplicationIdentityTests
     }
 
     [TestMethod]
-    public void ambiguousReplacementIsRejected()
+    public void expiredRootWithMultipleStrongReplacementsIsAmbiguous()
     {
         var identity = StrongIdentity();
         var result = WindowsApplicationResolver.Resolve(
@@ -65,6 +65,42 @@ public sealed class ApplicationIdentityTests
         Assert.AreEqual(ApplicationResolutionState.Ambiguous, result.State);
         Assert.IsNull(result.ResolvedProcessId);
         CollectionAssert.AreEqual(new[] { 202, 303 }, result.CandidateProcessIds.ToArray());
+    }
+
+    [TestMethod]
+    public void incumbentRootWinsWhenSiblingProcessesShareStrongIdentity()
+    {
+        var identity = StrongIdentity();
+        var result = WindowsApplicationResolver.Resolve(
+            identity,
+            101,
+            [
+                new WindowsProcessIncarnation(101, identity),
+                new WindowsProcessIncarnation(102, identity),
+                new WindowsProcessIncarnation(103, identity),
+            ]);
+
+        Assert.AreEqual(ApplicationResolutionState.Resolved, result.State);
+        Assert.AreEqual(101, result.ResolvedProcessId);
+    }
+
+    [TestMethod]
+    public void incumbentPidWithDifferentIdentityIsNotAccepted()
+    {
+        var selected = StrongIdentity();
+        var different = WindowsApplicationIdentity.FromObservation(
+            @"C:\Apps\Other\Other.exe",
+            "Other");
+        var result = WindowsApplicationResolver.Resolve(
+            selected,
+            101,
+            [
+                new WindowsProcessIncarnation(101, different),
+                new WindowsProcessIncarnation(202, selected),
+            ]);
+
+        Assert.AreEqual(ApplicationResolutionState.Resolved, result.State);
+        Assert.AreEqual(202, result.ResolvedProcessId);
     }
 
     [TestMethod]
@@ -113,6 +149,27 @@ public sealed class ApplicationIdentityTests
             CancellationToken.None);
 
         Assert.AreEqual(202, resolved);
+    }
+
+    [TestMethod]
+    public async Task staleAttemptCannotReachProcessLoopbackBuildBoundary()
+    {
+        var stale = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var current = SessionAttemptID.Create(stale.SessionID, 2);
+        var buildReached = false;
+
+        await Assert.ThrowsExceptionAsync<OperationCanceledException>(() =>
+            WindowsApplicationStartup.BuildProcessLoopbackIfCurrentAttemptAsync(
+                stale,
+                attempt => attempt == current,
+                () =>
+                {
+                    buildReached = true;
+                    return Task.FromResult(101);
+                },
+                CancellationToken.None));
+
+        Assert.IsFalse(buildReached);
     }
 
     private static WindowsApplicationIdentity StrongIdentity() =>

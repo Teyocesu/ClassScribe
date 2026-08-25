@@ -241,7 +241,7 @@ struct ContentView: View {
             Picker("Aplicación", selection: $model.selectedApplicationIdentityID) {
                 Text("Seleccionar aplicación…").tag(String?.none)
                 ForEach(model.capture.applications) { app in
-                    Text(app.name).tag(String?.some(app.id))
+                    Text(app.name).tag(String?.some(app.logicalIdentityID))
                 }
             }
             .labelsHidden()

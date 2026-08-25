@@ -44,7 +44,10 @@ struct RunningApplication: Identifiable, Hashable {
     let name: String
     let processID: pid_t
 
-    var id: String { identity.stableKey }
+    /// UI row identity for one observed process incarnation. This is never
+    /// used as the selected application's logical identity.
+    var id: String { "\(logicalIdentityID)|pid:\(processID)" }
+    var logicalIdentityID: String { identity.stableKey }
     var bundleIdentifier: String { identity.bundleIdentifier ?? "" }
     var bundleURL: URL? { identity.bundleURL }
     var executableURL: URL? { identity.executableURL }
@@ -60,8 +63,8 @@ struct RunningApplication: Identifiable, Hashable {
     }
 
     /// Compatibility initializer for existing physical fixtures. The PID is
-    /// retained only as the observed incarnation; the logical ID is derived
-    /// from the supplied identity fields.
+    /// retained only as the observed incarnation; the logical identity is
+    /// derived from the supplied identity fields.
     init(
         id: pid_t,
         name: String,

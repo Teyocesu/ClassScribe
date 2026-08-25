@@ -13,8 +13,10 @@ cambios de persistencia.
 La implementación separa la identidad lógica de una aplicación de su PID
 efímero. El PID queda como diagnóstico de la encarnación observada; no se usa
 como la identidad seleccionada ni se persiste como tal. La reconciliación de
-startup pertenece al intento dueño y tiene deadline monotónico, cancelación y
-publicación protegida contra intentos obsoletos.
+startup pertenece al intento dueño y tiene deadline monotónico, cancelación
+propagada al trabajo detached y publicación protegida contra intentos
+obsoletos. Las filas del picker mantienen un ID de encarnación separado de la
+identidad lógica seleccionable.
 
 ## Modelo macOS
 
@@ -42,9 +44,12 @@ explícito.
 `WindowsApplicationIdentity` prefiere ruta ejecutable y package identity cuando
 está disponible; nombre de proceso solo es débil y no permite auto-rebind. El
 root se revalida inmediatamente antes de
-`WithProcessLoopback(...).BuildAsync()`: un PID expirado sólo se reemplaza con
-exactamente una coincidencia fuerte; cero candidatos es `missing` y más de uno
-es `ambiguous`. No existe una API de rebind para un recorder activo.
+`WithProcessLoopback(...).BuildAsync()`. Si el PID incumbente sigue teniendo la
+identidad seleccionada, conserva precedencia aunque existan hermanos con la
+misma identidad fuerte; sólo cuando falta o no coincide se aplican las reglas
+de cero candidatos (`missing`), una coincidencia (`resolved`) o varias
+(`ambiguous`). Una identidad débil nunca auto-reenlaza. No existe una API de
+rebind para un recorder activo.
 
 ## Resultados estructurados y seguridad de intentos
 
@@ -62,12 +67,19 @@ macOS: `sameIdentitySamePidResolves`,
 `helperAppearsAfterInitialEnumerationIsIncluded`, `deadPidIsRemovedFromTopology`,
 `unrelatedSameDisplayNameIsNotSelected`, `multipleStrongMatchesAreAmbiguous`,
 `missingApplicationIsMissing`, `staleAttemptCannotPublishResolvedTopology`,
+`parentTaskCancellationStopsStartupReconciliation`,
+`applicationRowsSeparateLogicalIdentityFromIncarnationID`,
 `translatedAudioTargetIsValidatedBeforeTapHandoff` y
 `noValidAudioObjectsDoesNotCreateTap` pasan en el focused Swift.
 
-Windows: `sameIdentitySameRootResolves`, `expiredPidUniqueStrongReplacementResolves`,
-`sameNameDifferentExecutableDoesNotMatch`, `ambiguousReplacementIsRejected`,
-`weakIdentityDoesNotAutoRebind`, `staleAttemptCannotPublishReplacement` y
+Windows: `sameIdentitySameRootResolves`,
+`incumbentRootWinsWhenSiblingProcessesShareStrongIdentity`,
+`expiredRootWithUniqueStrongReplacementResolves`,
+`expiredRootWithMultipleStrongReplacementsIsAmbiguous`,
+`incumbentPidWithDifferentIdentityIsNotAccepted`,
+`sameNameDifferentExecutableDoesNotMatch`, `weakIdentityDoesNotAutoRebind`,
+`staleAttemptCannotPublishReplacement`,
+`staleAttemptCannotReachProcessLoopbackBuildBoundary` y
 `resolvedPidIsRevalidatedBeforeBuildAsync` quedan escritos para MSTest.
 
 ## Gates físicos
