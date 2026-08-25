@@ -3,10 +3,10 @@
 Fecha: 2026-08-25
 
 Baseline correctivo final: `v0.8.0-development` = `524319e579e954fc374b07c95ab917f1bd53fe3c`
-Estado: correctivo final de Windows session-stop ownership implementado;
-**FIXED / PARTIAL**.
-La revisión independiente y los gates físicos/runtime Windows permanecen
-pendientes; esta caracterización no marca 2C.1 como aprobada.
+Estado final: revisión independiente **APPROVED**; arquitectura/backend/lifecycle
+local **APPROVED**; Windows compile/runtime **SKIPPED — dotnet/csc unavailable**;
+gates físicos **PENDING**. Esto no implica release readiness completo; Fase 2C.2
+permanece **NOT STARTED**.
 
 ## Alcance
 

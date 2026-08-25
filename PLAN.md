@@ -2,7 +2,7 @@
 
 Fecha: 2026-08-25
 
-Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente** (runtime process-backed macOS **PASS**; runtime Windows **PENDING / SKIPPED — dotnet unavailable**); Fase 1C **ARCHITECTURE APPROVED** (CATap subsystem físico macOS **PASS**; micrófono macOS physical gate pending — TCC; Windows physical/runtime gate pending; process isolation **INCONCLUSIVE / evidence-gated**, no requerida por la evidencia actual). La arquitectura de Fase 1 está **APPROVED**; los physical release gates permanecen pendientes; Fase 2A **FIXED / PARTIAL**, Fase 2B.1 **COMPLETE / PARTIAL**, Fase 2B.2 **FIXED / PARTIAL**, Fase 2C.1 **FIXED / PARTIAL — correctivo final de Windows Stop ownership implementado, revisión independiente pendiente**, Fase 2C.2 **NOT STARTED** y Fases 2D–2F **NOT STARTED**.
+Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente** (runtime process-backed macOS **PASS**; runtime Windows **PENDING / SKIPPED — dotnet unavailable**); Fase 1C **ARCHITECTURE APPROVED** (CATap subsystem físico macOS **PASS**; micrófono macOS physical gate pending — TCC; Windows physical/runtime gate pending; process isolation **INCONCLUSIVE / evidence-gated**, no requerida por la evidencia actual). La arquitectura de Fase 1 está **APPROVED**; los physical release gates permanecen pendientes; Fase 2A **FIXED / PARTIAL**, Fase 2B.1 **COMPLETE / PARTIAL**, Fase 2B.2 **FIXED / PARTIAL**, Fase 2C.1 **APPROVED arquitectónicamente y con los gates locales disponibles; Windows compile/runtime y gates físicos pendientes**, Fase 2C.2 **NOT STARTED** y Fases 2D–2F **NOT STARTED**.
 SPEC canónica: [`docs/specs/v0.8.0.md`](docs/specs/v0.8.0.md)
 
 Este documento es mutable: ordena trabajo pequeño y verificable. No redefine requisitos. Cada fase se valida localmente con el patrón `focused → subsystem`; los gates con TCC, hardware, llamada real o Windows físico están definidos en la SPEC.
@@ -58,7 +58,7 @@ porque `dotnet` no está instalado. El detalle reproducible existente está en
 
 ## Fase 2 — Captura confiable y audio del equipo
 
-Estado: **FASE 2C.1 FIXED / PARTIAL — correctivo final de Windows lifecycle/device restart implementado; revisión independiente y gates físicos pendientes**; Fase 2A permanece **FIXED / PARTIAL**, Fase 2B.1 permanece **COMPLETE / PARTIAL**, Fase 2B.2 permanece **FIXED / PARTIAL**, Fase 2C.2 permanece **NOT STARTED** y Fases 2D–2F permanecen **NOT STARTED**.
+Estado: **FASE 2C.1 APPROVED arquitectónicamente y con los gates locales disponibles; Windows compile/runtime y gates físicos pendientes**; Fase 2A permanece **FIXED / PARTIAL**, Fase 2B.1 permanece **COMPLETE / PARTIAL**, Fase 2B.2 permanece **FIXED / PARTIAL**, Fase 2C.2 permanece **NOT STARTED** y Fases 2D–2F permanecen **NOT STARTED**.
 
 Objetivo: diferenciar transporte/señal y agregar global con consentimiento explícito y master fiel.
 
@@ -69,7 +69,7 @@ Objetivo: diferenciar transporte/señal y agregar global con consentimiento expl
 - [x] Fase 2B.1: separar identidad lógica de encarnación PID y reconciliar aplicación/topología durante startup; validar AudioObjectIDs justo antes del handoff CATap y revalidar el root Windows antes de `BuildAsync`.
 - [x] Fase 2B.2 **FIXED / PARTIAL**: macOS rebind durante grabación con confirmación → stop/drain de la generación vieja → avance de generación → salud fresca → build/start, recuperación post-stop explícita y seams de lifecycle; el gate físico PID lifecycle permanece pendiente.
 - [x] Fase 2B.2 **FIXED / PARTIAL**: Windows rebind durante grabación con drenaje de callbacks antes del cambio, timeline durable anclado al primer PCM no vacío inicial o post-handoff, gap total máximo de 30 s y reconstrucción por root reemplazado; runtime físico **SKIPPED — dotnet/csc unavailable**.
-- [x] Fase 2C.1 **FIXED / PARTIAL**: infraestructura CATap global y WASAPI render loopback con exclusión/self, autorización efímera por intento, generaciones, ownership durable, lifecycle serializado, Stop single-flight real hasta `FinalizeRaw`, cleanup post-`BuildAsync` y failure terminal observable; revisión independiente y gates físicos/runtime Windows pendientes.
+- [x] Fase 2C.1 **APPROVED arquitectónicamente / gates locales disponibles**: infraestructura CATap global y WASAPI render loopback con exclusión/self, autorización efímera por intento, generaciones, ownership durable, lifecycle serializado, Stop single-flight real hasta `FinalizeRaw`, cleanup post-`BuildAsync` y failure terminal observable; Windows compile/runtime y gates físicos pendientes.
 - [ ] Fase 2C.2 **NOT STARTED**: implementar modal de privacidad y CTA `Capturar audio del equipo`, sin transición automática posible.
 - [ ] Separar master source-rate/stereo del derivado ASR 16 kHz mono.
 - [ ] Elegir RF64/W64 o segmentos después del fixture de clase larga.
