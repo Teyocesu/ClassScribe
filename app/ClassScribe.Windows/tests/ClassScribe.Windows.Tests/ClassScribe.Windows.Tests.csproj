@@ -1,0 +1,11 @@
+<Project Sdk="MSTest.Sdk/4.3.3">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.22000.0</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <RootNamespace>ClassScribe.Windows.Tests</RootNamespace>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/ClassScribe.Windows/ClassScribe.Windows.csproj" />
+  </ItemGroup>
+</Project>

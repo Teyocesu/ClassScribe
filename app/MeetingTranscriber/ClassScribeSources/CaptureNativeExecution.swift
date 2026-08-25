@@ -455,9 +455,8 @@ final class CaptureNativeExecutor: @unchecked Sendable {
             }
             try Self.checkCancellation(work)
 
-            let exclusions = AppAudioCapture.systemOutputExclusionObjectIDs()
             let session = AudioCaptureSession(
-                source: .systemOutput(excludingProcessObjectIDs: exclusions),
+                source: .systemOutput,
                 appOutputURL: outputURL,
                 micOutputURL: nil,
                 appLiveSink: liveSink,
@@ -562,7 +561,7 @@ final class CaptureNativeExecutor: @unchecked Sendable {
                 if let session = captureSessions[attempt] {
                     continuation.resume(returning: CaptureNativeLevelSnapshot(
                         levelDBFS: session.appLevelDBFS,
-                        terminalErrorMessage: nil,
+                        terminalErrorMessage: session.appTerminalErrorMessage,
                     ))
                     return
                 }

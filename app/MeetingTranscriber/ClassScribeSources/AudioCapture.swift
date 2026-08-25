@@ -1243,6 +1243,10 @@ final class CaptureController {
                           self.activeAttempt == attempt,
                           self.attemptGate.accepts(attempt)
                     else { return }
+                    if let terminalErrorMessage = snapshot.terminalErrorMessage {
+                        self.reportTerminalFailure(terminalErrorMessage)
+                        return
+                    }
                     self.levelDBFS = snapshot.levelDBFS
                 } else if self.onlineRootPID != nil, self.onlineSourceAvailable {
                     let snapshot = await self.nativeExecutor.levelSnapshot(for: attempt)
@@ -1250,6 +1254,10 @@ final class CaptureController {
                           self.activeAttempt == attempt,
                           self.attemptGate.accepts(attempt)
                     else { return }
+                    if let terminalErrorMessage = snapshot.terminalErrorMessage {
+                        self.reportTerminalFailure(terminalErrorMessage)
+                        return
+                    }
                     self.levelDBFS = snapshot.levelDBFS
                     self.checkOnlineFrameProgress(for: attempt)
                     self.scheduleApplicationProbe(for: attempt)

@@ -246,6 +246,14 @@ public class AudioCaptureSession {
         appCapture?.currentLevelDBFS ?? -120
     }
 
+    /// Terminal output-device restart failure owned by the current native
+    /// source. The session keeps the stopped AppAudioCapture object attached
+    /// until the control plane observes this value and performs normal
+    /// recoverable finalization, so durable audio is never discarded.
+    public var appTerminalErrorMessage: String? {
+        appCapture?.terminalErrorMessage
+    }
+
     /// Instantaneous mic level in dBFS, decayed to -120 when no buffer has arrived
     /// in the last 0.5 s. Drives the menu-bar asymmetric-silence indicator.
     public var micLevelDBFS: Double {

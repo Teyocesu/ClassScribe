@@ -1,11 +1,11 @@
 import CoreAudio
 
-/// Native CATap source kinds. The system-output variant is deliberately
-/// represented by the validated process-object IDs to exclude, not by an
-/// application PID list. This keeps the global tap boundary explicit.
+/// Native CATap source policies. System-output capture stores only the policy
+/// to exclude ClassScribe itself; the AudioObjectIDs are ephemeral CoreAudio
+/// evidence and are revalidated at every CATap construction.
 public enum AppAudioCaptureSource: Equatable, Sendable {
     case application(processes: [pid_t])
-    case systemOutput(excludingProcessObjectIDs: [AudioObjectID])
+    case systemOutput
 }
 
 /// Already validated object IDs handed to the SDK construction boundary.

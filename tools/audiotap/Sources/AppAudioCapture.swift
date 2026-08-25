@@ -8,10 +8,11 @@ private let logger = Logger(subsystem: "com.meetingtranscriber.audiotap", catego
 /// No Screen Recording permission needed — only Audio Capture.
 /// Monitors default output device changes and recreates the tap when needed.
 ///
-/// Most mutable state is serialized through `writeQueue` (`audiotap.writer`,
+/// Native lifecycle mutations are serialized through `lifecycleQueue`; durable
+/// callback work is serialized through `writeQueue` (`audiotap.writer`,
 /// userInteractive QoS) or driven from the CoreAudio IOProc callback which
-/// never overlaps with itself for a given tap. The two fields the main thread
-/// and the IOProc genuinely touch concurrently — `actualSampleRate` and
+/// never overlaps with itself for a given tap. The fields the lifecycle path
+/// and IOProc genuinely touch concurrently — `actualSampleRate` and
 /// `isRunning` — are instead `OSAllocatedUnfairLock`-backed so each access is
 /// atomic. `@unchecked Sendable` reflects that this serialization is manual
 /// rather than expressible to the compiler.
@@ -46,11 +47,11 @@ public class AppAudioCapture: @unchecked Sendable {
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
     /// Guards delayed route-change retries. Without a generation token, a
-    /// retry already queued on the main dispatch queue can recreate the tap
-    /// after the user has stopped the recording.
+    /// retry already queued on the lifecycle queue can recreate the tap after
+    /// the user has stopped the recording.
     private let lifecycle = CaptureLifecycleGate()
     /// Gates the IOProc callback (read on `writeQueue`), set on the start/stop
-    /// path on the main thread. It becomes true immediately before
+    /// path on the lifecycle queue. It becomes true immediately before
     /// `AudioDeviceStart` so a synchronously-enqueued first callback is accepted;
     /// the atomic lock makes that ordering visible to `writeQueue`.
     private let runningLock = OSAllocatedUnfairLock(initialState: false)
@@ -69,12 +70,28 @@ public class AppAudioCapture: @unchecked Sendable {
     private let writeQueue = DispatchQueue(
         label: "audiotap.writer", qos: .userInteractive,
     )
+    /// Sole owner of every CoreAudio mutation for this instance. The
+    /// property-listener callback is delivered on main, but it only enqueues a
+    /// notification here; it never starts, stops, destroys, or recreates a
+    /// native source itself.
+    private let lifecycleQueue = DispatchQueue(
+        label: "audiotap.lifecycle", qos: .userInitiated,
+    )
 
     /// `internal` (not `private`) so the cross-file `+DebugLogging` extension
     /// can drive the per-buffer RMS accumulator + dBFS report cadence.
     var debugRMS = DebugRMSReporter()
     var debugTotalBytes: UInt64 = 0
     let levelPublisher = LevelPublisher()
+    private let terminalErrorLock = OSAllocatedUnfairLock(initialState: Optional<String>.none)
+
+    /// A bounded output-device restart that gives up is a source-owned
+    /// terminal signal. It remains readable after the native source is
+    /// stopped, allowing the control plane to preserve and finalize the
+    /// durable file instead of presenting a healthy but source-less capture.
+    public var terminalErrorMessage: String? {
+        terminalErrorLock.withLock { $0 }
+    }
 
     /// Returns the instantaneous app-audio level in dBFS, decayed to -120 if
     /// no buffer arrived in the last 0.5 seconds (e.g. tap died, device
@@ -174,22 +191,43 @@ public class AppAudioCapture: @unchecked Sendable {
     }
 
     public func start() throws {
-        guard let generation = lifecycle.begin() else {
-            throw NSError(
-                domain: "audiotap", code: -2,
-                userInfo: [NSLocalizedDescriptionKey: "Audio capture is already active"],
-            )
-        }
-        do {
-            try startCapture()
-            guard lifecycle.isActive(generation) else {
-                stopCapture()
-                throw CancellationError()
+        try lifecycleQueue.sync {
+            guard let generation = lifecycle.begin() else {
+                throw NSError(
+                    domain: "audiotap", code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "Audio capture is already active"],
+                )
             }
-            installOutputDeviceChangeListener()
-        } catch {
-            lifecycle.end(generation)
-            throw error
+            deviceChangeCoordinator.reset()
+            terminalErrorLock.withLock { $0 = nil }
+            do {
+                try startCapture()
+                guard lifecycle.isActive(generation) else {
+                    stopCapture()
+                    throw CancellationError()
+                }
+                installOutputDeviceChangeListener()
+            } catch {
+                stopCapture()
+                removeOutputDeviceChangeListener()
+                lifecycle.end(generation)
+                throw error
+            }
+        }
+    }
+
+    /// Product seam used by the host's focused lifecycle tests. It submits
+    /// work to the same serial owner as start/stop/restart; it does not create
+    /// a parallel state machine or bypass native ownership.
+    @_spi(ClassScribeTests)
+    public func performLifecycleOperationForTesting(
+        _ operation: @escaping @Sendable () -> Void,
+    ) async {
+        await withCheckedContinuation { continuation in
+            lifecycleQueue.async {
+                operation()
+                continuation.resume()
+            }
         }
     }
 
@@ -330,10 +368,8 @@ public class AppAudioCapture: @unchecked Sendable {
                     )
                 }
             }
-        } else if case let .systemOutput(exclusions) = source {
-            logger.info(
-                "System output global tap requested; validated self-exclusion count=\(exclusions.count, privacy: .public)",
-            )
+        } else if case .systemOutput = source {
+            logger.info("System output global tap requested; self-exclusions will be revalidated before CATap construction")
         }
 
         // Get default output device UID
@@ -368,7 +404,14 @@ public class AppAudioCapture: @unchecked Sendable {
         case .application:
             let handoffTranslated = try translatePIDs()
             tapSource = .application(processObjectIDs: handoffTranslated.map(\.audioObjectID))
-        case let .systemOutput(exclusions):
+        case .systemOutput:
+            // Process AudioObjectIDs are ephemeral. Re-enumerate and validate
+            // ClassScribe plus currently running bundle-rooted helpers for
+            // every CATap construction, including device restarts.
+            let exclusions = Self.systemOutputExclusionObjectIDs()
+            logger.info(
+                "System output self-exclusion revalidated immediately before CATap; count=\(exclusions.count, privacy: .public)",
+            )
             tapSource = .systemOutput(excludingProcessObjectIDs: exclusions)
         }
         let tap = CATapDescriptionFactory.make(for: tapSource)
@@ -579,21 +622,17 @@ public class AppAudioCapture: @unchecked Sendable {
     }
 
     public func stop() {
-        // Invalidate retries before stopping hardware. A block that is already
-        // queued will observe a stale generation and return without restarting.
-        lifecycle.cancel()
-        stopCapture()
-        if outputListenerInstalled, let listener = outputDeviceChangeListener {
-            AudioObjectRemovePropertyListenerBlock(
-                AudioObjectID(kAudioObjectSystemObject),
-                &defaultOutputAddress,
-                DispatchQueue.main,
-                listener,
-            )
-            outputDeviceChangeListener = nil
-            outputListenerInstalled = false
+        lifecycleQueue.sync {
+            // Invalidate retries before stopping hardware. A block that is
+            // already queued will observe a stale generation and return
+            // without restarting. User Stop and device restart share this
+            // serial owner and therefore cannot overlap.
+            lifecycle.cancel()
+            stopCapture()
+            removeOutputDeviceChangeListener()
+            deviceChangeCoordinator.reset()
+            logger.info("Audio capture stopped")
         }
-        logger.info("Audio capture stopped")
     }
 }
 
@@ -619,7 +658,28 @@ extension AppAudioCapture {
         }
     }
 
+    private func removeOutputDeviceChangeListener() {
+        guard outputListenerInstalled, let listener = outputDeviceChangeListener else { return }
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultOutputAddress,
+            DispatchQueue.main,
+            listener,
+        )
+        outputDeviceChangeListener = nil
+        outputListenerInstalled = false
+    }
+
     func handleOutputDeviceChanged() {
+        // CoreAudio invokes the property listener on main. This method is
+        // notification-only; native lifecycle work is handed to the serial
+        // owner below.
+        lifecycleQueue.async { [weak self] in
+            self?.handleOutputDeviceChangedOnLifecycleQueue()
+        }
+    }
+
+    private func handleOutputDeviceChangedOnLifecycleQueue() {
         guard isRunning, let generation = lifecycle.activeGeneration else { return }
         let action = deviceChangeCoordinator.handle(.deviceChanged)
         guard action != .ignore else { return }
@@ -668,6 +728,7 @@ extension AppAudioCapture {
             scheduleRetry(after: delay, generation: generation)
 
         case .complete:
+            terminalErrorLock.withLock { $0 = nil }
             logger.info("App audio: tap restarted (rate: \(self.actualSampleRate) Hz)")
 
         case .giveUp:
@@ -677,12 +738,14 @@ extension AppAudioCapture {
             // down too; otherwise callbacks/hardware survive with no active
             // lifecycle and `stop()` becomes the only eventual cleanup.
             stopCapture()
+            let message = "La fuente de salida de audio no pudo recuperarse después de varios cambios de dispositivo; el audio recibido se conserva."
+            terminalErrorLock.withLock { $0 = message }
             logger.error("App audio: retry failed; giving up")
         }
     }
 
     private func scheduleRetry(after delay: TimeInterval, generation: UInt64) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        lifecycleQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, self.lifecycle.isActive(generation) else { return }
             self.completeRestart(generation: generation)
         }

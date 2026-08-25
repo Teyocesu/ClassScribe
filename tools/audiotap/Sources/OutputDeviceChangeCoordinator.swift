@@ -47,6 +47,13 @@ struct OutputDeviceChangeCoordinator: Equatable {
         self.retryDelay = retryDelay
     }
 
+    /// Reuses the coordinator only after the owning capture lifecycle has
+    /// ended. Delayed actions still carry a CaptureLifecycleGate generation,
+    /// so resetting this state cannot revive stale work from a prior session.
+    mutating func reset() {
+        state = .idle
+    }
+
     mutating func handle(_ event: Event) -> Action {
         switch (state, event) {
         case (.idle, .deviceChanged):

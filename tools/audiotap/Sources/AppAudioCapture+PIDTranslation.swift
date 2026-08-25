@@ -57,8 +57,33 @@ extension AppAudioCapture {
     public static func systemOutputExclusionObjectIDs() -> [AudioObjectID] {
         var candidatePIDs = [getpid()]
         candidatePIDs.append(contentsOf: ProcessTreeEnumerator.pidsRooted(in: Bundle.main.bundleURL))
-        let uniquePIDs = Array(Set(candidatePIDs.filter { $0 > 0 })).sorted()
-        return Array(Set(validatedAudioTargets(in: uniquePIDs).map(\.audioObjectID))).sorted()
+        return validatedSystemOutputObjectIDs(in: candidatePIDs)
+    }
+
+    /// Deterministic product seam for the ephemeral global-tap exclusion
+    /// policy. The real overload above supplies CoreAudio translation and the
+    /// round-trip validator; restart code calls it again for every CATap.
+    public static func validatedSystemOutputObjectIDs(in pids: [pid_t]) -> [AudioObjectID] {
+        validatedSystemOutputObjectIDs(
+            in: pids,
+            translate: rawTranslatePID,
+            roundTrip: audioObjectMatchesPID,
+        )
+    }
+
+    public static func validatedSystemOutputObjectIDs(
+        in pids: [pid_t],
+        translate: (pid_t) -> AudioObjectID?,
+        roundTrip: (pid_t, AudioObjectID) -> Bool,
+    ) -> [AudioObjectID] {
+        let uniquePIDs = Array(Set(pids.filter { $0 > 0 })).sorted()
+        return Array(Set(
+            AudioTargetValidation.translateAndValidate(
+                uniquePIDs,
+                translate: translate,
+                roundTrip: roundTrip,
+            ).map(\.audioObjectID),
+        )).sorted()
     }
 
     public static func validatedAudioTargets(in pids: [pid_t]) -> [ValidatedAudioTarget] {

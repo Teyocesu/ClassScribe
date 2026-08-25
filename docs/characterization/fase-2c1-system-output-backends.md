@@ -2,8 +2,10 @@
 
 Fecha: 2026-08-25
 
-Baseline: `v0.8.0-development` = `21fa69bd56bfca2cad00c71491412c9673371b01`
-Estado: infraestructura implementada; gate físico y runtime Windows pendientes.
+Baseline correctivo: `v0.8.0-development` = `6c28107bed11bff3b1d70d8242cb1b327f44316b`
+Estado: correctivo de lifecycle/device restart implementado; **FIXED / PARTIAL**.
+La revisión independiente y los gates físicos/runtime Windows permanecen
+pendientes; esta caracterización no marca 2C.1 como aprobada.
 
 ## Alcance
 
@@ -14,7 +16,7 @@ de backend cuando una aplicación falla. La UI normal continúa usando
 presencial. El scope persistido `systemOutput` ya existente se conserva sin
 inventar un nuevo `CaptureMode`.
 
-La base fue verificada antes del cambio con:
+La base correctiva fue verificada antes del cambio con:
 
 ```text
 git fetch origin
@@ -58,13 +60,24 @@ No se usa ScreenCaptureKit ni una lista de todas las aplicaciones como entrada
 del tap global. Si CoreAudio no puede validar el proceso propio, no se fabrica
 un ID: la exclusión queda limitada a los objetos que pasaron el round-trip.
 `CATapDescriptionFactory` y `AppAudioCapture.systemOutputExclusionObjectIDs()`
-son seams inspeccionables y testeables.
+son seams inspeccionables y testeables. `AppAudioCapture` conserva la política
+`.systemOutput`, no un snapshot de `AudioObjectID`: cada construcción inicial o
+restart vuelve a enumerar ClassScribe y los helpers rooted en el bundle,
+deduplica PIDs/objetos y exige el round-trip PID → objeto → PID. Un fallo de
+traducción no fabrica IDs sintéticos.
 
 El source global reutiliza `AudioCaptureSession`, el `source.raw` de la sesión,
-el timeline y el `LiveAudioSink`. `AppAudioCapture` conserva su listener y
-coordinador de default-output: ante cambio de dispositivo cierra admisión,
-drena callbacks, detiene/destroza el aggregate/tap y reintenta en el mismo
-owner, sin crear otro archivo ni otra sesión.
+el `TimelineAnchor` y el `LiveAudioSink`. Todas las mutaciones nativas de
+`AppAudioCapture` viven en un `lifecycleQueue` serial; el listener entregado en
+main sólo notifica y encola. Stop, cambio de dispositivo y retry comparten ese
+owner; se invalida la generación antes del teardown, se drenan callbacks y
+`writeQueue` antes de destruir CoreAudio, y los retries delayed no pueden
+recrear la fuente después de Stop. No se crea otro archivo ni otra sesión.
+
+Si el coordinador agota retries, la fuente publica un error terminal observable
+por `CaptureNativeLevelSnapshot`; `CaptureController` lo consume como fallo
+recuperable y conserva el audio durable. Un restart exitoso limpia ese error y
+un intento nuevo no hereda el estado anterior.
 
 El controlador conserva `SessionAttemptID`, `CaptureSourceGeneration`, el gate
 de callbacks y los estados `awaitingCallbacks`, `noCallbacks`, `silent` y
@@ -89,7 +102,14 @@ El health tick hace una observación acotada del endpoint default con single
 flight y throttle. Sólo un cambio del ID provoca rebind; un cambio de nombre no
 lo provoca. El rebind cierra admisión y drena la generación vieja, conserva el
 `source.raw`, marca el handoff en el timeline y crea el recorder loopback del
-endpoint actual.
+endpoint actual. La sesión se considera activa por el intento, raw/channel/
+writer y admission state, no por la existencia temporal del recorder.
+`StopAsync` es single-flight: durante un rebind sin recorder cancela capture,
+invalida generación/coordinador/autorización, termina el recorder si existe,
+espera writer/raw y finaliza el `source.raw` existente. Toda publicación final
+de una nueva generación revalida Stop, intento, generación y coordinator. El
+mensaje de no-callback para esta fuente nombra explícitamente la salida del
+sistema.
 
 ## Persistencia y ownership
 
@@ -107,26 +127,32 @@ Se añadieron pruebas deterministas para:
 - exigencia del capability antes del start macOS;
 - construcción CATap global con exclusiones explícitas y construcción de app
   por mixdown de procesos;
-- política Windows de restart sólo ante cambio de endpoint ID.
+- política Windows de restart sólo ante cambio de endpoint ID;
+- ownership de sesión Windows durante rebind sin recorder, Stop concurrente,
+  fallo de build y recuperación, usando la fábrica de recorder del camino de
+  producto;
+- serialización real del owner macOS, revalidación de self-exclusions en un
+  restart y rechazo de traducciones sin objeto válido.
 
-`git diff --check` pasa. El gate reproducible del repositorio
-`./scripts/pre-push.sh --with-tests` terminó correctamente: compilación del
-producto macOS y 224 tests focused/subsystem pasaron, incluidos los nuevos tests
-de autorización y persistencia. El script usa el toolchain local versionado en
-`.toolchain`.
+`git diff --check` pasa. La última corrida del gate reproducible
+`./scripts/pre-push.sh --with-tests` compiló el producto macOS y ejecutó 227
+tests, incluidos los nuevos tests de lifecycle/self-exclusion, con resultado
+**PASS**. Durante la caracterización hubo flakes aislados de timing en tests
+process-backed preexistentes; sus reruns focalizados pasaron y no se atribuyen
+a esta fase.
 
-La ejecución directa de `swift test` con el SwiftPM del Command Line Tools del
-sistema quedó bloqueada porque esa versión rechaza el parámetro existente
-`swiftLanguageModes: [.v6]` del manifest, antes de compilar el producto. No se
-modificó el manifest ni se instaló otra toolchain; tampoco hay `xcodebuild`
-disponible en el host. También se intentó la suite standalone de
-`tools/audiotap` con el mirror local; sus fuentes de producto compilaron, pero
-el host no expone el módulo `XCTest`, por lo que esa suite no pudo enlazarse.
-Esto no invalida el gate del repositorio, que sí pasó.
+La suite standalone XCTest de `tools/audiotap` queda **SKIPPED** en este host:
+el SwiftPM del Command Line Tools no acepta el parámetro existente
+`swiftLanguageModes: [.v6]` del manifest antes de llegar al test target, y el
+host no expone un gate XCTest standalone utilizable. Sus fuentes de producto
+sí compilan dentro del toolchain oficial del repositorio. No se modificó el
+manifest ni se instaló otra toolchain.
 
-La suite Windows está escrita en `ClassScribe.Core.Tests`, pero el runtime no se
-ejecutó porque `dotnet`/`csc` no están disponibles. No se instala SDK ni se
-presenta el runtime como aprobado.
+La suite Windows de product path vive en
+`app/ClassScribe.Windows/tests/ClassScribe.Windows.Tests` y usa una fábrica
+inyectable sobre el mismo `WindowsAudioCapture`; no usa una máquina de estados
+paralela. El compile/runtime no se ejecutó porque `dotnet`/`csc` no están
+disponibles. No se instala SDK ni se presenta el runtime como aprobado.
 
 ## Gates pendientes y fuera de alcance
 

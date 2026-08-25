@@ -62,6 +62,35 @@ final class AppAudioCapturePIDTranslationTests: XCTestCase {
         XCTAssertEqual(tap.processes, [7, 9])
     }
 
+    func testSystemOutputExclusionsRevalidateHelpersBeforeEachConstruction() {
+        let first = AppAudioCapture.validatedSystemOutputObjectIDs(
+            in: [101, 202],
+            translate: { pid in [101: AudioObjectID(7), 202: AudioObjectID(9)][pid] },
+            roundTrip: { _, _ in true },
+        )
+        let afterHelperAppeared = AppAudioCapture.validatedSystemOutputObjectIDs(
+            in: [101, 202, 303],
+            translate: { pid in
+                [101: AudioObjectID(7), 202: AudioObjectID(9), 303: AudioObjectID(11)][pid]
+            },
+            roundTrip: { _, _ in true },
+        )
+
+        XCTAssertEqual(first, [7, 9])
+        XCTAssertEqual(afterHelperAppeared, [7, 9, 11])
+        XCTAssertFalse(first.contains(11), "A prior restart must not reuse or pre-claim a later helper object")
+    }
+
+    func testInvalidSelfTranslationProducesNoSyntheticObject() {
+        let result = AppAudioCapture.validatedSystemOutputObjectIDs(
+            in: [101, 202],
+            translate: { pid in pid == 101 ? AudioObjectID(kAudioObjectUnknown) : nil },
+            roundTrip: { _, _ in true },
+        )
+
+        XCTAssertTrue(result.isEmpty)
+    }
+
     func testApplicationFactoryRemainsProcessMixdown() {
         let tap = CATapDescriptionFactory.make(
             for: .application(processObjectIDs: [7, 9]),
