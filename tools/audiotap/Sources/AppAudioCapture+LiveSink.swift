@@ -10,10 +10,11 @@ extension AppAudioCapture {
     /// the same data `writeCapturedBuffer` writes to the file fd. The normal
     /// path: forwarding the resampled buffer means the app side doesn't resample
     /// a second time (`LiveAudioResampler` short-circuits 16 kHz mono). Gap-fill
-    /// silence is deliberately excluded; only the buffer's real samples flow
-    /// here. Short-circuits when no sink is installed.
+    /// silence is still excluded, but an empty callback is forwarded when the
+    /// native converter is priming so transport health can distinguish it from
+    /// a stalled callback path. Short-circuits when no sink is installed.
     func forwardToLiveSink(monoSamples: [Float]) {
-        guard let sink = liveSink, !monoSamples.isEmpty else { return }
+        guard let sink = liveSink else { return }
         sink(LiveAudioBuffer(
             samples: monoSamples,
             channelCount: 1,
@@ -31,11 +32,15 @@ extension AppAudioCapture {
     func forwardToLiveSink(data: UnsafeMutableRawPointer, byteCount: Int) {
         guard let sink = liveSink else { return }
         let sampleCount = byteCount / MemoryLayout<Float>.size
-        guard sampleCount > 0 else { return }
-        let buf = UnsafeBufferPointer(
-            start: data.assumingMemoryBound(to: Float.self), count: sampleCount,
-        )
-        let samples = Array(buf)
+        let samples: [Float]
+        if sampleCount > 0 {
+            let buf = UnsafeBufferPointer(
+                start: data.assumingMemoryBound(to: Float.self), count: sampleCount,
+            )
+            samples = Array(buf)
+        } else {
+            samples = []
+        }
         let channelCount = max(actualChannels, 1)
         let rate = actualSampleRate > 0 ? actualSampleRate : sampleRate
         sink(LiveAudioBuffer(

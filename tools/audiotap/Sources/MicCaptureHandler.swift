@@ -39,7 +39,7 @@ public class MicCaptureHandler: @unchecked Sendable {
     private var isRestarting = false
     private var automaticRestartCount = 0
     private static let maximumAutomaticRestarts = 3
-    private var ignoreConfigurationChangesUntil = Date.distantPast
+    private var ignoreConfigurationChangesUntil = ContinuousClock().now
     // Bounded retry for transient restart failures (issue #379): a device
     // change can briefly expose an invalid format; retry with exponential
     // backoff (MicRestartRetryPolicy) rather than dropping the recording.
@@ -153,8 +153,9 @@ public class MicCaptureHandler: @unchecked Sendable {
     @MainActor
     public func waitForFirstBuffer(timeout: TimeInterval = 2.5) async throws {
         try Task.checkCancellation()
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(max(0, timeout)))
+        while clock.now < deadline {
             if firstBufferGate.hasWrittenFrames {
                 try Task.checkCancellation()
                 return
@@ -354,7 +355,7 @@ public class MicCaptureHandler: @unchecked Sendable {
         }
         tapInstalled = true // inputNode accessed + tap attached; stop() must remove it even if start() throws
 
-        ignoreConfigurationChangesUntil = Date().addingTimeInterval(1.0)
+        ignoreConfigurationChangesUntil = ContinuousClock().now.advanced(by: .seconds(1))
         MicCaptureDiagnostics.record("engine prepare")
         engine.prepare()
         callbackGate.open()
@@ -400,7 +401,7 @@ public class MicCaptureHandler: @unchecked Sendable {
     }
 
     private func handleEngineConfigChange() {
-        guard Date() >= ignoreConfigurationChangesUntil else {
+        guard ContinuousClock().now >= ignoreConfigurationChangesUntil else {
             MicCaptureDiagnostics.record("ignored configuration change caused by engine start")
             return
         }
@@ -630,9 +631,15 @@ extension MicCaptureHandler {
     func forwardToLiveSink(buffer: AVAudioPCMBuffer) {
         guard let sink = liveSink else { return }
         let frames = Int(buffer.frameLength)
-        guard frames > 0, let channelData = buffer.floatChannelData else { return }
-        let ptr = channelData[0]
-        let samples = Array(UnsafeBufferPointer(start: ptr, count: frames))
+        let samples: [Float]
+        if frames > 0, let channelData = buffer.floatChannelData {
+            let ptr = channelData[0]
+            samples = Array(UnsafeBufferPointer(start: ptr, count: frames))
+        } else {
+            // A zero-frame callback still proves that the audio callback path
+            // is alive. Signal health classifies its energy as digital silence.
+            samples = []
+        }
         sink(LiveAudioBuffer(
             samples: samples,
             channelCount: Int(buffer.format.channelCount),

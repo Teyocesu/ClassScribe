@@ -13,10 +13,15 @@ actor LiveAudioBufferStore {
     private var retainedStartOffset = 0
     private var baseSampleIndex: Int64 = 0
     private var totalSampleCount: Int64 = 0
+    private var totalCallbackCount: Int64 = 0
     private(set) var latestLevelDBFS = -120.0
 
     func append(_ buffer: LiveAudioBuffer, generation expectedGeneration: UUID) {
         guard expectedGeneration == generation else { return }
+        // Callback arrival is transport evidence even when the adapter has no
+        // samples to append. Signal health must not infer liveness from RMS or
+        // from a non-empty buffer alone.
+        totalCallbackCount &+= 1
         let mono = Self.mono16k(buffer)
         guard !mono.isEmpty else { return }
         samples.append(contentsOf: mono)
@@ -46,8 +51,13 @@ actor LiveAudioBufferStore {
         retainedStartOffset = 0
         baseSampleIndex = 0
         totalSampleCount = 0
+        totalCallbackCount = 0
         latestLevelDBFS = -120
         return generation
+    }
+
+    func callbackCount() -> Int64 {
+        totalCallbackCount
     }
 
     func totalSamples() -> Int64 {
@@ -69,6 +79,21 @@ actor LiveAudioBufferStore {
         }
         try Task.checkCancellation()
         return totalSampleCount
+    }
+
+    /// Waits for a callback, not for a non-empty buffer. A callback carrying
+    /// digital zero or zero frames is a live silent stream and must be allowed
+    /// to complete startup.
+    func waitForCallbacks(after baseline: Int64, timeout: TimeInterval) async throws -> Int64? {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(max(0, timeout)))
+        while totalCallbackCount <= baseline {
+            try Task.checkCancellation()
+            guard clock.now < deadline else { return nil }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try Task.checkCancellation()
+        return totalCallbackCount
     }
 
     func window(
@@ -99,7 +124,7 @@ actor LiveAudioBufferStore {
     func recentSilenceDuration(
         maximumMilliseconds: Int = 8_000,
         analysisWindowMilliseconds: Int = 100,
-        thresholdDBFS: Double = -43,
+        thresholdDBFS: Double = CaptureSignalThresholds.macOSApplication.silenceEnergyDBFS,
         endingAt endIndex: Int64? = nil,
     ) -> TimeInterval {
         let end = min(endIndex ?? totalSampleCount, totalSampleCount)
@@ -290,6 +315,7 @@ enum CaptureError: LocalizedError, Sendable {
     case noProcesses
     case applicationAudioUnavailable
     case applicationAudioStopped
+    case captureCallbacksStalled
     case emptyAudio
     case wavHeaderOnly
     case emptyAudioFile
@@ -308,6 +334,8 @@ enum CaptureError: LocalizedError, Sendable {
             "La aplicación no entregó audio. Comprueba que siga abierta y revisa el permiso de Audio del sistema en Privacidad y seguridad."
         case .applicationAudioStopped:
             "La aplicación dejó de entregar audio. Se detuvo la captura para conservar lo grabado; comprueba que la app siga abierta y el permiso de Audio del sistema."
+        case .captureCallbacksStalled:
+            "La fuente de audio dejó de entregar callbacks. El audio recibido se conserva para recuperación."
         case .emptyAudio: "El archivo de audio está vacío. El original se conservó para diagnóstico."
         case .wavHeaderOnly: "El micrófono no entregó audio. El archivo se conservó para diagnóstico."
         case .emptyAudioFile: "El archivo de audio no llegó a crearse con datos. Se conservó la sesión para diagnóstico."
@@ -398,17 +426,20 @@ struct AudioProcessStartupWaiter {
 @MainActor
 @Observable
 final class CaptureController {
-    // Leave enough room for the first TCC prompt and for CoreAudio route
-    // negotiation. Mid-session the AudioTap restart policy normally settles in
-    // ~1.5 s; twelve seconds avoids false stops during a slow Bluetooth/USB
-    // handoff while still bounding a genuinely dead callback stream.
-    nonisolated static let onlineFirstBufferTimeout: TimeInterval = 30
-    nonisolated static let onlineStallTimeout: TimeInterval = 12
+    // These aliases preserve the existing focused tests/API while keeping all
+    // signal-health budgets in CaptureSignalThresholds.
+    nonisolated static let onlineFirstBufferTimeout =
+        CaptureSignalThresholds.macOSApplication.initialCallbackBudget
+    nonisolated static let onlineStallTimeout =
+        CaptureSignalThresholds.macOSApplication.stallBudget
+    nonisolated static let microphoneFirstBufferTimeout =
+        CaptureSignalThresholds.macOSMicrophone.initialCallbackBudget
     nonisolated static let onlineProcessRegistrationTimeout: TimeInterval = 3
 
     private(set) var applications: [RunningApplication] = []
     private(set) var microphones: [MicrophoneOption] = []
     private(set) var levelDBFS = -120.0
+    private(set) var signalHealth: CaptureSignalHealthSnapshot?
     private(set) var isCapturing = false
     private(set) var isStarting = false
 
@@ -434,8 +465,7 @@ final class CaptureController {
     private var liveBufferTask: Task<Void, Never>?
     private var activeCaptureGeneration: UUID?
     private var onlineRootPID: pid_t?
-    private var onlineHealthCheckInFlight = false
-    private var onlineFrameWatchdog = AudioFrameWatchdog(stallTimeout: onlineStallTimeout)
+    private var signalHealthTracker: CaptureSignalHealthTracker?
 
     var isBusy: Bool {
         isCapturing
@@ -485,6 +515,14 @@ final class CaptureController {
         attemptGate.begin(attempt)
         let startCancellation = CaptureStartCancellation()
         self.startCancellation = startCancellation
+        let signalTracker = CaptureSignalHealthTracker(
+            attempt: attempt,
+            thresholds: mode == .online
+                ? .macOSApplication
+                : .macOSMicrophone,
+        )
+        signalHealthTracker = signalTracker
+        signalHealth = signalTracker.snapshot(for: attempt)
         defer {
             if self.startCancellation === startCancellation {
                 self.startCancellation = nil
@@ -502,7 +540,6 @@ final class CaptureController {
         guard activeAttempt == attempt else { throw CancellationError() }
         activeCaptureGeneration = nil
         onlineRootPID = nil
-        onlineHealthCheckInFlight = false
         let sourceURL = folder.appendingPathComponent("source.wav")
         // The pump normally drains far faster than real time. A generous bound
         // still prevents unbounded memory if the process is heavily starved;
@@ -530,6 +567,13 @@ final class CaptureController {
             // thread. Spawning one unstructured Task per buffer allowed tasks
             // to reach the actor out of order and could scramble live ASR.
             guard callbackAttemptGate.accepts(attempt) else { return }
+            _ = signalTracker.recordCallback(
+                for: attempt,
+                measurement: CaptureSignalMeasurement(
+                    samples: buffer.samples,
+                    channelCount: buffer.channelCount,
+                ),
+            )
             _ = liveContinuation.yield(buffer)
         }
 
@@ -563,7 +607,7 @@ final class CaptureController {
                 try Task.checkCancellation()
                 guard activeAttempt == attempt else { throw CancellationError() }
 
-                let initialSampleCount = try await waitForFirstSamples(
+                _ = try await waitForFirstCallbacks(
                     after: 0,
                     timeout: Self.onlineFirstBufferTimeout,
                     cancellation: startCancellation,
@@ -572,10 +616,6 @@ final class CaptureController {
                 rawOnlineURL = rawURL
                 onlineRootPID = application.id
                 activeCaptureGeneration = liveGeneration
-                onlineFrameWatchdog.reset(
-                    sampleCount: initialSampleCount,
-                    now: ProcessInfo.processInfo.systemUptime,
-                )
 
             case .inPerson:
                 let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -595,7 +635,11 @@ final class CaptureController {
                 let capture = MicCaptureHandler(outputURL: sourceURL, debugLogging: true, liveSink: sink)
                 try capture.start(deviceUID: microphone.id)
                 do {
-                    try await capture.waitForFirstBuffer()
+                    _ = try await waitForFirstCallbacks(
+                        after: 0,
+                        timeout: Self.microphoneFirstBufferTimeout,
+                        cancellation: startCancellation,
+                    )
                     try Task.checkCancellation()
                 } catch {
                     // This legacy mic path remains MainActor-owned while its
@@ -616,6 +660,7 @@ final class CaptureController {
             self.liveBufferContinuation = liveContinuation
             self.liveBufferTask = liveBufferTask
             keepLiveBufferPump = true
+            signalHealth = signalTracker.snapshot(for: attempt)
             isCapturing = true
             startLevelTimer()
             return sourceURL
@@ -625,6 +670,12 @@ final class CaptureController {
             // before awaiting any other teardown, and clear ownership first.
             microphoneCaptureOwner.release()
             startCancellation.cancel()
+            let lastHealth = signalTracker.snapshot(for: attempt)
+            signalTracker.invalidate(attempt)
+            signalHealth = lastHealth
+            if let currentTracker = signalHealthTracker, currentTracker === signalTracker {
+                signalHealthTracker = nil
+            }
             if activeAttempt == attempt {
                 activeAttempt = nil
                 attemptGate.invalidate(attempt)
@@ -646,6 +697,9 @@ final class CaptureController {
         attemptGate.invalidate(attempt)
         startCancellation?.cancel()
         nativeStartWork?.cancel()
+        signalHealthTracker?.invalidate(attempt)
+        signalHealth = nil
+        signalHealthTracker = nil
         activeCaptureGeneration = nil
         onlineRootPID = nil
         levelTimer?.invalidate()
@@ -670,12 +724,16 @@ final class CaptureController {
         terminalCaptureFailure = nil
         let stoppedAttempt = activeAttempt
         if let stoppedAttempt {
+            if let tracker = signalHealthTracker {
+                signalHealth = tracker.snapshot(for: stoppedAttempt)
+                tracker.invalidate(stoppedAttempt)
+            }
             activeAttempt = nil
             attemptGate.invalidate(stoppedAttempt)
         }
+        signalHealthTracker = nil
         activeCaptureGeneration = nil
         onlineRootPID = nil
-        onlineHealthCheckInFlight = false
         levelTimer?.invalidate()
         levelTimer = nil
         let rawToWrap = rawOnlineURL
@@ -756,14 +814,14 @@ final class CaptureController {
         return work
     }
 
-    private func waitForFirstSamples(
+    private func waitForFirstCallbacks(
         after baseline: Int64,
         timeout: TimeInterval,
         cancellation: CaptureStartCancellation,
     ) async throws -> Int64 {
         let liveStore = self.liveStore
         return try await CaptureFirstSampleRace.wait(cancellation: cancellation) {
-            try await liveStore.waitForSamples(after: baseline, timeout: timeout)
+            try await liveStore.waitForCallbacks(after: baseline, timeout: timeout)
         }
     }
 
@@ -785,6 +843,17 @@ final class CaptureController {
                       self.isCapturing,
                       let attempt = self.activeAttempt
                 else { return }
+                if let tracker = self.signalHealthTracker,
+                   let signal = tracker.snapshot(for: attempt) {
+                    self.signalHealth = signal
+                    // A callback stall is a capture-health failure candidate;
+                    // silent callbacks remain healthy and never enter this
+                    // branch.
+                    if signal.state == .noCallbacks {
+                        self.reportTerminalFailure(CaptureError.captureCallbacksStalled.localizedDescription)
+                        return
+                    }
+                }
                 if self.onlineRootPID != nil {
                     let snapshot = await self.nativeExecutor.levelSnapshot(for: attempt)
                     guard self.isCapturing,
@@ -805,31 +874,12 @@ final class CaptureController {
     }
 
     private func checkOnlineFrameProgress(for attempt: SessionAttemptID) {
-        guard !onlineHealthCheckInFlight,
-              terminalCaptureFailure == nil,
-              let generation = activeCaptureGeneration,
+        guard terminalCaptureFailure == nil,
+              activeCaptureGeneration != nil,
               activeAttempt == attempt
         else { return }
         if let onlineRootPID, !Self.processIsRunning(onlineRootPID) {
             reportTerminalFailure(CaptureError.applicationAudioStopped.localizedDescription)
-            return
-        }
-        onlineHealthCheckInFlight = true
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let sampleCount = await self.liveStore.totalSamples()
-            self.onlineHealthCheckInFlight = false
-            guard self.isCapturing,
-                  self.activeAttempt == attempt,
-                  self.activeCaptureGeneration == generation,
-                  self.terminalCaptureFailure == nil
-            else { return }
-            if self.onlineFrameWatchdog.observe(
-                sampleCount: sampleCount,
-                now: ProcessInfo.processInfo.systemUptime,
-            ) {
-                self.reportTerminalFailure(CaptureError.applicationAudioStopped.localizedDescription)
-            }
         }
     }
 

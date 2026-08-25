@@ -105,6 +105,7 @@ final class ClassScribeModel {
     private var technicalVocabularyURL: URL?
     private var activeSession: ClassSessionContext?
     private var liveTranscriptionError: String?
+    private var lastPresentedCaptureSignalState: CaptureSignalState?
     private var generationGate = SessionGenerationGate()
     private var asrOriginalReference: ASRTranscriptReference?
     private var activeDiarizationProposal: DiarizationProposal?
@@ -132,6 +133,12 @@ final class ClassScribeModel {
 
     var isRecording: Bool {
         capture.isCapturing
+    }
+
+    /// Structured transport/content health exposed to the control plane. UI
+    /// text is derived from this value and never becomes the source of truth.
+    var captureSignalState: CaptureSignalState? {
+        capture.signalHealth?.state
     }
 
     var canStart: Bool {
@@ -301,6 +308,7 @@ final class ClassScribeModel {
         isTranscriptionPaused = false
         transcriptionLatency = 0
         elapsed = 0
+        lastPresentedCaptureSignalState = nil
         selectedTab = .professor
         accumulator = LiveTranscriptAccumulator()
         liveEditReconciler.reset()
@@ -334,7 +342,7 @@ final class ClassScribeModel {
             capturePhase = .connecting
             asrPhase = .idle
             statusDetail = mode == .inPerson
-                ? "Esperando el primer buffer escrito antes de iniciar el contador."
+                ? "Esperando el primer callback de audio antes de iniciar el contador."
                 : "Iniciando la captura de audio de la aplicación seleccionada."
             try checkpointLive("session-created", session: session)
             try store.saveMetadata(metadata(session: session, state: .startingCapture), folder: folder)
@@ -352,6 +360,7 @@ final class ClassScribeModel {
             asrPhase = .waitingForSpeech
             statusDetail = "El audio se guarda aunque pauses la transcripción."
             startElapsedTimer()
+            presentCaptureSignal(capture.signalHealth)
             startLiveTranscription(session: session)
         } catch is CancellationError {
             guard let session = startedSession, !isCurrent(session) else { return }
@@ -881,12 +890,30 @@ final class ClassScribeModel {
                       self.generationGate.accepts(timerAttempt),
                       self.activeSession?.attemptID == timerAttempt
                 else { return }
+                self.presentCaptureSignal(self.capture.signalHealth)
                 if let failure = self.capture.takeTerminalFailure() {
                     await self.failActiveCapture(failure)
                     return
                 }
                 self.elapsed = Date().timeIntervalSince(startedAt)
             }
+        }
+    }
+
+    private func presentCaptureSignal(_ snapshot: CaptureSignalHealthSnapshot?) {
+        guard let snapshot,
+              snapshot.state != lastPresentedCaptureSignalState
+        else { return }
+        lastPresentedCaptureSignalState = snapshot.state
+        switch snapshot.state {
+        case .awaitingCallbacks:
+            statusDetail = "Esperando callbacks de audio; la captura aún está conectando."
+        case .noCallbacks:
+            statusDetail = "La fuente dejó de entregar callbacks; el audio recibido se conserva."
+        case .silent:
+            statusDetail = "Captura activa con callbacks silenciosos; el silencio no es un fallo."
+        case .audible:
+            statusDetail = "Audio recibido; esperando voz o un resultado de transcripción."
         }
     }
 
@@ -898,7 +925,7 @@ final class ClassScribeModel {
         sessionPhase = .stopping
         capturePhase = .stopping
         asrPhase = .idle
-        statusDetail = "Cerrando y validando el audio después del error del micrófono."
+        statusDetail = "Cerrando y validando el audio después del error de la fuente."
         elapsedTimer?.invalidate()
         elapsedTimer = nil
         _ = await stopLiveTranscription()

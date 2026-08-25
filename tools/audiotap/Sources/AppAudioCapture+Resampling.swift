@@ -71,7 +71,13 @@ public extension AppAudioCapture {
         let mono16k = resampler.process(
             interleaved, inputRate: inputRate, inputChannels: inputChannels,
         )
-        guard !mono16k.isEmpty else { return }
+        // Converter priming can yield no output even though the native callback
+        // is alive. Forward an empty callback so signal health records a live
+        // silent transport instead of waiting for a non-empty buffer.
+        guard !mono16k.isEmpty else {
+            forwardToLiveSink(monoSamples: [])
+            return
+        }
         fillTimelineGap(fd: fd, hostTicks: hostTicks, outputFrames: mono16k.count)
         Self.writeFloats(mono16k, to: fd)
         forwardToLiveSink(monoSamples: mono16k)

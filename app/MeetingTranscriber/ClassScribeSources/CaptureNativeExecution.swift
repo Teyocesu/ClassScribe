@@ -249,8 +249,8 @@ final class CaptureStartCancellation: @unchecked Sendable {
 }
 
 /// Structured race used by application startup. `sampleWait` owns the bounded
-/// first-frame timeout and is required to cooperate with task cancellation;
-/// `LiveAudioBufferStore.waitForSamples` does so via `Task.checkCancellation`
+/// first-callback timeout and is required to cooperate with task cancellation;
+/// `LiveAudioBufferStore.waitForCallbacks` does so via `Task.checkCancellation`
 /// and cancellable `Task.sleep`.
 enum CaptureFirstSampleRace {
     static func wait(

@@ -28,8 +28,12 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private EventHandler<StoppedEventArgs>? recordingStoppedHandler;
     private long capturedBytes;
     private int recentBytes;
+    private readonly CaptureSignalHealthTracker signalHealthTracker =
+        new(CaptureSignalThresholds.Windows);
 
     public event Action<SessionAttemptID, double>? LevelChanged;
+
+    public event Action<SessionAttemptID, CaptureSignalHealthSnapshot>? SignalHealthChanged;
 
     public event Action<SessionAttemptID, Exception>? CaptureFaulted;
 
@@ -47,6 +51,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     }
 
     public double DurationSeconds => Interlocked.Read(ref capturedBytes) / (double)BytesPerSecond;
+
+    public CaptureSignalHealthSnapshot? SignalHealth => signalHealthTracker.Snapshot(captureAttempt);
 
     public static IReadOnlyList<AudioSourceOption> EnumerateApplications()
     {
@@ -136,6 +142,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         recentBytes = 0;
         recentPackets.Clear();
         captureAttempt = attempt;
+        signalHealthTracker.Begin(attempt);
+        PublishSignalHealth(attempt);
 
         try
         {
@@ -187,11 +195,14 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             try
             {
                 await firstPacket.Task
-                    .WaitAsync(TimeSpan.FromSeconds(10), cancellationToken)
+                    .WaitAsync(
+                        TimeSpan.FromSeconds(CaptureSignalThresholds.Windows.InitialCallbackBudgetSeconds),
+                        cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (TimeoutException error)
             {
+                PublishSignalHealth(attempt);
                 throw new IOException(
                     source.Kind == AudioSourceKind.Process
                         ? "Windows no entregó audio. Reproduce sonido en la aplicación seleccionada y vuelve a intentarlo."
@@ -308,8 +319,16 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         _ = flags;
         _ = devicePosition;
         _ = qpcPosition;
+        var measurement = CaptureSignalMeasurement.FromPcm16(buffer, PcmWaveFile.Channels);
+        if (!signalHealthTracker.TryRecordCallback(attempt, measurement))
+        {
+            return;
+        }
+        PublishSignalHealth(attempt);
         if (buffer.Length == 0)
         {
+            firstPacket.TrySetResult();
+            LevelChanged?.Invoke(attempt, 0);
             return;
         }
 
@@ -479,6 +498,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             rawStream = null;
             if (finishedAttempt is not null)
             {
+                signalHealthTracker.Invalidate(finishedAttempt);
                 LevelChanged?.Invoke(finishedAttempt, 0);
             }
         }
@@ -525,5 +545,24 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
         var rootMeanSquare = Math.Sqrt(squares / samples);
         return Math.Clamp(rootMeanSquare * 4, 0, 1);
+    }
+
+    public CaptureSignalHealthSnapshot? EvaluateSignalHealth(SessionAttemptID attempt)
+    {
+        var snapshot = signalHealthTracker.Snapshot(attempt);
+        if (snapshot is not null)
+        {
+            SignalHealthChanged?.Invoke(attempt, snapshot);
+        }
+
+        return snapshot;
+    }
+
+    private void PublishSignalHealth(SessionAttemptID attempt)
+    {
+        if (signalHealthTracker.Snapshot(attempt) is { } snapshot)
+        {
+            SignalHealthChanged?.Invoke(attempt, snapshot);
+        }
     }
 }

@@ -42,6 +42,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private string warningText = string.Empty;
     private string elapsedText = "00:00";
     private double audioLevel;
+    private CaptureSignalState captureSignalState = CaptureSignalState.AwaitingCallbacks;
     private double modelProgress;
     private bool isRecording;
     private bool isBusy;
@@ -53,6 +54,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private SessionAttemptID? activeAttempt;
     private SessionAttemptCallbackLease? captureCallbackLease;
     private Action<SessionAttemptID, double>? captureLevelHandler;
+    private Action<SessionAttemptID, CaptureSignalHealthSnapshot>? captureSignalHealthHandler;
     private Action<SessionAttemptID, Exception>? captureFaultHandler;
     private ASRTranscriptReference? asrOriginalReference;
     private DiarizationProposal? activeDiarizationProposal;
@@ -207,6 +209,12 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         private set => SetProperty(ref audioLevel, value);
     }
 
+    public CaptureSignalState SignalState
+    {
+        get => captureSignalState;
+        private set => SetProperty(ref captureSignalState, value);
+    }
+
     public double ModelProgress
     {
         get => modelProgress;
@@ -349,6 +357,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         var startedAt = DateTimeOffset.Now;
         var sessionID = Guid.NewGuid();
         var attempt = BeginAttempt(sessionID);
+        SignalState = CaptureSignalState.AwaitingCallbacks;
         RegisterCaptureCallbacks(attempt);
         var captureStarted = false;
         asrOriginalReference = null;
@@ -385,7 +394,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            StatusText = "Esperando la primera muestra de audio…";
+            StatusText = "Esperando el primer callback de audio…";
             await audioCapture.StartAsync(SelectedSource, currentFolder, attempt, cancellationToken).ConfigureAwait(true);
             captureStarted = true;
             if (!IsCurrent(attempt))
@@ -408,7 +417,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            StatusText = "Grabando y guardando audio localmente";
+            if (audioCapture.SignalHealth is { } signalHealth)
+            {
+                ApplyCaptureSignal(signalHealth, attempt);
+            }
+            else
+            {
+                StatusText = "Grabando y guardando audio localmente";
+            }
             StartBackgroundLoops();
         }
         catch (OperationCanceledException)
@@ -917,6 +933,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
 
             var duration = audioCapture.DurationSeconds;
+            _ = audioCapture.EvaluateSignalHealth(attempt);
             RunOnUi(() =>
             {
                 if (IsCurrent(attempt))
@@ -1416,6 +1433,30 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         WarningText = string.Empty;
     }
 
+    private void ApplyCaptureSignal(CaptureSignalHealthSnapshot snapshot, SessionAttemptID attempt)
+    {
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
+        var changed = SignalState != snapshot.State;
+        SignalState = snapshot.State;
+        if (!IsRecording || !changed)
+        {
+            return;
+        }
+
+        StatusText = snapshot.State switch
+        {
+            CaptureSignalState.AwaitingCallbacks => "Esperando callbacks de audio…",
+            CaptureSignalState.NoCallbacks => "La fuente dejó de entregar callbacks; conserva el audio recibido y revisa la fuente.",
+            CaptureSignalState.Silent => "Captura activa con callbacks silenciosos; el silencio no es un fallo.",
+            CaptureSignalState.Audible => "Audio recibido; esperando voz o un resultado de transcripción.",
+            _ => StatusText,
+        };
+    }
+
     private void SetLiveProgrammatically(string value)
     {
         settingLiveProgrammatically = true;
@@ -1485,6 +1526,15 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
             lease.TryAccept(() => RunOnUi(() => lease.TryAccept(() => AudioLevel = level)));
         };
+        Action<SessionAttemptID, CaptureSignalHealthSnapshot> signalHealthHandler = (eventAttempt, snapshot) =>
+        {
+            if (eventAttempt != lease.Attempt)
+            {
+                return;
+            }
+
+            lease.TryAccept(() => RunOnUi(() => lease.TryAccept(() => ApplyCaptureSignal(snapshot, eventAttempt))));
+        };
         Action<SessionAttemptID, Exception> faultHandler = (eventAttempt, error) =>
         {
             if (eventAttempt != lease.Attempt)
@@ -1500,8 +1550,10 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         };
         captureCallbackLease = lease;
         captureLevelHandler = levelHandler;
+        captureSignalHealthHandler = signalHealthHandler;
         captureFaultHandler = faultHandler;
         audioCapture.LevelChanged += levelHandler;
+        audioCapture.SignalHealthChanged += signalHealthHandler;
         audioCapture.CaptureFaulted += faultHandler;
     }
 
@@ -1520,6 +1572,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             audioCapture.LevelChanged -= captureLevelHandler;
         }
 
+        if (captureSignalHealthHandler is not null)
+        {
+            audioCapture.SignalHealthChanged -= captureSignalHealthHandler;
+        }
+
         if (captureFaultHandler is not null)
         {
             audioCapture.CaptureFaulted -= captureFaultHandler;
@@ -1527,6 +1584,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         captureCallbackLease = null;
         captureLevelHandler = null;
+        captureSignalHealthHandler = null;
         captureFaultHandler = null;
     }
 
