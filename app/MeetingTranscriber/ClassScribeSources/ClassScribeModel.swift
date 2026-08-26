@@ -397,21 +397,31 @@ final class ClassScribeModel {
     }
 
     func confirmSystemOutputConsent(_ request: SystemOutputConsentRequest) async {
+        guard let authorization = consumeSystemOutputConsent(request) else { return }
+        await performStart(
+            sessionID: request.attempt.sessionID,
+            attemptID: request.attempt,
+            systemOutputAuthorization: authorization,
+        )
+    }
+
+    /// Verifies and consumes the domain-owned request before the first
+    /// suspension point. The alert's presentation copy can therefore be
+    /// dismissed by SwiftUI without erasing the request that authorizes this
+    /// exact attempt.
+    private func consumeSystemOutputConsent(
+        _ request: SystemOutputConsentRequest,
+    ) -> SystemOutputCaptureAuthorization? {
         guard pendingSystemOutputConsent == request,
               generationGate.accepts(request.attempt),
               mode == .online,
               onlineCaptureSource == .systemOutput,
               subject == request.subject
-        else { return }
+        else { return nil }
 
         pendingSystemOutputConsent = nil
-        let authorization = capture.issueSystemOutputAuthorizationAfterExplicitUserConsent(
+        return capture.issueSystemOutputAuthorizationAfterExplicitUserConsent(
             for: request.attempt,
-        )
-        await performStart(
-            sessionID: request.attempt.sessionID,
-            attemptID: request.attempt,
-            systemOutputAuthorization: authorization,
         )
     }
 

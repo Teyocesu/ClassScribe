@@ -88,6 +88,7 @@ struct LiveTranscriptFollowPresentation: Equatable {
 struct ContentView: View {
     @Bindable var model: ClassScribeModel
     @State private var showsTechnicalVocabulary = false
+    @State private var systemOutputConsentPresentation = SystemOutputConsentPresentationState()
     @State private var liveEditorIsEditing = false
     @State private var followsLiveTranscript = true
     @State private var hasUnseenLiveTranscript = false
@@ -111,7 +112,7 @@ struct ContentView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .alert(item: $model.pendingSystemOutputConsent) { request in
+        .alert(item: $systemOutputConsentPresentation.presentedRequest) { request in
             Alert(
                 title: Text("Capturar audio del equipo"),
                 message: Text(
@@ -128,7 +129,16 @@ struct ContentView: View {
                 },
             )
         }
+        .onAppear {
+            systemOutputConsentPresentation.synchronize(
+                with: model.pendingSystemOutputConsent,
+            )
+        }
+        .onChange(of: model.pendingSystemOutputConsent) { _, pending in
+            systemOutputConsentPresentation.synchronize(with: pending)
+        }
         .onDisappear {
+            systemOutputConsentPresentation.presentedRequest = nil
             if let request = model.pendingSystemOutputConsent {
                 model.cancelSystemOutputConsent(request)
             }
@@ -916,5 +926,16 @@ struct ContentView: View {
                 .padding(.vertical, 4)
             }
         }
+    }
+}
+
+/// Presentation-only state for the consent alert. The domain request remains
+/// owned exclusively by `ClassScribeModel`, so SwiftUI may dismiss this copy
+/// without erasing the request that the affirmative action must consume.
+struct SystemOutputConsentPresentationState: Equatable {
+    var presentedRequest: SystemOutputConsentRequest? = nil
+
+    mutating func synchronize(with domainRequest: SystemOutputConsentRequest?) {
+        presentedRequest = domainRequest
     }
 }

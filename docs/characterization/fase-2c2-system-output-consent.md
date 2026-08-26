@@ -4,10 +4,11 @@ Fecha: 2026-08-25
 
 Baseline de implementación: `d70795b2ed74bfd5b812ba1d1782c3545c0d547e`
 
-Estado: **COMPLETE / PARTIAL**. La UX y el control-plane de consentimiento
-quedaron implementados en macOS y Windows; la revisión local macOS pasó. La
-suite/runtime Windows queda **SKIPPED — dotnet/csc unavailable**. Esto no marca
-la Fase 2 completa ni convierte los gates físicos o de runtime en PASS.
+Estado: **FIXED / PARTIAL**. La UX y el control-plane de consentimiento quedaron
+implementados en macOS y Windows; el correctivo de ownership del modal macOS y la
+revisión local macOS pasaron. La suite/runtime Windows queda **SKIPPED —
+dotnet/csc unavailable**. Esto no marca la Fase 2C.2 como APPROVED, no marca la
+Fase 2 completa ni convierte los gates físicos o de runtime en PASS.
 
 ## UX de fuente online
 
@@ -45,6 +46,20 @@ Cancelar: Cancelar
 
 No hay checkbox, opción de recordar, consentimiento global ni persistencia del
 consentimiento.
+
+## Ownership de presentación del modal macOS
+
+`ClassScribeModel.pendingSystemOutputConsent` es la única fuente de ownership
+del request pendiente. `ContentView` presenta una copia separada mediante
+`SystemOutputConsentPresentationState`; por eso el dismiss automático del
+`Alert` sólo limpia el estado de presentación y no puede borrar el request de
+dominio antes del confirm. Una invalidación legítima del pending sincroniza la
+copia de presentación, y la desaparición de la ventana cancela el pending.
+
+La acción afirmativa llama a `confirmSystemOutputConsent`, que verifica y
+consume el request exacto y emite el capability antes del primer `await`.
+Una segunda confirmación del mismo request, o una copia stale después de un
+cambio de fuente/modo, no puede iniciar otra captura.
 
 ## Frontera de autorización
 
@@ -107,10 +122,11 @@ macOS:
 
 - `./scripts/pre-push.sh --with-tests` — **PASS**;
 - build release del bundle macOS — **PASS**;
-- suite ClassScribe — **233 tests passed**;
+- suite ClassScribe — **237 tests passed**;
 - tests focalizados de modelo/UI: selección sin aplicación, cancelación,
-  capability por intento, metadata, stale confirmation y CTA sin fallback —
-  **PASS** dentro de la suite.
+  capability por intento, metadata, ownership de presentación/dismissal,
+  confirmación única, stale confirmation, segundo consentimiento y CTA sin
+  fallback — **PASS** dentro de la suite.
 
 Windows:
 

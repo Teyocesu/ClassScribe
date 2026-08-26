@@ -24,6 +24,83 @@ func systemOutputCanStartWithoutAnApplicationAndShowsConsentState() async throws
 
 @MainActor
 @Test
+func alertPresentationDismissalDoesNotEraseDomainPendingBeforeConfirm() async throws {
+    var starts: [CaptureStartRequest] = []
+    let model = makeConsentModel { request in
+        starts.append(request)
+        throw ConsentModelTestError.rejected(request.captureScope)
+    }
+    defer { removeConsentRoot(model.storeRoot) }
+
+    model.subject = "Álgebra"
+    model.onlineCaptureSource = .systemOutput
+    await model.startClass()
+    let domainRequest = try #require(model.pendingSystemOutputConsent)
+
+    var presentation = SystemOutputConsentPresentationState()
+    presentation.synchronize(with: domainRequest)
+    let presentedRequest = try #require(presentation.presentedRequest)
+    presentation.presentedRequest = nil
+
+    #expect(model.pendingSystemOutputConsent == domainRequest)
+    await model.confirmSystemOutputConsent(presentedRequest)
+
+    let start = try #require(starts.first)
+    #expect(start.attempt == domainRequest.attempt)
+    #expect(start.captureScope == .systemOutput)
+    #expect(model.pendingSystemOutputConsent == nil)
+}
+
+@MainActor
+@Test
+func presentationDismissalAloneNeverIssuesAuthorization() async throws {
+    var starts = 0
+    let model = makeConsentModel { _ in
+        starts += 1
+        throw ConsentModelTestError.rejected(.systemOutput)
+    }
+    defer { removeConsentRoot(model.storeRoot) }
+
+    model.subject = "Álgebra"
+    model.onlineCaptureSource = .systemOutput
+    await model.startClass()
+    let domainRequest = try #require(model.pendingSystemOutputConsent)
+
+    var presentation = SystemOutputConsentPresentationState()
+    presentation.synchronize(with: domainRequest)
+    presentation.presentedRequest = nil
+
+    #expect(model.pendingSystemOutputConsent == domainRequest)
+    #expect(starts == 0)
+    #expect(model.storeSessionCount == 0)
+    #expect(!model.capture.isCapturing)
+}
+
+@MainActor
+@Test
+func explicitConfirmConsumesPendingExactlyOnce() async throws {
+    var starts = 0
+    let model = makeConsentModel { request in
+        starts += 1
+        throw ConsentModelTestError.rejected(request.captureScope)
+    }
+    defer { removeConsentRoot(model.storeRoot) }
+
+    model.subject = "Álgebra"
+    model.onlineCaptureSource = .systemOutput
+    await model.startClass()
+    let request = try #require(model.pendingSystemOutputConsent)
+
+    await model.confirmSystemOutputConsent(request)
+    #expect(model.pendingSystemOutputConsent == nil)
+    await model.confirmSystemOutputConsent(request)
+
+    #expect(starts == 1)
+    #expect(model.storeSessionCount == 1)
+}
+
+@MainActor
+@Test
 func cancellingSystemOutputConsentNeverStartsCapture() async throws {
     var starts = 0
     let model = makeConsentModel { _ in
@@ -90,12 +167,16 @@ func changingSourceWhileConsentIsVisibleInvalidatesTheStaleConfirmation() async 
     model.onlineCaptureSource = .systemOutput
     await model.startClass()
     let request = try #require(model.pendingSystemOutputConsent)
+    var presentation = SystemOutputConsentPresentationState()
+    presentation.synchronize(with: request)
 
     model.onlineCaptureSource = .application
+    presentation.synchronize(with: model.pendingSystemOutputConsent)
     await model.confirmSystemOutputConsent(request)
 
     #expect(starts == 0)
     #expect(model.pendingSystemOutputConsent == nil)
+    #expect(presentation.presentedRequest == nil)
     #expect(!model.capture.isCapturing)
 }
 
@@ -113,13 +194,43 @@ func changingModeWhileConsentIsVisibleInvalidatesTheStaleConfirmation() async th
     model.onlineCaptureSource = .systemOutput
     await model.startClass()
     let request = try #require(model.pendingSystemOutputConsent)
+    var presentation = SystemOutputConsentPresentationState()
+    presentation.synchronize(with: request)
 
     model.mode = .inPerson
+    presentation.synchronize(with: model.pendingSystemOutputConsent)
     await model.confirmSystemOutputConsent(request)
 
     #expect(starts == 0)
     #expect(model.pendingSystemOutputConsent == nil)
+    #expect(presentation.presentedRequest == nil)
     #expect(!model.capture.isCapturing)
+}
+
+@MainActor
+@Test
+func secondMacSystemOutputStartRequiresFreshConsent() async throws {
+    var starts: [CaptureStartRequest] = []
+    let model = makeConsentModel { request in
+        starts.append(request)
+        throw ConsentModelTestError.rejected(request.captureScope)
+    }
+    defer { removeConsentRoot(model.storeRoot) }
+
+    model.subject = "Álgebra"
+    model.onlineCaptureSource = .systemOutput
+    await model.startClass()
+    let firstRequest = try #require(model.pendingSystemOutputConsent)
+    await model.confirmSystemOutputConsent(firstRequest)
+
+    await model.startClass()
+    let secondRequest = try #require(model.pendingSystemOutputConsent)
+    #expect(secondRequest.id != firstRequest.id)
+    #expect(secondRequest.attempt != firstRequest.attempt)
+    await model.confirmSystemOutputConsent(secondRequest)
+
+    #expect(starts.count == 2)
+    #expect(model.storeSessionCount == 2)
 }
 
 @MainActor
