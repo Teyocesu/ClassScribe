@@ -150,6 +150,7 @@ Siguen **PENDING/SKIPPED**, no PASS:
 - TCC;
 - hardware/device-change physical gates.
 
-Master source-rate/stereo frente al derivado ASR 16 kHz mono, y el formato de
-archivo largo RF64/W64 o segmentación, permanecen pendientes. La Fase 2C.2 no
-afirma release readiness completo; la Fase 2D sigue **NOT STARTED**.
+La Fase 2D dejó aprobado arquitectónicamente y con evidencia local disponible
+el master source-rate/stereo frente al derivado ASR 16 kHz mono. Permanecen
+pendientes sus gates runtime/físicos y la decisión de formato de archivo largo
+RF64/W64 o segmentación. La Fase 2C.2 no afirma release readiness completo.

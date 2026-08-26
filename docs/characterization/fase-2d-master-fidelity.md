@@ -2,20 +2,20 @@
 
 Fecha: 2026-08-26
 
-Estado: **FIXED / PARTIAL**. La separación entre el master durable de
-application/systemOutput y el derivado ASR 16 kHz mono está implementada en el
-target macOS activo, en el paquete AudioTap y en el product path Windows. Esta
-corrección añade resampling master streaming stateful, handoff determinista y
-propagación terminal de fallos durables; Windows usa una política explícita de
-formato observable para process-loopback. Hay build de producto macOS y
-contratos deterministas disponibles; la revisión independiente queda
-pendiente. XCTest standalone no está disponible en este host y `dotnet`/`csc`
+Estado: **APPROVED arquitectónicamente y con toda la evidencia local disponible**.
+La separación entre el master durable de application/systemOutput y el derivado
+ASR 16 kHz mono está implementada en el target macOS activo, en el paquete
+AudioTap y en el product path Windows. Esta corrección añade resampling master
+streaming stateful, handoff determinista y propagación terminal de fallos
+durables; Windows usa una política explícita de formato observable para
+process-loopback. Hay build de producto macOS y contratos deterministas
+disponibles. XCTest standalone no está disponible en este host y `dotnet`/`csc`
 tampoco. Los gates runtime/physical que requieren esos entornos o audio real
 permanecen **SKIPPED/PENDING**, no PASS.
 
-La Fase 2 completa sigue abierta. Fase 2C.1 y Fase 2C.2 permanecen
-**APPROVED** según sus caracterizaciones; Fase 2E y Fase 2F siguen
-**NOT STARTED**. Esta fase no afirma release readiness completo.
+La aprobación de 2D es arquitectónica/local y no afirma multiplatform release
+readiness. Fase 2C.1 y Fase 2C.2 permanecen **APPROVED** según sus
+caracterizaciones. Fase 2E queda **DIFERIDA / NOT STARTED**.
 
 ## Contrato de artefactos
 
@@ -244,7 +244,10 @@ hardware/device quedan **PENDING**; el compile/runtime Windows queda
 **SKIPPED — dotnet/csc unavailable**. Las pruebas sintéticas y los builds
 locales no convierten esos estados en PASS.
 
-Fase 2E decidirá el formato para clases largas mediante fixture real. RF64,
-W64 y segmentación siguen fuera de alcance; `master.raw` no impone ahora un
-límite RIFF y `source.wav` sólo se materializa con límites seguros. No se
-inicia Fase 2E, Fase 2F ni Fase 3.
+Fase 2E queda diferida y no se inicia en este checkpoint. La decisión
+provisional es que `master.raw` no impone un límite RIFF y `source.wav` sigue
+siendo WAV dentro del contrato actual. No se elige RF64, W64 ni segmentación
+sin un fixture de clase larga y evidencia de que una duración razonable queda
+bloqueada; la truncación silenciosa está prohibida. Si ese gate falla, el
+hallazgo vuelve a un correctivo focalizado antes de RC; de lo contrario, 2E
+permanece posterior a v0.8.0.
