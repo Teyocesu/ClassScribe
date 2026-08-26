@@ -47,7 +47,7 @@ public final class TimelineAnchor: @unchecked Sendable {
         guard let rate, rate > 0 else { return 0 }
         guard let anchor = anchorHostSeconds else {
             anchorHostSeconds = hostSeconds
-            framesWritten = frameCount
+            framesWritten += frameCount
             return 0
         }
         let expected = Int(((hostSeconds - anchor) * Double(rate)).rounded())
@@ -58,5 +58,14 @@ public final class TimelineAnchor: @unchecked Sendable {
         }
         framesWritten += silence + frameCount
         return silence
+    }
+
+    /// Accounts for converter-drained frames that continue the already
+    /// accepted stream but have no new hardware timestamp of their own. This
+    /// is used at a generation/format handoff and during final stop, before the
+    /// next timestamped packet can calculate a gap.
+    func advance(frames: Int) {
+        guard frames > 0 else { return }
+        framesWritten += frames
     }
 }

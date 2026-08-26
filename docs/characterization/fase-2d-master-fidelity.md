@@ -2,13 +2,16 @@
 
 Fecha: 2026-08-25
 
-Estado: **COMPLETE / PARTIAL**. La separación entre el master durable de
+Estado: **FIXED / PARTIAL**. La separación entre el master durable de
 application/systemOutput y el derivado ASR 16 kHz mono está implementada en el
-target macOS activo, en el paquete AudioTap y en el product path Windows. Hay
-build de producto macOS y contratos deterministas disponibles; XCTest
-standalone no está disponible en este host y `dotnet`/`csc` tampoco. Los gates
-runtime/physical que requieren esos entornos o audio real permanecen
-**SKIPPED/PENDING**, no PASS.
+target macOS activo, en el paquete AudioTap y en el product path Windows. Esta
+corrección añade resampling master streaming stateful, handoff determinista y
+propagación terminal de fallos durables; Windows usa una política explícita de
+formato observable para process-loopback. Hay build de producto macOS y
+contratos deterministas disponibles; la revisión independiente queda
+pendiente. XCTest standalone no está disponible en este host y `dotnet`/`csc`
+tampoco. Los gates runtime/physical que requieren esos entornos o audio real
+permanecen **SKIPPED/PENDING**, no PASS.
 
 La Fase 2 completa sigue abierta. Fase 2C.1 y Fase 2C.2 permanecen
 **APPROVED** según sus caracterizaciones; Fase 2E y Fase 2F siguen
@@ -92,12 +95,24 @@ source-rate/stereo, mientras el resampler existente alimenta el sink live a
 16 kHz mono. El live sink es cache para ASR, no la fuente de verdad durable.
 
 El writer acepta la primera entrada no vacía, mantiene el descriptor de master,
-downmixea entradas de más de dos canales y convierte el sample rate sólo cuando
-la fuente cambia. La generación y los leases existentes siguen filtrando
-callbacks tardíos. El stop drena la captura, cierra/flush del master, valida el
-manifest, deriva `source.wav` y continúa el pipeline actual. La ruta de
-micrófono conserva el camino legacy de esta fase; no se afirma fidelidad
-master source-rate para micrófono.
+downmixea entradas de más de dos canales y convierte el sample rate mediante un
+`StreamingMasterResampler` stateful. Conserva phase fraccional, frame previo,
+conteos acumulados y el formato master inmutable; por eso el conteo acumulado
+sigue la conversión racional con error máximo de un frame master y no reinicia
+la interpolación en cada callback. La generación y los leases existentes siguen
+filtrando callbacks tardíos. En un cambio de generation/format se drena y
+finaliza el converter anterior antes del gap durable y se crea un converter
+nuevo; no se interpola audio a través del silencio del handoff. La ruta de
+micrófono conserva el camino legacy de esta fase; no se afirma fidelidad master
+source-rate para micrófono.
+
+Un fallo de escritura del master es terminal y recoverable: gana el primer
+error, bloquea nuevas escrituras y conserva el `master.raw`/manifest válido ya
+existente. `AudioCaptureSession` lo expone al `CaptureNativeExecutor`; el
+resultado llega al `CaptureController`, que no puede informar éxito de
+finalización simplemente porque un master parcial permita derivar `source.wav`.
+El live ASR puede conservar datos transitorios, pero no oculta el fallo de la
+fuente durable. Un nuevo `SessionAttemptID` recibe estado limpio.
 
 La recuperación de una sesión nueva intenta primero `master.raw` + manifest
 válido y regenera `source.wav` si falta o es inválido. Si ese par no es válido,
@@ -114,24 +129,45 @@ no fuerza 16 kHz mono al recorder durable. El micrófono puede seguir usando el
 formato legacy fijo.
 
 El callback con attempt y generation válidos convierte el PCM nativo al
-descriptor inmutable del master y lo escribe en `master.raw`. En paralelo,
-convierte a 16 kHz mono para el snapshot ASR reciente. Los contadores de
-duración durable y de ASR son independientes. El stop conserva el ownership
-single-flight existente, deriva `source.wav` una vez desde el master y deja el
-master/manifest disponibles para recovery si la derivación falla.
+descriptor inmutable del master y lo escribe en `master.raw` mediante un
+resampler streaming stateful. En paralelo, convierte a 16 kHz mono para el
+snapshot ASR reciente. Los contadores de duración durable y de ASR son
+independientes; `CaptureHandoffTimeline` usa el `FrameCount` real producido por
+el converter, incluido el tail drenado antes de un handoff o stop. El stop
+conserva el ownership single-flight existente, deriva `source.wav` una vez
+desde el master y deja el master/manifest disponibles para recovery si la
+derivación falla.
+
+Para process-loopback, Windows consulta el mix del default render endpoint
+observable por ClassScribe y solicita explícitamente ese formato con
+`WithFormat(...)`; conserva mono y limita más de dos canales a stereo. NAudio
+no ofrece aquí un `GetMixFormat` por proceso, así que esto no se presenta como
+sample rate nativo individual de la aplicación: si Windows enruta la app a otro
+endpoint, la limitación queda explícita. `SystemOutput` mantiene el formato
+real del render endpoint.
 
 Se escribieron pruebas del product path para formato real del recorder,
 elección por primer PCM no vacío, cambio de formato en rebind, timeline/gap,
 single-flight, derivación, recovery y compatibilidad legacy. El compile/runtime
 Windows queda **SKIPPED — dotnet/csc unavailable**; no se instaló SDK.
 
+Los contratos deterministas cubren 44.1 kHz → 48 kHz con 10.000 callbacks de
+256 frames, 48 kHz → 44.1 kHz con callbacks de 127 frames, tamaños alternos
+127/256/511, una rampa dividida frente a un bloque único, continuidad de
+boundaries y el `FrameCount` real usado por `CaptureHandoffTimeline`. También
+se verifica que la conversión del manifest aparezca una sola vez por
+generation/format. Estos casos permanecen sujetos a la disponibilidad de cada
+suite indicada en la tabla de evidencia.
+
 ## Timeline, rebind y duración
 
 La línea durable usa frames, bytes por frame y sample rate del master. Un
 callback vacío o stale no fija el formato. Durante un rebind se drena la
 generación vieja, se avanza la generación, se reutiliza el mismo descriptor y
-archivo de master, y un nuevo formato de entrada se convierte antes de
-escribir. El evento queda registrado en `conversions` del manifest.
+archivo de master, y un nuevo formato de entrada crea un converter independiente
+antes de escribir. El tail drenado se registra antes de planear el gap durable;
+no se interpola a través del silencio y el evento queda registrado una sola vez
+en `conversions` del manifest por generation/format.
 
 Los gaps se insertan como silencio alineado al master y el derivado conserva la
 misma duración temporal mediante resampling global. La duración online se
@@ -154,25 +190,26 @@ Resultados reproducibles de este checkout:
 | Validación | Resultado |
 | --- | --- |
 | `./scripts/run_app.sh --build-only` | **PASS**; bundle release macOS y codesign verificado |
-| `./scripts/pre-push.sh --with-tests` | **PASS**; bundle macOS, compilación de tests y 239 tests pasaron |
+| `./scripts/pre-push.sh --with-tests` | **PASS**; bundle macOS, compilación de tests y 240 tests pasaron |
 | `swift build --package-path tools/audiotap -c release -j 2` con el `.toolchain` local y `-strict-concurrency=complete` | **PASS** |
 | `swift test --package-path tools/audiotap -j 2` con el `.toolchain` local, `-resource-dir` y `-strict-concurrency=complete` | **SKIPPED — XCTest unavailable**; Command Line Tools devuelve `no such module 'XCTest'` |
-| Product path Windows y contratos equivalentes | código y tests escritos; revisión estática disponible; runtime **SKIPPED — dotnet/csc unavailable** |
+| Product path Windows y contratos equivalentes | código y tests escritos; revisión estática disponible; runtime/compile **SKIPPED — dotnet/csc unavailable** |
 | `git diff --check` | **PASS** |
 
 La suite standalone de AudioTap no se presenta como PASS porque el host no
 expone XCTest utilizable. La suite de producto macOS sí pasó mediante
-`pre-push`; tampoco se presenta la suite Windows como compilada o ejecutada.
-No se inventan conteos de tests.
+`pre-push`, incluyendo el test product-path de fallo durable; tampoco se
+presenta la suite Windows como compilada o ejecutada. No se inventan conteos de
+tests.
 
 ## Gates físicos y trabajo diferido
 
 No se ejecutó un gate de fidelidad física CATap con output audible real,
-exclusión de ClassScribe, cambio de dispositivo y teardown; queda
-**PENDING / SKIPPED**. El gate TCC queda **PENDING**. Los gates físicos de
-Windows, cambio de hardware/device y runtime Windows quedan
-**PENDING / SKIPPED — dotnet/csc unavailable**. Las pruebas sintéticas y los
-builds locales no convierten esos estados en PASS.
+exclusión de ClassScribe, cambio de dispositivo y teardown; queda **PENDING**.
+El gate TCC queda **PENDING**. Los gates físicos de Windows y cambio de
+hardware/device quedan **PENDING**; el compile/runtime Windows queda
+**SKIPPED — dotnet/csc unavailable**. Las pruebas sintéticas y los builds
+locales no convierten esos estados en PASS.
 
 Fase 2E decidirá el formato para clases largas mediante fixture real. RF64,
 W64 y segmentación siguen fuera de alcance; `master.raw` no impone ahora un

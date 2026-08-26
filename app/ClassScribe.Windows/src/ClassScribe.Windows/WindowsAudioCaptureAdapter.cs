@@ -105,7 +105,22 @@ internal sealed class NAudioWindowsAudioCaptureFactory : IWindowsAudioCaptureFac
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+
+        // NAudio's process-loopback virtual endpoint has no per-process
+        // GetMixFormat. Query the default render endpoint that ClassScribe can
+        // observe and carry that explicit shared-mix contract into the virtual
+        // recorder. If Windows routes the app to another endpoint, this remains
+        // an honest best-observable request rather than an app-native-rate claim.
+        var observedEndpoint = GetDefaultRenderEndpoint();
+        using var observedDevice = observedEndpoint.Device
+            ?? throw new InvalidOperationException(
+                "El endpoint de salida no tiene un dispositivo WASAPI observable.");
+        using var audioClient = observedDevice.AudioClient;
+        var observedRenderMix = NAudioWindowsAudioRecorder.ToPcmFormat(audioClient.MixFormat);
+        var requestedFormat = ProcessLoopbackFormatPolicy.FromObservedRenderMix(observedRenderMix);
+
         var recorder = await CreateBuilder()
+            .WithFormat(ToWaveFormat(requestedFormat))
             .WithProcessLoopback(rootProcessId, ProcessLoopbackMode.IncludeTargetProcessTree)
             .BuildAsync()
             .ConfigureAwait(false);
@@ -137,6 +152,22 @@ internal sealed class NAudioWindowsAudioCaptureFactory : IWindowsAudioCaptureFac
     public IWindowsAudioRecorder BuildDeviceRecorder(MMDevice device) =>
         new NAudioWindowsAudioRecorder(
             CreateBuilder(fixedMicrophoneFormat: true).WithDevice(device).Build());
+
+    internal static WaveFormat ToWaveFormat(AudioPcmFormat format)
+    {
+        format.EnsureValid();
+        return format.Encoding switch
+        {
+            AudioSampleEncoding.PcmS16LE => new WaveFormat(
+                format.SampleRate,
+                16,
+                format.Channels),
+            AudioSampleEncoding.Float32LE => WaveFormat.CreateIeeeFloatWaveFormat(
+                format.SampleRate,
+                format.Channels),
+            _ => throw new ArgumentOutOfRangeException(nameof(format.Encoding)),
+        };
+    }
 }
 
 internal sealed class NAudioWindowsAudioRecorder : IWindowsAudioRecorder
@@ -186,7 +217,7 @@ internal sealed class NAudioWindowsAudioRecorder : IWindowsAudioRecorder
         RecordingStopped?.Invoke(eventArgs.Exception);
     }
 
-    private static AudioPcmFormat ToPcmFormat(WaveFormat waveFormat)
+    internal static AudioPcmFormat ToPcmFormat(WaveFormat waveFormat)
     {
         ArgumentNullException.ThrowIfNull(waveFormat);
         var standard = waveFormat.AsStandardWaveFormat();

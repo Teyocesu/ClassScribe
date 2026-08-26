@@ -6,7 +6,7 @@ private let logger = Logger(subsystem: "com.meetingtranscriber.audiotap", catego
 /// Orchestrates app audio capture + optional mic recording.
 /// Replaces the CLI entry point — call `start()` and `stop()` directly from the host app.
 @available(macOS 14.2, *)
-public class AudioCaptureSession {
+public class AudioCaptureSession: @unchecked Sendable {
     private var pids: [pid_t]
     private var source: AppAudioCaptureSource
     private let sampleRate: Int
@@ -25,6 +25,7 @@ public class AudioCaptureSession {
 
     private var appCapture: AppAudioCapture?
     private var masterWriter: MasterAudioWriter?
+    private var stoppedAppTerminalErrorMessage: String?
     private var micCapture: MicCaptureHandler?
     private var appFileHandle: FileHandle?
     private var applicationSourceGeneration: UInt64 = 1
@@ -108,6 +109,7 @@ public class AudioCaptureSession {
     /// Start capturing app audio (and optionally mic audio).
     public func start() throws {
         applicationSourceGeneration = 1
+        stoppedAppTerminalErrorMessage = nil
         // Create app output file and get its file descriptor
         // Restrict permissions to owner-only (0600) — audio may contain sensitive meeting content
         FileManager.default.createFile(
@@ -187,6 +189,13 @@ public class AudioCaptureSession {
             )
         }
         stopApplicationCapture()
+        if let failureMessage = masterWriter?.failureMessage {
+            throw NSError(
+                domain: "audiotap.master",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: failureMessage],
+            )
+        }
         applicationSourceGeneration &+= 1
         self.source = source
         if case let .application(processes) = source {
@@ -211,10 +220,12 @@ public class AudioCaptureSession {
     /// Stops the current native app source but leaves the session file open so
     /// a subsequent source generation can append at the same offset.
     public func stopApplicationCapture() {
-        guard let capture = appCapture else { return }
-        capture.stop()
-        rememberApplicationReadings(capture)
-        appCapture = nil
+        if let capture = appCapture {
+            capture.stop()
+            rememberApplicationReadings(capture)
+            appCapture = nil
+        }
+        finishMasterWriter()
     }
 
     private func startApplicationCapture(
@@ -267,12 +278,14 @@ public class AudioCaptureSession {
         appCapture?.currentLevelDBFS ?? -120
     }
 
-    /// Terminal output-device restart failure owned by the current native
-    /// source. The session keeps the stopped AppAudioCapture object attached
-    /// until the control plane observes this value and performs normal
-    /// recoverable finalization, so durable audio is never discarded.
+    /// Terminal failure owned by the current native source or durable master.
+    /// The session retains the first failure after source teardown so the
+    /// control plane can perform recoverable finalization without discarding
+    /// durable evidence.
     public var appTerminalErrorMessage: String? {
-        appCapture?.terminalErrorMessage
+        masterWriter?.failureMessage
+            ?? appCapture?.terminalErrorMessage
+            ?? stoppedAppTerminalErrorMessage
     }
 
     /// Instantaneous mic level in dBFS, decayed to -120 when no buffer has arrived
@@ -284,6 +297,7 @@ public class AudioCaptureSession {
     /// Stop all capture and return the result.
     public func stop() -> AudioCaptureResult {
         stopApplicationCapture()
+        finishMasterWriter()
         micCapture?.stop()
 
         // Gather the raw per-track readings and hand the delay/rate/channel
@@ -305,6 +319,7 @@ public class AudioCaptureSession {
             ),
         )
 
+        stoppedAppTerminalErrorMessage = masterWriter?.failureMessage
         try? appFileHandle?.close()
         appFileHandle = nil
         masterWriter = nil
@@ -312,5 +327,32 @@ public class AudioCaptureSession {
 
         logger.info("Capture session stopped (rate: \(result.actualSampleRate), channels: \(result.actualChannels), micDelay: \(result.micDelay))")
         return result
+    }
+
+    /// Test-only product seam: attaches a real session-owned master writer to
+    /// this session without constructing a CoreAudio source. The native
+    /// executor can then exercise the same level/stop ownership path with a
+    /// deterministic injected durable failure.
+    @_spi(ClassScribeTests)
+    public func installMasterWriterForTesting(
+        _ writer: MasterAudioWriter,
+        fileHandle: FileHandle,
+    ) {
+        masterWriter = writer
+        appFileHandle = fileHandle
+        stoppedAppTerminalErrorMessage = nil
+    }
+
+    private func finishMasterWriter() {
+        guard let writer = masterWriter else { return }
+        do {
+            try writer.finish()
+        } catch {
+            writer.recordFailure(error)
+            logger.error(
+                "Master audio finalization failed: \(error.localizedDescription, privacy: .public)",
+            )
+        }
+        stoppedAppTerminalErrorMessage = writer.failureMessage
     }
 }

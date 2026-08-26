@@ -179,6 +179,26 @@ public sealed class CaptureHandoffTimeline
         }
     }
 
+    /// Advances the durable end by converter-drained frames that continue the
+    /// accepted stream but have no new arrival timestamp. This must run before
+    /// a subsequent generation plans its handoff gap.
+    public void AdvanceDurableFrames(int frames)
+    {
+        if (frames <= 0)
+        {
+            return;
+        }
+
+        lock (sync)
+        {
+            if (lastPacketEndTimestamp is not null)
+            {
+                lastPacketEndTimestamp = checked(
+                    lastPacketEndTimestamp.Value + DurationTicks(checked(frames * bytesPerFrame)));
+            }
+        }
+    }
+
     public (long? LastPacketEndTimestamp, bool HasPendingHandoff) Snapshot
     {
         get

@@ -7,13 +7,22 @@ import Foundation
 @available(macOS 14.2, *)
 public final class MasterAudioWriter: @unchecked Sendable {
     private let outputFileDescriptor: Int32
+    private let failureLock = NSLock()
     public let masterURL: URL
     public let manifestURL: URL
     public let timelineAnchor: TimelineAnchor
     private(set) public var format: AudioManifestMaster?
     private(set) public var manifest: AudioManifest?
     private(set) public var framesWritten: Int64 = 0
-    private(set) public var failureMessage: String?
+    private var storedFailureMessage: String?
+    private var converter: StreamingMasterResampler?
+    private var converterKey: ConverterKey?
+
+    public var failureMessage: String? {
+        failureLock.lock()
+        defer { failureLock.unlock() }
+        return storedFailureMessage
+    }
 
     public init(
         outputFileDescriptor: Int32,
@@ -43,7 +52,46 @@ public final class MasterAudioWriter: @unchecked Sendable {
         hostTicks: UInt64,
         sourceGeneration: UInt64,
     ) throws -> Bool {
+        if let failureMessage {
+            throw Self.terminalError(failureMessage)
+        }
         guard !samples.isEmpty, inputRate > 0, inputChannels > 0 else { return false }
+        do {
+            return try appendImpl(
+                samples,
+                inputRate: inputRate,
+                inputChannels: inputChannels,
+                hostTicks: hostTicks,
+                sourceGeneration: sourceGeneration,
+            )
+        } catch {
+            recordFailure(error)
+            throw error
+        }
+    }
+
+    /// Drains the pending look-ahead frame for the current source format. The
+    /// returned tail is written before a new generation's timeline gap, so a
+    /// format handoff never interpolates through silence.
+    public func finish() throws {
+        if let failureMessage {
+            throw Self.terminalError(failureMessage)
+        }
+        do {
+            try flushConverter()
+        } catch {
+            recordFailure(error)
+            throw error
+        }
+    }
+
+    private func appendImpl(
+        _ samples: [Float],
+        inputRate: Int,
+        inputChannels: Int,
+        hostTicks: UInt64,
+        sourceGeneration: UInt64,
+    ) throws -> Bool {
         let frameCount = samples.count / inputChannels
         guard frameCount > 0 else { return false }
         let complete = Array(samples.prefix(frameCount * inputChannels))
@@ -95,13 +143,31 @@ public final class MasterAudioWriter: @unchecked Sendable {
             manifest = updated
         }
 
-        let converted = Self.normalizeAndResample(
-            complete,
+        let key = ConverterKey(
+            sourceGeneration: max(1, sourceGeneration),
             inputRate: inputRate,
             inputChannels: inputChannels,
-            outputRate: selected.sampleRate,
-            outputChannels: selected.channels,
         )
+        if converterKey != key {
+            try flushConverter()
+            guard let newConverter = StreamingMasterResampler(
+                inputRate: inputRate,
+                inputChannels: inputChannels,
+                outputRate: selected.sampleRate,
+                outputChannels: selected.channels,
+            ) else {
+                throw NSError(
+                    domain: "audiotap.master",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "No se pudo crear el conversor master."],
+                )
+            }
+            converter = newConverter
+            converterKey = key
+        }
+
+        guard let converter else { return false }
+        let converted = converter.process(complete)
         guard !converted.isEmpty else { return false }
         let outputFrames = converted.count / selected.channels
         let silenceFrames = timelineAnchor.silenceFramesBefore(
@@ -120,6 +186,22 @@ public final class MasterAudioWriter: @unchecked Sendable {
         return true
     }
 
+    /// Whether the next callback belongs to a source stream whose converter
+    /// state cannot be reused. The Windows product uses the same distinction
+    /// to drain the old packet before it plans the new handoff gap.
+    public func requiresConverterReset(
+        inputRate: Int,
+        inputChannels: Int,
+        sourceGeneration: UInt64,
+    ) -> Bool {
+        guard converter != nil else { return false }
+        return converterKey != ConverterKey(
+            sourceGeneration: max(1, sourceGeneration),
+            inputRate: inputRate,
+            inputChannels: inputChannels,
+        )
+    }
+
     public func validateManifest() throws {
         guard let manifest else { throw AudioManifestError.invalidFormat }
         try AudioManifestStore.validate(manifest)
@@ -128,9 +210,23 @@ public final class MasterAudioWriter: @unchecked Sendable {
     /// Records a durable-path failure for the owner to surface during stop or
     /// recovery while allowing the independent live ASR branch to continue.
     public func recordFailure(_ error: Error) {
-        if failureMessage == nil {
-            failureMessage = error.localizedDescription
+        failureLock.lock()
+        if storedFailureMessage == nil {
+            storedFailureMessage = error.localizedDescription
         }
+        failureLock.unlock()
+    }
+
+    private func flushConverter() throws {
+        guard let converter else { return }
+        self.converter = nil
+        converterKey = nil
+        let tail = converter.finish()
+        guard !tail.isEmpty, let format else { return }
+        let outputFrames = tail.count / format.channels
+        timelineAnchor.advance(frames: outputFrames)
+        try write(Self.float32LEData(tail))
+        framesWritten += Int64(outputFrames)
     }
 
     private func write(_ data: Data) throws {
@@ -154,67 +250,6 @@ public final class MasterAudioWriter: @unchecked Sendable {
         }
     }
 
-    private static func normalizeAndResample(
-        _ samples: [Float],
-        inputRate: Int,
-        inputChannels: Int,
-        outputRate: Int,
-        outputChannels: Int,
-    ) -> [Float] {
-        let inputFrames = samples.count / inputChannels
-        guard inputFrames > 0 else { return [] }
-        var normalized = [Float](repeating: 0, count: inputFrames * outputChannels)
-        for frame in 0 ..< inputFrames {
-            let source = frame * inputChannels
-            let destination = frame * outputChannels
-            if outputChannels == 1 {
-                let sum = (0 ..< inputChannels).reduce(Float.zero) {
-                    $0 + (samples[source + $1].isFinite ? samples[source + $1] : 0)
-                }
-                normalized[destination] = sum / Float(inputChannels)
-            } else if inputChannels == 1 {
-                normalized[destination] = samples[source]
-                normalized[destination + 1] = samples[source]
-            } else if inputChannels == 2 {
-                normalized[destination] = samples[source]
-                normalized[destination + 1] = samples[source + 1]
-            } else {
-                var left: Float = 0
-                var right: Float = 0
-                var leftCount = 0
-                var rightCount = 0
-                for channel in 0 ..< inputChannels {
-                    let value = samples[source + channel].isFinite ? samples[source + channel] : 0
-                    if channel.isMultiple(of: 2) {
-                        left += value
-                        leftCount += 1
-                    } else {
-                        right += value
-                        rightCount += 1
-                    }
-                }
-                normalized[destination] = left / Float(max(leftCount, 1))
-                normalized[destination + 1] = right / Float(max(rightCount, 1))
-            }
-        }
-        guard inputRate != outputRate else { return normalized }
-        let outputFrames = max(1, Int((Double(inputFrames) * Double(outputRate) / Double(inputRate)).rounded()))
-        var output = [Float](repeating: 0, count: outputFrames * outputChannels)
-        let sourceStep = Double(inputRate) / Double(outputRate)
-        for frame in 0 ..< outputFrames {
-            let position = Double(frame) * sourceStep
-            let lower = min(inputFrames - 1, Int(position.rounded(.down)))
-            let upper = min(inputFrames - 1, lower + 1)
-            let fraction = Float(position - Double(lower))
-            for channel in 0 ..< outputChannels {
-                let first = normalized[lower * outputChannels + channel]
-                let second = normalized[upper * outputChannels + channel]
-                output[frame * outputChannels + channel] = first + ((second - first) * fraction)
-            }
-        }
-        return output
-    }
-
     fileprivate static func float32LEData(_ samples: [Float]) -> Data {
         var data = Data(capacity: samples.count * MemoryLayout<Float>.size)
         for sample in samples {
@@ -226,6 +261,20 @@ public final class MasterAudioWriter: @unchecked Sendable {
 
     private static func float32LEData(repeating value: Float, count: Int) -> Data {
         float32LEData([Float](repeating: value, count: count))
+    }
+
+    private static func terminalError(_ message: String) -> NSError {
+        NSError(
+            domain: "audiotap.master",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: message],
+        )
+    }
+
+    private struct ConverterKey: Equatable {
+        let sourceGeneration: UInt64
+        let inputRate: Int
+        let inputChannels: Int
     }
 }
 

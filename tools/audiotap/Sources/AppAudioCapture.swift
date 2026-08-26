@@ -94,7 +94,10 @@ public class AppAudioCapture: @unchecked Sendable {
     /// stopped, allowing the control plane to preserve and finalize the
     /// durable file instead of presenting a healthy but source-less capture.
     public var terminalErrorMessage: String? {
-        terminalErrorLock.withLock { $0 }
+        if let masterFailure = masterWriter?.failureMessage {
+            return masterFailure
+        }
+        return terminalErrorLock.withLock { $0 }
     }
 
     /// Returns the instantaneous app-audio level in dBFS, decayed to -120 if

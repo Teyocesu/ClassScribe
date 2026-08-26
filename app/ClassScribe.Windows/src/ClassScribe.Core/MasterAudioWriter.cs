@@ -8,6 +8,8 @@ public sealed class MasterAudioWriter
 {
     private readonly string manifestPath;
     private AudioManifest? manifest;
+    private StreamingMasterResampler? resampler;
+    private ConverterKey? converterKey;
 
     public MasterAudioWriter(string manifestPath)
     {
@@ -45,6 +47,17 @@ public sealed class MasterAudioWriter
             inputFormat.SampleRate,
             Math.Min(inputFormat.Channels, 2),
             AudioSampleEncoding.Float32LE);
+        var key = new ConverterKey(
+            generation.Number,
+            inputFormat.SampleRate,
+            inputFormat.Channels,
+            inputFormat.Encoding);
+        if (converterKey is not null && converterKey != key)
+        {
+            throw new InvalidOperationException(
+                "El conversor master anterior debe drenarse antes de cambiar de formato o generación.");
+        }
+
         var conversion = inputFormat.SampleRate != outputFormat.SampleRate
             || inputFormat.Channels != outputFormat.Channels;
         if (Format is null)
@@ -85,15 +98,54 @@ public sealed class MasterAudioWriter
             }
         }
 
-        var samples = PcmAudioConverter.Convert(
-            input,
-            inputFormat,
-            outputFormat.SampleRate,
-            outputFormat.Channels);
+        if (resampler is null)
+        {
+            resampler = new StreamingMasterResampler(
+                inputFormat.SampleRate,
+                inputFormat.Channels,
+                outputFormat.SampleRate,
+                outputFormat.Channels);
+            converterKey = key;
+        }
+
+        var samples = resampler.Process(PcmAudioConverter.Decode(input, inputFormat));
         return new MasterAudioPacket(
             PcmAudioConverter.EncodeFloat32LE(samples),
             samples.Length / outputFormat.Channels,
             outputFormat);
+    }
+
+    public bool RequiresConverterReset(
+        AudioPcmFormat inputFormat,
+        CaptureSourceGeneration generation)
+    {
+        ArgumentNullException.ThrowIfNull(generation);
+        inputFormat.EnsureValid();
+        return resampler is not null
+            && converterKey != new ConverterKey(
+                generation.Number,
+                inputFormat.SampleRate,
+                inputFormat.Channels,
+                inputFormat.Encoding);
+    }
+
+    /// Returns the old stream's deterministic look-ahead tail and resets the
+    /// converter. The caller must enqueue and commit this packet before
+    /// planning a new generation's wall-clock gap.
+    public MasterAudioPacket FlushPendingPacket()
+    {
+        if (resampler is null || Format is not { } format)
+        {
+            return MasterAudioPacket.Empty;
+        }
+
+        var pending = resampler.Finish();
+        resampler = null;
+        converterKey = null;
+        return new MasterAudioPacket(
+            PcmAudioConverter.EncodeFloat32LE(pending),
+            pending.Length / format.Channels,
+            format);
     }
 
     public byte[] CreateSilence(int frames)
@@ -138,6 +190,12 @@ public sealed class MasterAudioWriter
         OutputSampleRate = output.SampleRate,
         OutputChannels = output.Channels,
     };
+
+    private readonly record struct ConverterKey(
+        long SourceGeneration,
+        int InputRate,
+        int InputChannels,
+        AudioSampleEncoding Encoding);
 }
 
 public readonly record struct MasterAudioPacket(

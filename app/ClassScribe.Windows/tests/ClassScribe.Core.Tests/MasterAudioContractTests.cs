@@ -40,7 +40,7 @@ public sealed class MasterAudioContractTests
         Assert.IsFalse(File.Exists(manifestPath));
 
         var packet = writer.PreparePacket(
-            PcmAudioConverter.EncodePcmS16LE(new[] { 0.25f, -0.25f }),
+            PcmAudioConverter.EncodePcmS16LE(new[] { 0.25f, -0.25f, 0.3f, -0.3f }),
             inputFormat,
             generation);
 
@@ -105,6 +105,7 @@ public sealed class MasterAudioContractTests
             PcmAudioConverter.EncodeFloat32LE(new[] { 0.1f, -0.1f, 0.2f, -0.2f }),
             AudioPcmFormat.Create(48_000, 2, AudioSampleEncoding.Float32LE),
             firstGeneration);
+        _ = writer.FlushPendingPacket();
         _ = writer.PreparePacket(
             PcmAudioConverter.EncodePcmS16LE(new[] { 0.3f, -0.3f }),
             AudioPcmFormat.Create(44_100, 1, AudioSampleEncoding.PcmS16LE),
@@ -131,7 +132,9 @@ public sealed class MasterAudioContractTests
             PcmAudioConverter.EncodeFloat32LE(new[] { 0.1f, -0.1f, 0.2f, -0.2f }),
             firstFormat,
             firstGeneration);
-        var secondInput = PcmAudioConverter.EncodePcmS16LE(new[] { 0.3f, -0.3f });
+        var firstTail = writer.FlushPendingPacket();
+        writer.CommitFrames(firstTail.FrameCount);
+        var secondInput = PcmAudioConverter.EncodePcmS16LE(new[] { 0.3f, -0.3f, 0.4f, -0.4f });
         var second = writer.PreparePacket(secondInput, secondFormat, secondGeneration);
 
         Assert.AreEqual(first.FrameCount * first.Format.BytesPerFrame, first.Bytes.Length);
@@ -141,17 +144,52 @@ public sealed class MasterAudioContractTests
     }
 
     [TestMethod]
+    public void conversionManifestIsRecordedOncePerGenerationAndFormat()
+    {
+        var writer = new MasterAudioWriter(Path.Combine(temporaryRoot, "audio-manifest.json"));
+        var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
+        var firstGeneration = new CaptureSourceGeneration(attempt, 1);
+        var secondGeneration = new CaptureSourceGeneration(attempt, 2);
+        var masterFormat = AudioPcmFormat.Create(48_000, 2, AudioSampleEncoding.Float32LE);
+        var changedFormat = AudioPcmFormat.Create(44_100, 1, AudioSampleEncoding.PcmS16LE);
+
+        _ = writer.PreparePacket(
+            PcmAudioConverter.EncodeFloat32LE([0.1f, -0.1f, 0.2f, -0.2f]),
+            masterFormat,
+            firstGeneration);
+        _ = writer.FlushPendingPacket();
+        _ = writer.PreparePacket(
+            PcmAudioConverter.EncodePcmS16LE([0.3f, -0.3f, 0.4f, -0.4f]),
+            changedFormat,
+            secondGeneration);
+        _ = writer.PreparePacket(
+            PcmAudioConverter.EncodePcmS16LE([0.5f, -0.5f, 0.6f, -0.6f]),
+            changedFormat,
+            secondGeneration);
+
+        Assert.AreEqual(1, writer.Manifest?.Conversions.Count);
+    }
+
+    [TestMethod]
     public void masterDurationDoesNotDependOnAsrDerivativeBytes()
     {
         var writer = new MasterAudioWriter(Path.Combine(temporaryRoot, "audio-manifest.json"));
         var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
         var generation = new CaptureSourceGeneration(attempt, 1);
 
-        _ = writer.PreparePacket(
-            PcmAudioConverter.EncodeFloat32LE(new[] { 0.1f, -0.1f }),
+        var samples = new float[48_000 * 2];
+        for (var index = 0; index < samples.Length; index += 2)
+        {
+            samples[index] = 0.1f;
+            samples[index + 1] = -0.1f;
+        }
+        var packet = writer.PreparePacket(
+            PcmAudioConverter.EncodeFloat32LE(samples),
             AudioPcmFormat.Create(48_000, 2, AudioSampleEncoding.Float32LE),
             generation);
-        writer.CommitFrames(48_000);
+        writer.CommitFrames(packet.FrameCount);
+        var tail = writer.FlushPendingPacket();
+        writer.CommitFrames(tail.FrameCount);
 
         Assert.AreEqual(1, writer.DurationSeconds, 0.000001);
     }

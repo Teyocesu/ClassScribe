@@ -384,6 +384,17 @@ public sealed class WindowsAudioCaptureProductPathTests
         Assert.AreEqual(1, recorder.DisposeCount);
     }
 
+    [TestMethod]
+    public void recorderFormatReflectsRequestedProcessLoopbackContract()
+    {
+        var requested = ProcessLoopbackFormatPolicy.FromObservedRenderMix(
+            AudioPcmFormat.Create(96_000, 1, AudioSampleEncoding.Float32LE));
+        var effective = NAudioWindowsAudioRecorder.ToPcmFormat(
+            NAudioWindowsAudioCaptureFactory.ToWaveFormat(requested));
+
+        Assert.AreEqual(requested, effective);
+    }
+
     private static async Task StartSystemOutputAsync(
         WindowsAudioCapture capture,
         string folder,

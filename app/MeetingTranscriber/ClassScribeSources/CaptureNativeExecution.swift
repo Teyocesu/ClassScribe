@@ -281,6 +281,10 @@ struct CaptureNativeLevelSnapshot: Sendable {
     let terminalErrorMessage: String?
 }
 
+struct CaptureNativeStopResult: Sendable {
+    let terminalErrorMessage: String?
+}
+
 /// Product seam for the online mid-recording handoff. The default adapter
 /// delegates to the serial native executor; lifecycle tests can inject a
 /// deterministic implementation without constructing CoreAudio objects.
@@ -553,9 +557,30 @@ final class CaptureNativeExecutor: @unchecked Sendable {
         }
     }
 
-    func beginStop(attempt: SessionAttemptID) -> CaptureNativeWork<Void> {
+    func beginStop(attempt: SessionAttemptID) -> CaptureNativeWork<CaptureNativeStopResult> {
         submit(attempt: attempt) { [self] _ in
-            _ = captureSessions.removeValue(forKey: attempt)?.stop()
+            guard let session = captureSessions.removeValue(forKey: attempt) else {
+                return CaptureNativeStopResult(terminalErrorMessage: nil)
+            }
+            _ = session.stop()
+            return CaptureNativeStopResult(
+                terminalErrorMessage: session.appTerminalErrorMessage,
+            )
+        }
+    }
+
+    /// Product-test seam that installs a real session owner on the same serial
+    /// executor used by CATap. It avoids constructing CoreAudio objects while
+    /// preserving the level-snapshot and stop ownership path.
+    func installSessionForTesting(
+        _ session: AudioCaptureSession,
+        for attempt: SessionAttemptID,
+    ) async {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                captureSessions[attempt] = session
+                continuation.resume()
+            }
         }
     }
 

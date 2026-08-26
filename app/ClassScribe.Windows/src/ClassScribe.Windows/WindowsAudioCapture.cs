@@ -788,6 +788,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     {
         MasterAudioPacket packet;
         AudioPcmFormat durableFormat;
+        var converterProducedNoPacket = false;
         lock (sync)
         {
             if (!IsCurrentSourceGeneration(attempt, generation)
@@ -798,15 +799,18 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
             try
             {
-                packet = masterWriter.PreparePacket(copy, inputFormat, generation);
-                if (packet.IsEmpty)
+                if (masterWriter.RequiresConverterReset(inputFormat, generation)
+                    && !FlushPendingMasterPacketLocked())
                 {
                     return;
                 }
 
+                packet = masterWriter.PreparePacket(copy, inputFormat, generation);
                 durableFormat = packet.Format;
                 masterFormat = durableFormat;
                 packetTimeline.SetFormat(durableFormat);
+                AddAsrPacketToSnapshot(copy, inputFormat);
+                converterProducedNoPacket = packet.IsEmpty;
             }
             catch (Exception error) when (error is IOException
                                                or UnauthorizedAccessException
@@ -816,6 +820,15 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                                                or JsonException)
             {
                 FailCapture(attempt, error);
+                return;
+            }
+
+            if (converterProducedNoPacket)
+            {
+                // The streaming converter may hold one look-ahead frame. A
+                // callback still counts for startup/health; the held frame is
+                // drained on the next callback, handoff, or final stop.
+                generationFirstPacket.TrySetResult();
                 return;
             }
 
@@ -860,12 +873,35 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
             masterWriter.CommitFrames(packet.FrameCount);
             masterFramesWritten = masterWriter.FramesWritten;
-            AddAsrPacketToSnapshot(copy, inputFormat);
             packetTimeline.CommitPacket(plan);
         }
 
         generationFirstPacket.TrySetResult();
         LevelChanged?.Invoke(attempt, CalculateLevel(copy, inputFormat));
+    }
+
+    private bool FlushPendingMasterPacketLocked()
+    {
+        if (masterWriter is not { } writer)
+        {
+            return true;
+        }
+
+        var pending = writer.FlushPendingPacket();
+        if (pending.IsEmpty)
+        {
+            return true;
+        }
+
+        if (!TryQueuePacket(pending.Bytes))
+        {
+            return false;
+        }
+
+        writer.CommitFrames(pending.FrameCount);
+        masterFramesWritten = writer.FramesWritten;
+        packetTimeline.AdvanceDurableFrames(pending.FrameCount);
+        return true;
     }
 
     private void AddAsrPacketToSnapshot(byte[] input, AudioPcmFormat format)
@@ -1224,6 +1260,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
     private async Task<string?> FinishCaptureResourcesAsync()
     {
+        lock (sync)
+        {
+            // Stop/rebind drains the converter before the channel is closed;
+            // otherwise its final look-ahead frame would disappear silently.
+            _ = FlushPendingMasterPacketLocked();
+        }
+
         SessionAttemptID? finishedAttempt;
         string? rawPathForAttempt;
         lock (sync)

@@ -15,15 +15,17 @@ final class MasterAudioWriterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.manifestURL.path))
 
         XCTAssertTrue(try writer.append(
-            [0.25, -0.25],
+            [0.25, -0.25, 0.3, -0.3],
             inputRate: 44_100,
-            inputChannels: 1,
+            inputChannels: 2,
             hostTicks: 0,
             sourceGeneration: 1,
         ))
         XCTAssertEqual(writer.format?.sampleRate, 44_100)
-        XCTAssertEqual(writer.format?.channels, 1)
+        XCTAssertEqual(writer.format?.channels, 2)
         XCTAssertEqual(writer.framesWritten, 1)
+        try writer.finish()
+        XCTAssertEqual(writer.framesWritten, 2)
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.manifestURL.path))
     }
 
@@ -110,12 +112,44 @@ final class MasterAudioWriterTests: XCTestCase {
             hostTicks: 0,
             sourceGeneration: 2,
         )
+        try writer.finish()
 
         try fixture.close()
         let raw = try Data(contentsOf: fixture.masterURL)
         XCTAssertEqual(raw.count, Int(writer.framesWritten) * 2 * MemoryLayout<Float>.size)
         XCTAssertEqual(writer.format?.encoding, "float32LE")
         XCTAssertEqual(writer.manifest?.conversions.count, 1)
+    }
+
+    func testConversionManifestIsRecordedOncePerGenerationAndFormat() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let writer = fixture.writer
+
+        _ = try writer.append(
+            [0.1, -0.1, 0.2, -0.2],
+            inputRate: 48_000,
+            inputChannels: 2,
+            hostTicks: 0,
+            sourceGeneration: 1,
+        )
+        _ = try writer.append(
+            [0.3, 0.4, 0.5, 0.6],
+            inputRate: 44_100,
+            inputChannels: 1,
+            hostTicks: 0,
+            sourceGeneration: 2,
+        )
+        _ = try writer.append(
+            [0.7, 0.8, 0.9, 1.0],
+            inputRate: 44_100,
+            inputChannels: 1,
+            hostTicks: 0,
+            sourceGeneration: 2,
+        )
+
+        XCTAssertEqual(writer.manifest?.conversions.count, 1)
+        XCTAssertEqual(writer.manifest?.conversions.first?.sourceGeneration, 2)
     }
 
     func testMasterDurationDoesNotDependOnAsrDerivativeBytes() throws {
@@ -130,6 +164,7 @@ final class MasterAudioWriterTests: XCTestCase {
             hostTicks: 0,
             sourceGeneration: 1,
         )
+        try writer.finish()
 
         XCTAssertEqual(writer.duration, 1, accuracy: 0.000001)
     }
@@ -145,6 +180,7 @@ final class MasterAudioWriterTests: XCTestCase {
             hostTicks: 0,
             sourceGeneration: 1,
         )
+        try fixture.writer.finish()
         XCTAssertEqual(fixture.writer.format?.sampleRate, 48_000)
         XCTAssertEqual(fixture.writer.format?.channels, 2)
         XCTAssertEqual(fixture.writer.format?.encoding, "float32LE")
@@ -183,7 +219,7 @@ final class MasterAudioWriterTests: XCTestCase {
         defer { fixture.cleanup() }
 
         _ = try fixture.writer.append(
-            [0.1, 0.2, 0.3, 0.4],
+            [0.1, 0.2, 0.3, 0.4, 0.2, 0.3, 0.4, 0.5],
             inputRate: 48_000,
             inputChannels: 4,
             hostTicks: 0,

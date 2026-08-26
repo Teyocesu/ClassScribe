@@ -554,7 +554,7 @@ final class CaptureController {
     private var activeAttempt: SessionAttemptID?
     private var startCancellation: CaptureStartCancellation?
     private var nativeStartWork: CaptureNativeWork<Void>?
-    private var nativeStopWork: CaptureNativeWork<Void>?
+    private var nativeStopWork: CaptureNativeWork<CaptureNativeStopResult>?
     private var nativeStopAttempt: SessionAttemptID?
     private var levelTimer: Timer?
     private var rawOnlineURL: URL?
@@ -1115,9 +1115,11 @@ final class CaptureController {
         // The control-plane state above is committed before awaiting native
         // teardown. The actual stop remains owned by the serial native queue,
         // so a slow AudioDeviceStop/engine.stop cannot freeze MainActor.
+        var nativeStopResult: CaptureNativeStopResult?
         if let stoppedAttempt {
             let nativeStop = requestNativeStop(for: stoppedAttempt)
             await nativeStop.waitForCompletion()
+            nativeStopResult = try? await nativeStop.value()
         }
         microphoneCaptureOwner.release()
 
@@ -1139,7 +1141,15 @@ final class CaptureController {
             }
         }
         stopTask = finalization
-        let result = await finalization.value
+        let finalizedResult = await finalization.value
+        let result: Result<CaptureStopResult, CaptureError>
+        if let terminalErrorMessage = nativeStopResult?.terminalErrorMessage {
+            result = .failure(.audioFinalization(
+                "La escritura durable del master falló: \(terminalErrorMessage)",
+            ))
+        } else {
+            result = finalizedResult
+        }
         stopTask = nil
         completedStop = result
         return try result.get()
@@ -1175,7 +1185,7 @@ final class CaptureController {
         }
     }
 
-    private func requestNativeStop(for attempt: SessionAttemptID) -> CaptureNativeWork<Void> {
+    private func requestNativeStop(for attempt: SessionAttemptID) -> CaptureNativeWork<CaptureNativeStopResult> {
         if let nativeStopWork,
            nativeStopAttempt == attempt {
             return nativeStopWork

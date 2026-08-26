@@ -1,3 +1,4 @@
+@_spi(ClassScribeTests) import AudioTapLib
 import Foundation
 import Testing
 @testable import ClassScribe
@@ -276,6 +277,117 @@ func staleMicStartupResourceIsStoppedAndReleased() {
     #expect(owner.ownedResource == nil)
     #expect(resource.stopCount == 1)
     #expect(stopCount.get() == 1)
+}
+
+@MainActor
+@Test
+@available(macOS 14.2, *)
+func durableMasterFailureReachesProductStopBoundaryAndPreservesEvidence() async throws {
+    let folder = FileManager.default.temporaryDirectory
+        .appendingPathComponent("classscribe-master-failure-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let masterURL = folder.appendingPathComponent("master.raw")
+    let manifestURL = folder.appendingPathComponent("audio-manifest.json")
+    guard FileManager.default.createFile(
+        atPath: masterURL.path,
+        contents: nil,
+        attributes: [.posixPermissions: 0o600],
+    ) else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    let handle = try FileHandle(forWritingTo: masterURL)
+    let writer = MasterAudioWriter(
+        outputFileDescriptor: handle.fileDescriptor,
+        masterURL: masterURL,
+        manifestURL: manifestURL,
+    )
+    let session = AudioCaptureSession(
+        pids: [],
+        appOutputURL: masterURL,
+        appManifestURL: manifestURL,
+    )
+    session.installMasterWriterForTesting(writer, fileHandle: handle)
+
+    try writer.append(
+        [0.1, -0.1, 0.2, -0.2],
+        inputRate: 48_000,
+        inputChannels: 2,
+        hostTicks: 0,
+        sourceGeneration: 1,
+    )
+    try writer.finish()
+    let validMasterSize = try Data(contentsOf: masterURL).count
+    let validManifest = try Data(contentsOf: manifestURL)
+    try AudioManifestStore.validate(try AudioManifestStore.read(from: manifestURL))
+
+    let injectedFailure = NSError(
+        domain: "classscribe.tests",
+        code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "synthetic durable master failure"],
+    )
+    writer.recordFailure(injectedFailure)
+    let attempt = SessionAttemptID(generation: 1)
+    let executor = CaptureNativeExecutor()
+    await executor.installSessionForTesting(session, for: attempt)
+
+    let snapshot = await executor.levelSnapshot(for: attempt)
+    #expect(snapshot.terminalErrorMessage == "synthetic durable master failure")
+
+    do {
+        _ = try writer.append(
+            [0.3, -0.3, 0.4, -0.4],
+            inputRate: 48_000,
+            inputChannels: 2,
+            hostTicks: 0,
+            sourceGeneration: 1,
+        )
+        Issue.record("Los callbacks posteriores no debían escribir el master")
+    } catch {
+        // The first durable error turns the writer into a terminal boundary.
+    }
+    #expect(try Data(contentsOf: masterURL).count == validMasterSize)
+
+    let stop = executor.beginStop(attempt: attempt)
+    let stopResult = try await stop.value()
+    #expect(stopResult.terminalErrorMessage == "synthetic durable master failure")
+    #expect(try Data(contentsOf: manifestURL) == validManifest)
+    try AudioManifestStore.validate(try AudioManifestStore.read(from: manifestURL))
+
+    let nextFolder = FileManager.default.temporaryDirectory
+        .appendingPathComponent("classscribe-master-failure-next-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: nextFolder, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: nextFolder) }
+    let nextMasterURL = nextFolder.appendingPathComponent("master.raw")
+    let nextManifestURL = nextFolder.appendingPathComponent("audio-manifest.json")
+    guard FileManager.default.createFile(
+        atPath: nextMasterURL.path,
+        contents: nil,
+        attributes: [.posixPermissions: 0o600],
+    ) else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    let nextHandle = try FileHandle(forWritingTo: nextMasterURL)
+    let nextSession = AudioCaptureSession(
+        pids: [],
+        appOutputURL: nextMasterURL,
+        appManifestURL: nextManifestURL,
+    )
+    nextSession.installMasterWriterForTesting(
+        MasterAudioWriter(
+            outputFileDescriptor: nextHandle.fileDescriptor,
+            masterURL: nextMasterURL,
+            manifestURL: nextManifestURL,
+        ),
+        fileHandle: nextHandle,
+    )
+    let nextAttempt = SessionAttemptID(generation: 2)
+    await executor.installSessionForTesting(nextSession, for: nextAttempt)
+    let nextSnapshot = await executor.levelSnapshot(for: nextAttempt)
+    #expect(nextSnapshot.terminalErrorMessage == nil)
+    let nextStop = executor.beginStop(attempt: nextAttempt)
+    _ = try await nextStop.value()
 }
 
 private final class LockedValue<Value>: @unchecked Sendable {
