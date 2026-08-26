@@ -65,6 +65,30 @@ public readonly record struct CaptureSignalMeasurement(
         return FromRms(sampleCount, sampleCount / channels, rms);
     }
 
+    public static CaptureSignalMeasurement FromPcm(
+        ReadOnlySpan<byte> pcm,
+        AudioPcmFormat format)
+    {
+        format.EnsureValid();
+        var samples = PcmAudioConverter.Decode(pcm, format);
+        if (samples.Length == 0)
+        {
+            return new CaptureSignalMeasurement(0, 0, 0, -120);
+        }
+
+        double sumOfSquares = 0;
+        foreach (var sample in samples)
+        {
+            var normalized = float.IsFinite(sample) ? sample : 0;
+            sumOfSquares += normalized * normalized;
+        }
+
+        return FromRms(
+            samples.Length,
+            samples.Length / format.Channels,
+            Math.Sqrt(sumOfSquares / samples.Length));
+    }
+
     public static CaptureSignalMeasurement FromRms(long sampleCount, long frameCount, double rms)
     {
         var safeRms = double.IsFinite(rms) ? Math.Max(0, rms) : 0;

@@ -345,7 +345,9 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         && !IsRecording
         && currentFolder is not null
         && (File.Exists(Path.Combine(currentFolder, "source.wav"))
-            || File.Exists(Path.Combine(currentFolder, "source.raw")));
+            || File.Exists(Path.Combine(currentFolder, "source.raw"))
+            || (File.Exists(Path.Combine(currentFolder, "master.raw"))
+                && File.Exists(Path.Combine(currentFolder, "audio-manifest.json"))));
 
     public async Task InitializeAsync()
     {
@@ -566,6 +568,10 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 Source = source.DisplayName,
                 TechnicalVocabulary = vocabularySnapshot,
                 Language = languageSnapshot,
+                AudioFormat = captureScope == CaptureScope.Microphone
+                    ? PcmWaveFile.AudioFormatName
+                    : PcmWaveFile.MasterAudioFormatName,
+                FormatVersion = captureScope == CaptureScope.Microphone ? 1 : 2,
                 State = ProcessingState.StartingCapture,
                 SessionPhase = ClassScribe.Core.SessionPhase.Starting,
                 CapturePhase = ClassScribe.Core.CapturePhase.Connecting,
@@ -599,6 +605,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             IsRecording = true;
             currentMetadata = currentMetadata with
             {
+                AudioManifestReference = captureScope == CaptureScope.Microphone
+                    ? null
+                    : File.Exists(Path.Combine(currentFolder, "audio-manifest.json"))
+                        ? new AudioManifestReference()
+                        : null,
                 State = ProcessingState.Recording,
                 SessionPhase = ClassScribe.Core.SessionPhase.Recording,
                 CapturePhase = ClassScribe.Core.CapturePhase.Recording,

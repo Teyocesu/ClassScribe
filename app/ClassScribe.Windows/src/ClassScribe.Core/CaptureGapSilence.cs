@@ -43,10 +43,12 @@ public static class CaptureGapSilence
         long currentTimestamp,
         int bytesPerSecond,
         int previousPacketBytes = 0,
-        TimeSpan maximumGap = default)
+        TimeSpan maximumGap = default,
+        int bytesPerFrame = 2)
     {
         var maximum = maximumGap == default ? DefaultMaximumGap : maximumGap;
-        if (previousTimestamp is null || currentTimestamp <= previousTimestamp.Value || bytesPerSecond <= 0)
+        if (previousTimestamp is null || currentTimestamp <= previousTimestamp.Value || bytesPerSecond <= 0
+            || bytesPerFrame <= 0)
         {
             return new(CaptureGapDisposition.NoGap, 0, 0);
         }
@@ -75,7 +77,8 @@ public static class CaptureGapSilence
             return new(CaptureGapDisposition.NoGap, 0, gapSeconds);
         }
 
-        var bounded = checked((int)Math.Min(bytes, maximum.TotalSeconds * bytesPerSecond)) & ~1;
+        var bounded = checked((int)Math.Min(bytes, maximum.TotalSeconds * bytesPerSecond));
+        bounded -= bounded % bytesPerFrame;
         return bounded > 0
             ? new(CaptureGapDisposition.Silence, bounded, gapSeconds)
             : new(CaptureGapDisposition.NoGap, 0, gapSeconds);
@@ -86,14 +89,16 @@ public static class CaptureGapSilence
         long currentTimestamp,
         int bytesPerSecond,
         int previousPacketBytes = 0,
-        TimeSpan maximumGap = default)
+        TimeSpan maximumGap = default,
+        int bytesPerFrame = 2)
     {
         var assessment = Assess(
             previousTimestamp,
             currentTimestamp,
             bytesPerSecond,
             previousPacketBytes,
-            maximumGap);
+            maximumGap,
+            bytesPerFrame);
         if (assessment.IsExplicitFailure)
         {
             var maximum = maximumGap == default ? DefaultMaximumGap : maximumGap;

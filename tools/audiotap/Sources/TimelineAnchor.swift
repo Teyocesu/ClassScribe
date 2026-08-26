@@ -17,7 +17,7 @@ import Foundation
 /// is bridged automatically. The session owns one instance across source
 /// incarnations; each AppAudioCapture generation receives the same reference.
 public final class TimelineAnchor: @unchecked Sendable {
-    let rate: Int
+    private(set) var rate: Int?
     private var anchorHostSeconds: Double?
     private var framesWritten = 0
 
@@ -28,7 +28,14 @@ public final class TimelineAnchor: @unchecked Sendable {
     /// sane timestamp.
     static let maxGapSeconds: Double = 600
 
-    init(rate: Int) {
+    init(rate: Int? = nil) {
+        self.rate = rate
+    }
+
+    /// Sets the durable frame rate only before the first anchored buffer.
+    /// Rebinds must keep using the original master rate.
+    func setRateIfUnanchored(_ rate: Int) {
+        guard rate > 0, anchorHostSeconds == nil else { return }
         self.rate = rate
     }
 
@@ -37,6 +44,7 @@ public final class TimelineAnchor: @unchecked Sendable {
     /// wall-clock. The first call sets the anchor and inserts nothing. Never
     /// negative — an early/jittered timestamp just appends.
     func silenceFramesBefore(hostSeconds: Double, frameCount: Int) -> Int {
+        guard let rate, rate > 0 else { return 0 }
         guard let anchor = anchorHostSeconds else {
             anchorHostSeconds = hostSeconds
             framesWritten = frameCount

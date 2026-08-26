@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Text.Json;
 using System.Threading.Channels;
 using ClassScribe.Core;
 using NAudio.CoreAudioApi;
@@ -8,14 +9,14 @@ namespace ClassScribe.Windows;
 
 internal sealed class WindowsAudioCapture : IAsyncDisposable
 {
-    private const int BytesPerSecond = PcmWaveFile.SampleRate * PcmWaveFile.Channels
+    private const int AsrBytesPerSecond = PcmWaveFile.SampleRate * PcmWaveFile.Channels
         * (PcmWaveFile.BitsPerSample / 8);
     // The rebind budget is: native stop (10 s) + identity resolution (3 s) +
     // first callback (10 s), with margin for scheduler/driver variance. A
     // longer handoff is an explicit capture fault, never a silently shortened
     // recording.
     private static readonly TimeSpan RebindGapSafetyBound = TimeSpan.FromSeconds(30);
-    private const int SnapshotCapacity = BytesPerSecond * 45;
+    private const int SnapshotCapacity = AsrBytesPerSecond * 45;
     private readonly object sync = new();
     private readonly Queue<byte[]> recentPackets = new();
     private readonly CaptureSourceGenerationGate sourceGenerationGate = new();
@@ -32,6 +33,11 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private TaskCompletionSource stopped = NewSignal();
     private Exception? captureFailure;
     private string? rawPath;
+    private string? manifestPath;
+    private MasterAudioWriter? masterWriter;
+    private bool usesMasterContract;
+    private AudioPcmFormat? masterFormat;
+    private long masterFramesWritten;
     private SessionAttemptID? captureAttempt;
     private CaptureSourceGeneration? activeSourceGeneration;
     private AudioSourceOption? activeSource;
@@ -41,7 +47,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private Action<Exception?>? recordingStoppedHandler;
     private long capturedBytes;
     private int recentBytes;
-    private readonly CaptureHandoffTimeline packetTimeline = new(BytesPerSecond);
+    private CaptureHandoffTimeline packetTimeline = new(AsrBytesPerSecond);
     private Task? monitorTask;
     private long lastProbeTimestamp;
     private int rebindFailureCount;
@@ -89,7 +95,18 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             || packetChannel is not null
             || writerTask is not null;
 
-    public double DurationSeconds => Interlocked.Read(ref capturedBytes) / (double)BytesPerSecond;
+    public double DurationSeconds
+    {
+        get
+        {
+            lock (sync)
+            {
+                return usesMasterContract && masterFormat is { } format && format.SampleRate > 0
+                    ? masterFramesWritten / (double)format.SampleRate
+                    : Interlocked.Read(ref capturedBytes) / (double)AsrBytesPerSecond;
+            }
+        }
+    }
 
     public CaptureSignalHealthSnapshot? SignalHealth => signalHealthTracker.Snapshot(captureAttempt);
 
@@ -345,7 +362,16 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
 
         Directory.CreateDirectory(sessionFolder);
-        rawPath = Path.Combine(sessionFolder, "source.raw");
+        usesMasterContract = source.Kind is AudioSourceKind.Process or AudioSourceKind.SystemOutput;
+        rawPath = Path.Combine(sessionFolder, usesMasterContract ? "master.raw" : "source.raw");
+        manifestPath = usesMasterContract
+            ? Path.Combine(sessionFolder, "audio-manifest.json")
+            : null;
+        masterWriter = usesMasterContract
+            ? new MasterAudioWriter(manifestPath!)
+            : null;
+        masterFormat = null;
+        masterFramesWritten = 0;
         rawStream = new FileStream(
             rawPath,
             FileMode.CreateNew,
@@ -366,6 +392,9 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         LastWarning = null;
         capturedBytes = 0;
         recentBytes = 0;
+        packetTimeline = usesMasterContract
+            ? new CaptureHandoffTimeline()
+            : new CaptureHandoffTimeline(AsrBytesPerSecond);
         packetTimeline.Reset();
         lastProbeTimestamp = 0;
         rebindFailureCount = 0;
@@ -421,6 +450,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 generation,
                 generationFirstPacket,
                 generationCallbackLifecycle,
+                generationRecorder.Format,
                 buffer.Span);
         Action<Exception?> stoppedHandler = error =>
             HandleRecordingStopped(attempt, generation, generationStopped, error);
@@ -478,7 +508,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     public byte[] Snapshot(TimeSpan maximumDuration)
     {
         var requestedBytes = Math.Clamp(
-            (int)Math.Ceiling(maximumDuration.TotalSeconds * BytesPerSecond),
+            (int)Math.Ceiling(maximumDuration.TotalSeconds * AsrBytesPerSecond),
             0,
             SnapshotCapacity);
         lock (sync)
@@ -587,7 +617,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             .ConfigureAwait(false);
         if (captureFailure is not null || stopFailure is not null)
         {
-            LastWarning = "Windows informó un problema al cerrar la fuente, pero el WAV fue validado y se conservó.";
+            LastWarning = "Windows informó un problema al cerrar la fuente, pero el audio validado se conservó.";
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -623,6 +653,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         CaptureSourceGeneration generation,
         TaskCompletionSource generationFirstPacket,
         WindowsCaptureCallbackLifecycle callbackLifecycle,
+        AudioPcmFormat inputFormat,
         ReadOnlySpan<byte> buffer)
     {
         if (!callbackLifecycle.TryEnter())
@@ -636,6 +667,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 attempt,
                 generation,
                 generationFirstPacket,
+                inputFormat,
                 buffer);
         }
         finally
@@ -648,6 +680,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         SessionAttemptID attempt,
         CaptureSourceGeneration generation,
         TaskCompletionSource generationFirstPacket,
+        AudioPcmFormat inputFormat,
         ReadOnlySpan<byte> buffer)
     {
         if (!IsCurrentSourceGeneration(attempt, generation))
@@ -662,7 +695,16 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         {
             return;
         }
-        var measurement = CaptureSignalMeasurement.FromPcm16(buffer, PcmWaveFile.Channels);
+        CaptureSignalMeasurement measurement;
+        try
+        {
+            measurement = CaptureSignalMeasurement.FromPcm(buffer, inputFormat);
+        }
+        catch (Exception error) when (error is InvalidDataException or ArgumentOutOfRangeException)
+        {
+            FailCapture(attempt, error);
+            return;
+        }
         if (!signalHealthTracker.TryRecordCallback(attempt, measurement))
         {
             return;
@@ -676,6 +718,17 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
 
         var copy = buffer.ToArray();
+        if (usesMasterContract)
+        {
+            HandleMasterDataAvailable(
+                attempt,
+                generation,
+                generationFirstPacket,
+                inputFormat,
+                copy);
+            return;
+        }
+
         // This is the durable boundary: normal callbacks never consult a
         // clock, and only a new generation can have a pending handoff plan.
         if (!IsCurrentSourceGeneration(attempt, generation))
@@ -719,20 +772,139 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             return;
         }
 
-        AddDurablePacketToSnapshot(copy);
+        AddAsrPacketToSnapshot(copy);
         packetTimeline.CommitPacket(plan);
 
         generationFirstPacket.TrySetResult();
         LevelChanged?.Invoke(attempt, CalculateLevel(copy));
     }
 
+    private void HandleMasterDataAvailable(
+        SessionAttemptID attempt,
+        CaptureSourceGeneration generation,
+        TaskCompletionSource generationFirstPacket,
+        AudioPcmFormat inputFormat,
+        byte[] copy)
+    {
+        MasterAudioPacket packet;
+        AudioPcmFormat durableFormat;
+        lock (sync)
+        {
+            if (!IsCurrentSourceGeneration(attempt, generation)
+                || masterWriter is null)
+            {
+                return;
+            }
+
+            try
+            {
+                packet = masterWriter.PreparePacket(copy, inputFormat, generation);
+                if (packet.IsEmpty)
+                {
+                    return;
+                }
+
+                durableFormat = packet.Format;
+                masterFormat = durableFormat;
+                packetTimeline.SetFormat(durableFormat);
+            }
+            catch (Exception error) when (error is IOException
+                                               or UnauthorizedAccessException
+                                               or InvalidDataException
+                                               or ArgumentOutOfRangeException
+                                               or InvalidOperationException
+                                               or JsonException)
+            {
+                FailCapture(attempt, error);
+                return;
+            }
+
+            var plan = packetTimeline.PreparePacket(
+                generation,
+                packet.Bytes.Length,
+                arrivalTimestamp: Stopwatch.GetTimestamp,
+                maximumGap: RebindGapSafetyBound);
+            if (plan.IsRejected)
+            {
+                return;
+            }
+
+            if (plan.HandoffGap.IsExplicitFailure)
+            {
+                var error = new IOException(
+                    $"La pausa de rebind ({plan.HandoffGap.GapSeconds:F1}s) excede el límite seguro de {RebindGapSafetyBound.TotalSeconds:F0}s.");
+                generationFirstPacket.TrySetException(error);
+                FailCapture(attempt, error);
+                return;
+            }
+
+            if (plan.HandoffGap.SilenceBytes > 0)
+            {
+                if (!TryQueueSilence(
+                        attempt,
+                        generation,
+                        plan.HandoffGap.SilenceBytes,
+                        durableFormat))
+                {
+                    return;
+                }
+
+                masterWriter.CommitFrames(plan.HandoffGap.SilenceBytes / durableFormat.BytesPerFrame);
+            }
+
+            if (!IsCurrentSourceGeneration(attempt, generation)
+                || !TryQueuePacket(packet.Bytes))
+            {
+                return;
+            }
+
+            masterWriter.CommitFrames(packet.FrameCount);
+            masterFramesWritten = masterWriter.FramesWritten;
+            AddAsrPacketToSnapshot(copy, inputFormat);
+            packetTimeline.CommitPacket(plan);
+        }
+
+        generationFirstPacket.TrySetResult();
+        LevelChanged?.Invoke(attempt, CalculateLevel(copy, inputFormat));
+    }
+
+    private void AddAsrPacketToSnapshot(byte[] input, AudioPcmFormat format)
+    {
+        try
+        {
+            var samples = PcmAudioConverter.Convert(
+                input,
+                format,
+                PcmWaveFile.SampleRate,
+                PcmWaveFile.Channels);
+            AddAsrPacketToSnapshot(PcmAudioConverter.EncodePcmS16LE(samples));
+        }
+        catch (Exception error) when (error is InvalidDataException or ArgumentOutOfRangeException)
+        {
+            // Durable master conversion already owns the capture failure
+            // boundary. A malformed ASR conversion cannot reinterpret it as
+            // master data or corrupt the live ring.
+            captureFailure ??= error;
+        }
+    }
+
+    private static byte[] CreateAsrSilence(int frames) =>
+        new byte[checked(frames * PcmWaveFile.Channels * (PcmWaveFile.BitsPerSample / 8))];
+
     private bool TryQueueSilence(
         SessionAttemptID attempt,
         CaptureSourceGeneration generation,
-        int silenceBytes)
+        int silenceBytes,
+        AudioPcmFormat? masterFormat = null)
     {
         const int maximumChunkBytes = 64 * 1024;
-        var remaining = silenceBytes & ~1;
+        var durableBytesPerFrame = masterFormat?.BytesPerFrame ?? 2;
+        var remaining = silenceBytes - (silenceBytes % durableBytesPerFrame);
+        var durableFramesQueued = 0;
+        var asrFramesQueued = 0;
+        var totalDurableFrames = masterFormat is { } format
+            ? remaining / format.BytesPerFrame
+            : 0;
         while (remaining > 0)
         {
             if (!IsCurrentSourceGeneration(attempt, generation))
@@ -740,15 +912,52 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 return false;
             }
 
-            var chunkBytes = Math.Min(remaining, maximumChunkBytes) & ~1;
+            var chunkBytes = Math.Min(remaining, maximumChunkBytes);
+            chunkBytes -= chunkBytes % durableBytesPerFrame;
+            if (chunkBytes <= 0)
+            {
+                return false;
+            }
             var silence = new byte[chunkBytes];
             if (!TryQueuePacket(silence))
             {
                 return false;
             }
 
-            AddDurablePacketToSnapshot(silence);
+            if (masterFormat is { } format)
+            {
+                var chunkDurableFrames = chunkBytes / format.BytesPerFrame;
+                var targetAsrFrames = (int)Math.Round(
+                    (durableFramesQueued + chunkDurableFrames)
+                        * (double)PcmWaveFile.SampleRate / format.SampleRate,
+                    MidpointRounding.AwayFromZero);
+                var chunkAsrFrames = targetAsrFrames - asrFramesQueued;
+                if (chunkAsrFrames > 0)
+                {
+                    AddAsrPacketToSnapshot(CreateAsrSilence(chunkAsrFrames));
+                }
+
+                durableFramesQueued += chunkDurableFrames;
+                asrFramesQueued = targetAsrFrames;
+            }
+            else
+            {
+                AddAsrPacketToSnapshot(silence);
+            }
             remaining -= chunkBytes;
+        }
+
+        if (masterFormat is { } format && totalDurableFrames > 0)
+        {
+            var expectedAsrFrames = Math.Max(
+                1,
+                (int)Math.Round(
+                    totalDurableFrames * (double)PcmWaveFile.SampleRate / format.SampleRate,
+                    MidpointRounding.AwayFromZero));
+            if (expectedAsrFrames > asrFramesQueued)
+            {
+                AddAsrPacketToSnapshot(CreateAsrSilence(expectedAsrFrames - asrFramesQueued));
+            }
         }
 
         return true;
@@ -788,7 +997,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         return false;
     }
 
-    private void AddDurablePacketToSnapshot(byte[] packet)
+    private void AddAsrPacketToSnapshot(byte[] packet)
     {
         Interlocked.Add(ref capturedBytes, packet.Length);
         lock (sync)
@@ -834,7 +1043,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             {
                 await destination.WriteAsync(packet).ConfigureAwait(false);
                 bytesSinceDurableFlush += packet.Length;
-                if (bytesSinceDurableFlush >= BytesPerSecond * 2)
+                if (bytesSinceDurableFlush >= 512 * 1_024)
                 {
                     await destination.FlushAsync().ConfigureAwait(false);
                     destination.Flush(flushToDisk: true);
@@ -881,7 +1090,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                                                or UnauthorizedAccessException
                                                or InvalidDataException)
             {
-                // Keep source.raw in place so the history screen can recover it later.
+                // Keep the durable master (or legacy source.raw) in place so
+                // the history screen can recover it later.
             }
         }
     }
@@ -1068,6 +1278,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             packetChannel = null;
             writerTask = null;
             rawStream = null;
+            masterWriter = null;
             packetTimeline.Reset();
             if (finishedAttempt is not null)
             {
@@ -1093,10 +1304,27 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             await finalizationHook(source, cancellationToken).ConfigureAwait(false);
         }
 
-        PcmWaveFile.ValidateRaw(source);
         var wavePath = Path.Combine(Path.GetDirectoryName(source)!, "source.wav");
-        await PcmWaveFile.WrapRawAsync(source, wavePath, cancellationToken).ConfigureAwait(false);
-        File.Delete(source);
+        if (string.Equals(
+                Path.GetFileName(source),
+                "master.raw",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var manifest = Path.Combine(Path.GetDirectoryName(source)!, "audio-manifest.json");
+            _ = PcmWaveFile.ValidateMaster(source, manifest);
+            await PcmWaveFile.DeriveFromMasterAsync(
+                    source,
+                    manifest,
+                    wavePath,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            PcmWaveFile.ValidateRaw(source);
+            await PcmWaveFile.WrapRawAsync(source, wavePath, cancellationToken).ConfigureAwait(false);
+            File.Delete(source);
+        }
         lock (sync)
         {
             if (rawPath == source)
@@ -1691,6 +1919,19 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
         var rootMeanSquare = Math.Sqrt(squares / samples);
         return Math.Clamp(rootMeanSquare * 4, 0, 1);
+    }
+
+    private static double CalculateLevel(ReadOnlySpan<byte> pcm, AudioPcmFormat format)
+    {
+        try
+        {
+            var measurement = CaptureSignalMeasurement.FromPcm(pcm, format);
+            return Math.Clamp(measurement.Rms * 4, 0, 1);
+        }
+        catch (Exception error) when (error is InvalidDataException or ArgumentOutOfRangeException)
+        {
+            return 0;
+        }
     }
 
     public CaptureSignalHealthSnapshot? EvaluateSignalHealth(SessionAttemptID attempt)

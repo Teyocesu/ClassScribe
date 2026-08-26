@@ -94,6 +94,7 @@ public sealed record ClassMetadata
     public int FormatVersion { get; init; } = 1;
     public SessionAttemptID? AttemptID { get; init; }
     public ASRTranscriptReference? AsrOriginalReference { get; init; }
+    public AudioManifestReference? AudioManifestReference { get; init; }
     public IReadOnlyList<DiarizationProposalReference> DiarizationProposalReferences { get; init; } = [];
     public HumanCorrectionOverlayReference? HumanCorrectionOverlayReference { get; init; }
 }

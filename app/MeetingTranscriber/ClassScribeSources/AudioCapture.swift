@@ -258,6 +258,86 @@ enum WavFile {
         return try validate(destination)
     }
 
+    /// Validates the source-rate online master using the session manifest.
+    /// Unlike the legacy Float32 helper, this deliberately has no RIFF-size
+    /// limit because the master is a raw stream until Fase 2E chooses a long
+    /// container.
+    static func validateMaster(_ masterURL: URL, manifestURL: URL) throws -> TimeInterval {
+        let manifest = try AudioManifestStore.read(from: manifestURL)
+        let declaredMaster = try AudioManifestStore.resolve(
+            manifest.master.relativePath,
+            from: manifestURL,
+        )
+        guard declaredMaster.standardizedFileURL == masterURL.standardizedFileURL else {
+            throw CaptureError.invalidAudioFile
+        }
+        let values = try masterURL.resourceValues(
+            forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey],
+        )
+        let bytesPerFrame = manifest.master.channels * MemoryLayout<Float>.size
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let size = values.fileSize,
+              size > 0,
+              size.isMultiple(of: bytesPerFrame)
+        else { throw CaptureError.invalidRawAudio }
+        return Double(size / bytesPerFrame) / Double(manifest.master.sampleRate)
+    }
+
+    /// Regenerates the ASR WAV from a valid master without deleting or
+    /// rewriting the authoritative master descriptor.
+    static func deriveASRFromMaster(
+        masterURL: URL,
+        manifestURL: URL,
+        destination: URL,
+    ) throws -> TimeInterval {
+        _ = try validateMaster(masterURL, manifestURL: manifestURL)
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: destination.path) {
+            let values = try destination.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            )
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw CaptureError.invalidAudioFile
+            }
+            if let duration = try? validate(destination) {
+                return duration
+            }
+            let preserved = destination.deletingLastPathComponent().appendingPathComponent(
+                "source-invalid-preserved-\(UUID().uuidString).wav",
+            )
+            try fileManager.copyItem(at: destination, to: preserved)
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: preserved.path)
+        }
+
+        let temporaryRaw = destination.deletingLastPathComponent()
+            .appendingPathComponent(".source-asr-\(UUID().uuidString).raw")
+        defer { try? fileManager.removeItem(at: temporaryRaw) }
+        _ = try MasterAudioDerivative.writeFloat32Raw(
+            masterURL: masterURL,
+            manifestURL: manifestURL,
+            destinationURL: temporaryRaw,
+        )
+        try wrapFloat32Raw(temporaryRaw, destination: destination, sampleRate: 16000)
+        return try validate(destination)
+    }
+
+    static func recoverMaster(
+        _ masterURL: URL,
+        manifestURL: URL,
+        destination: URL,
+    ) throws -> TimeInterval {
+        _ = try validateMaster(masterURL, manifestURL: manifestURL)
+        if let duration = try? validate(destination) {
+            return duration
+        }
+        return try deriveASRFromMaster(
+            masterURL: masterURL,
+            manifestURL: manifestURL,
+            destination: destination,
+        )
+    }
+
     static func writeFloat32(_ samples: [Float], to destination: URL, sampleRate: Int = 16000) throws {
         let temporary = destination.deletingPathExtension().appendingPathExtension("raw")
         let data = samples.withUnsafeBytes { Data($0) }
@@ -478,6 +558,7 @@ final class CaptureController {
     private var nativeStopAttempt: SessionAttemptID?
     private var levelTimer: Timer?
     private var rawOnlineURL: URL?
+    private var audioManifestURL: URL?
     private var sourceWAVURL: URL?
     private var terminalCaptureFailure: CaptureTerminalFailure?
     private var completedStop: Result<CaptureStopResult, CaptureError>?
@@ -624,6 +705,7 @@ final class CaptureController {
         stopTask = nil
         sourceWAVURL = nil
         rawOnlineURL = nil
+        audioManifestURL = nil
         stopLiveBufferPump()
         let liveGeneration = await liveStore.reset()
         try Task.checkCancellation()
@@ -645,7 +727,10 @@ final class CaptureController {
         onlineRecoveryDeadline = nil
         onlineRebindFailureCount = 0
         let sourceURL = folder.appendingPathComponent("source.wav")
-        let rawURL = folder.appendingPathComponent("source.raw")
+        let masterURL = folder.appendingPathComponent("master.raw")
+        let manifestURL = folder.appendingPathComponent("audio-manifest.json")
+        sourceWAVURL = sourceURL
+        audioManifestURL = resolvedScope == .microphone ? nil : manifestURL
         // The pump normally drains far faster than real time. A generous bound
         // still prevents unbounded memory if the process is heavily starved;
         // newest buffers are the useful ones for a live view, while the complete
@@ -774,7 +859,8 @@ final class CaptureController {
                     sourceGeneration: sourceGeneration,
                     rootPID: rootPID,
                     pids: startupPlan.topologyPIDs,
-                    outputURL: rawURL,
+                    outputURL: masterURL,
+                    manifestURL: manifestURL,
                     // The resolver and the native registration retry share
                     // one monotonic startup budget. The native executor still
                     // performs its own immediate revalidation just before
@@ -795,7 +881,7 @@ final class CaptureController {
                     cancellation: startCancellation,
                 )
                 guard activeAttempt == attempt else { throw CancellationError() }
-                rawOnlineURL = rawURL
+                rawOnlineURL = masterURL
                 onlineRootPID = rootPID
                 onlineSelectedIdentity = selectedIdentity
                 onlineTargetPIDs = Set(startupPlan.translatedTargetPIDs)
@@ -828,7 +914,8 @@ final class CaptureController {
                     attempt: attempt,
                     sourceGeneration: sourceGeneration,
                     authorization: systemOutputAuthorization,
-                    outputURL: rawURL,
+                    outputURL: masterURL,
+                    manifestURL: manifestURL,
                     liveSink: systemOutputSink,
                     sourceCallbackGate: sourceCallbackGate,
                 )
@@ -843,7 +930,7 @@ final class CaptureController {
                     cancellation: startCancellation,
                 )
                 guard activeAttempt == attempt else { throw CancellationError() }
-                rawOnlineURL = rawURL
+                rawOnlineURL = masterURL
                 activeSourceGeneration = sourceGeneration
                 activeCaptureScope = .systemOutput
                 onlineSourceAvailable = true
@@ -1021,6 +1108,7 @@ final class CaptureController {
         levelTimer?.invalidate()
         levelTimer = nil
         let rawToWrap = rawOnlineURL
+        let manifestToFinalize = audioManifestURL
         stopLiveBufferPump()
         levelDBFS = -120
 
@@ -1035,13 +1123,14 @@ final class CaptureController {
 
         let finalization = Task.detached(priority: .userInitiated) { () -> Result<CaptureStopResult, CaptureError> in
             do {
-                if let rawToWrap {
-                    try WavFile.wrapFloat32Raw(rawToWrap, destination: sourceWAVURL)
+                if let rawToWrap, let manifestURL = manifestToFinalize {
+                    _ = try WavFile.deriveASRFromMaster(
+                        masterURL: rawToWrap,
+                        manifestURL: manifestURL,
+                        destination: sourceWAVURL,
+                    )
                 }
                 let duration = try WavFile.validate(sourceWAVURL)
-                if let rawToWrap {
-                    try? FileManager.default.removeItem(at: rawToWrap)
-                }
                 return .success(CaptureStopResult(url: sourceWAVURL, duration: duration))
             } catch let error as CaptureError {
                 return .failure(error)

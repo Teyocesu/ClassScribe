@@ -58,6 +58,21 @@ private func prepareRetryAudio(audioURL: URL, rawURL: URL) async throws -> Retry
         do {
             return try RetryAudioPreparation(duration: WavFile.validate(audioURL), recoveredRaw: false)
         } catch let wavError {
+            let folder = audioURL.deletingLastPathComponent()
+            let masterURL = folder.appendingPathComponent("master.raw")
+            let manifestURL = folder.appendingPathComponent("audio-manifest.json")
+            if FileManager.default.fileExists(atPath: masterURL.path),
+               FileManager.default.fileExists(atPath: manifestURL.path),
+               (try? WavFile.validateMaster(masterURL, manifestURL: manifestURL)) != nil {
+                return try RetryAudioPreparation(
+                    duration: WavFile.recoverMaster(
+                        masterURL,
+                        manifestURL: manifestURL,
+                        destination: audioURL,
+                    ),
+                    recoveredRaw: true,
+                )
+            }
             guard FileManager.default.fileExists(atPath: rawURL.path) else { throw wavError }
             return try RetryAudioPreparation(
                 duration: WavFile.recoverFloat32Raw(rawURL, destination: audioURL),
@@ -1158,8 +1173,15 @@ final class ClassScribeModel {
         // before validation and recovery metadata are written.
         await capture.abortPreservingAudio()
         let audioURL = session.folder.appendingPathComponent("source.wav")
+        let masterURL = session.folder.appendingPathComponent("master.raw")
+        let manifestURL = session.folder.appendingPathComponent("audio-manifest.json")
         let validation = await Task.detached(priority: .userInitiated) {
-            Result { try WavFile.validate(audioURL) }
+            Result {
+                if let duration = try? WavFile.validate(audioURL) {
+                    return duration
+                }
+                return try WavFile.validateMaster(masterURL, manifestURL: manifestURL)
+            }
         }.value
         guard isCurrent(session) else {
             isStopping = false
@@ -1547,6 +1569,10 @@ final class ClassScribeModel {
         let effectiveSessionPhase = override == nil ? sessionPhase : effectiveState.sessionPhase
         let effectiveCapturePhase = override == nil ? capturePhase : effectiveState.defaultCapturePhase
         let effectiveAsrPhase = override == nil ? asrPhase : effectiveState.defaultAsrPhase
+        let onlineScope = session.captureScope == .application || session.captureScope == .systemOutput
+        let manifestURL = session.folder.appendingPathComponent("audio-manifest.json")
+        let hasAudioManifest = FileManager.default.fileExists(atPath: manifestURL.path)
+        let usesMasterContract = onlineScope && (hasAudioManifest || capture.isCapturing || capture.isStarting)
         return ClassMetadata(
             id: session.id,
             subject: session.subject,
@@ -1565,11 +1591,14 @@ final class ClassScribeModel {
             capturePhase: effectiveCapturePhase,
             asrPhase: effectiveAsrPhase,
             captureScope: session.captureScope,
-            audioFormat: "float32_16000_mono",
-            formatVersion: 1,
+            audioFormat: usesMasterContract ? "float32le_master_manifest_v1" : "float32_16000_mono",
+            formatVersion: usesMasterContract ? 2 : 1,
             platform: "macos",
             attemptID: session.attemptID,
             asrOriginalReference: asrOriginalReference,
+            audioManifestReference: hasAudioManifest
+                ? AudioManifestReference()
+                : nil,
         )
     }
 

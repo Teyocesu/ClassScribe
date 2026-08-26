@@ -38,6 +38,10 @@ public class AppAudioCapture: @unchecked Sendable {
     /// `nil` only if a 16 kHz output format couldn't be built (not expected);
     /// the write then falls back to the raw native-rate path.
     let resampler: StreamingMonoResampler?
+    /// Source-rate durable writer. When present, the fixed resampler below is
+    /// only the ASR/live branch and never writes the master descriptor.
+    let masterWriter: MasterAudioWriter?
+    let sourceGeneration: UInt64
     /// Wall-clock anchoring so an output-device-restart gap becomes silence in
     /// the file instead of an under-run that drifts against the mic track (issue
     /// #379 follow-up — see `writeCapturedBuffer` in `+Resampling`). `internal`
@@ -121,8 +125,8 @@ public class AppAudioCapture: @unchecked Sendable {
 
     /// Actual channel count detected from first IOProc callback.
     public private(set) var actualChannels: Int = 0
-    // `outputSampleRate` / `outputChannels` (the format actually written to the
-    // fd, 16 kHz mono after the in-IOProc resample) live in `+Resampling`.
+    // `outputSampleRate` / `outputChannels` (the durable master format when the
+    // online writer is active, otherwise the legacy output) live in `+Resampling`.
 
     private var didLogFormat = false
     /// Pure state machine that decides when/what to dispatch on device-change events.
@@ -151,6 +155,8 @@ public class AppAudioCapture: @unchecked Sendable {
         liveSink: LiveAudioSink? = nil,
         timelineAnchor: TimelineAnchor? = nil,
         sourceCallbackGate: (@Sendable () -> Bool)? = nil,
+        masterWriter: MasterAudioWriter? = nil,
+        sourceGeneration: UInt64 = 1,
     ) {
         self.init(
             source: .application(processes: pids),
@@ -161,6 +167,8 @@ public class AppAudioCapture: @unchecked Sendable {
             liveSink: liveSink,
             timelineAnchor: timelineAnchor,
             sourceCallbackGate: sourceCallbackGate,
+            masterWriter: masterWriter,
+            sourceGeneration: sourceGeneration,
         )
     }
 
@@ -173,6 +181,8 @@ public class AppAudioCapture: @unchecked Sendable {
         liveSink: LiveAudioSink? = nil,
         timelineAnchor: TimelineAnchor? = nil,
         sourceCallbackGate: (@Sendable () -> Bool)? = nil,
+        masterWriter: MasterAudioWriter? = nil,
+        sourceGeneration: UInt64 = 1,
     ) {
         self.source = source
         if case let .application(processes) = source {
@@ -185,9 +195,11 @@ public class AppAudioCapture: @unchecked Sendable {
         self.channels = channels
         self.debugLogging = debugLogging
         self.liveSink = liveSink
-        self.timelineAnchor = timelineAnchor ?? TimelineAnchor(rate: Int(speechSampleRate))
+        self.timelineAnchor = timelineAnchor ?? masterWriter?.timelineAnchor ?? TimelineAnchor(rate: Int(speechSampleRate))
         self.sourceCallbackGate = sourceCallbackGate
         resampler = StreamingMonoResampler(targetRate: Int(speechSampleRate))
+        self.masterWriter = masterWriter
+        self.sourceGeneration = sourceGeneration
     }
 
     public func start() throws {
@@ -520,14 +532,13 @@ public class AppAudioCapture: @unchecked Sendable {
                 )
             }
 
-            // CATapDescription delivers interleaved float32. Resample + downmix
-            // to 16 kHz mono AT CAPTURE (writeCapturedBuffer, +Resampling),
-            // rebuilding the converter on a mid-recording rate change so a
-            // device swap can't time-warp the file the way a single post-hoc
-            // resample did (issue #379 follow-up). The live sink is fed the SAME
-            // resampled 16 kHz mono buffer from inside writeCapturedBuffer, so
-            // the app doesn't resample a second time. RMS/level still read the
-            // raw buffer below.
+            // CATapDescription delivers interleaved Float32. The online path
+            // writes the source-rate master and independently resamples/downmixes
+            // to 16 kHz mono for the live ASR sink; the legacy path keeps its
+            // fixed-rate durable write. Rebuilding the converter on a
+            // mid-recording rate change prevents a device swap from time-warping
+            // the file (issue #379 follow-up). RMS/level still read the raw buffer
+            // below.
             guard let data = abl.mBuffers.mData else { return }
             let byteCount = Int(abl.mBuffers.mDataByteSize)
             let hostTicks = Self.hostTicks(from: inInputTime)

@@ -1,25 +1,35 @@
 @preconcurrency import AVFoundation
 import CoreAudio
 import Foundation
+import os.log
 
-/// Capture-time resampling for `AppAudioCapture`. Folds each CATap buffer to
-/// 16 kHz mono before the file write (issue #379 follow-up) so a mid-recording
-/// output-device rate change can't time-warp the track the way a single
-/// post-hoc resample did. Extracted to a sibling file so `AppAudioCapture.swift`
-/// stays under the 600-line lint cap — same pattern as
-/// `AppAudioCapture+LiveSink.swift`.
+private let masterAudioLogger = Logger(
+    subsystem: "com.meetingtranscriber.audiotap",
+    category: "AppAudioCaptureMaster",
+)
+
+/// Capture-time conversion for `AppAudioCapture`. The online path writes the
+/// source-rate Float32 master and independently folds each CATap buffer to
+/// 16 kHz mono for ASR/live use. The legacy path retains its fixed-rate write.
+/// Extracted to a sibling file so `AppAudioCapture.swift` stays under the
+/// 600-line lint cap — same pattern as `AppAudioCapture+LiveSink.swift`.
 @available(macOS 14.2, *)
 public extension AppAudioCapture {
-    /// Format of the data actually written to the output fd: 16 kHz mono when
-    /// the resampler is active (the normal case), else the raw device input
-    /// (`actualSampleRate`/`actualChannels`) as a fallback. Read by
-    /// `AudioCaptureSession` to describe the produced file.
+    /// Format of the durable data written to the output fd: the selected master
+    /// format when the online master writer is active, otherwise the legacy
+    /// 16 kHz mono path (or raw device input as a fallback).
     var outputSampleRate: Int {
-        resampler != nil ? Int(speechSampleRate) : actualSampleRate
+        if let masterFormat = masterWriter?.format {
+            return masterFormat.sampleRate
+        }
+        return resampler != nil ? Int(speechSampleRate) : actualSampleRate
     }
 
     var outputChannels: Int {
-        resampler != nil ? 1 : actualChannels
+        if let masterFormat = masterWriter?.format {
+            return masterFormat.channels
+        }
+        return resampler != nil ? 1 : actualChannels
     }
 
     /// The buffer's hardware presentation time in mach ticks, for wall-clock
@@ -30,11 +40,12 @@ public extension AppAudioCapture {
         return stamp.mFlags.contains(.hostTimeValid) ? stamp.mHostTime : mach_absolute_time()
     }
 
-    /// Resample + downmix one interleaved CATap buffer to 16 kHz mono and write
-    /// it to `fd`, also forwarding the resampled buffer to the live sink. The
-    /// converter is rebuilt on a mid-recording rate change. The resampler buffers
-    /// internally, so a buffer that yields no output yet (converter priming) is
-    /// simply not written — its samples emerge on a later call, no data lost.
+    /// In the legacy path, resample + downmix one interleaved CATap buffer to
+    /// 16 kHz mono and write it to `fd`, also forwarding the resampled buffer to
+    /// the live sink. The converter is rebuilt on a mid-recording rate change.
+    /// The resampler buffers internally, so a buffer that yields no output yet
+    /// (converter priming) is simply not written — its samples emerge on a
+    /// later call, no data lost.
     /// Falls back to the raw native-rate write *and* raw-format live-sink forward
     /// only if no resampler was built (not expected for a 16 kHz target).
     /// `hostTicks` is the buffer's hardware presentation time, used to fill
@@ -57,6 +68,29 @@ public extension AppAudioCapture {
         let interleaved = Array(UnsafeBufferPointer(
             start: data.assumingMemoryBound(to: Float.self), count: floatCount,
         ))
+        if let masterWriter {
+            do {
+                _ = try masterWriter.append(
+                    interleaved,
+                    inputRate: actualSampleRate,
+                    inputChannels: max(actualChannels, 1),
+                    hostTicks: hostTicks,
+                    sourceGeneration: sourceGeneration,
+                )
+            } catch {
+                masterWriter.recordFailure(error)
+                masterAudioLogger.error(
+                    "Master audio write failed: \(error.localizedDescription, privacy: .public)",
+                )
+            }
+            // ASR/live remains an independent fixed 16 kHz mono branch.
+            resampleAndForward(
+                interleaved: interleaved,
+                inputRate: actualSampleRate,
+                inputChannels: max(actualChannels, 1),
+            )
+            return
+        }
         resampleForwardAndWrite(
             fd: fd, interleaved: interleaved,
             inputRate: actualSampleRate, inputChannels: max(actualChannels, 1),
@@ -87,6 +121,24 @@ public extension AppAudioCapture {
         guard sourceCallbackGate?() ?? true else { return }
         fillTimelineGap(fd: fd, hostTicks: hostTicks, outputFrames: mono16k.count)
         Self.writeFloats(mono16k, to: fd)
+        forwardToLiveSink(monoSamples: mono16k)
+    }
+
+    /// ASR/live half of the split master path. It never writes the durable
+    /// descriptor and therefore cannot redefine or shorten the master.
+    internal func resampleAndForward(
+        interleaved: [Float], inputRate: Int, inputChannels: Int,
+    ) {
+        guard let resampler else { return }
+        let mono16k = resampler.process(
+            interleaved, inputRate: inputRate, inputChannels: inputChannels,
+        )
+        guard !mono16k.isEmpty else {
+            guard sourceCallbackGate?() ?? true else { return }
+            forwardToLiveSink(monoSamples: [])
+            return
+        }
+        guard sourceCallbackGate?() ?? true else { return }
         forwardToLiveSink(monoSamples: mono16k)
     }
 

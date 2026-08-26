@@ -12,6 +12,7 @@ public class AudioCaptureSession {
     private let sampleRate: Int
     private let channels: Int
     private let appOutputURL: URL
+    private let appManifestURL: URL?
     private let micOutputURL: URL?
     private let micDeviceUID: String?
     private let debugLogging: Bool
@@ -23,9 +24,10 @@ public class AudioCaptureSession {
     private let micDebugFault: DebugTapFault?
 
     private var appCapture: AppAudioCapture?
+    private var masterWriter: MasterAudioWriter?
     private var micCapture: MicCaptureHandler?
     private var appFileHandle: FileHandle?
-    private let appTimelineAnchor = TimelineAnchor(rate: Int(speechSampleRate))
+    private var applicationSourceGeneration: UInt64 = 1
     private var appFirstFrameTicks: UInt64 = 0
     private var appOutputSampleRate = 0
     private var appOutputChannels = 0
@@ -43,6 +45,7 @@ public class AudioCaptureSession {
     public convenience init(
         pids: [pid_t],
         appOutputURL: URL,
+        appManifestURL: URL? = nil,
         sampleRate: Int = 48000,
         channels: Int = 2,
         micOutputURL: URL? = nil,
@@ -56,6 +59,7 @@ public class AudioCaptureSession {
         self.init(
             source: .application(processes: pids),
             appOutputURL: appOutputURL,
+            appManifestURL: appManifestURL,
             sampleRate: sampleRate,
             channels: channels,
             micOutputURL: micOutputURL,
@@ -71,6 +75,7 @@ public class AudioCaptureSession {
     public init(
         source: AppAudioCaptureSource,
         appOutputURL: URL,
+        appManifestURL: URL? = nil,
         sampleRate: Int = 48000,
         channels: Int = 2,
         micOutputURL: URL? = nil,
@@ -90,6 +95,7 @@ public class AudioCaptureSession {
         self.sampleRate = sampleRate
         self.channels = channels
         self.appOutputURL = appOutputURL
+        self.appManifestURL = appManifestURL
         self.micOutputURL = micOutputURL
         self.micDeviceUID = micDeviceUID
         self.debugLogging = debugLogging
@@ -101,6 +107,7 @@ public class AudioCaptureSession {
 
     /// Start capturing app audio (and optionally mic audio).
     public func start() throws {
+        applicationSourceGeneration = 1
         // Create app output file and get its file descriptor
         // Restrict permissions to owner-only (0600) — audio may contain sensitive meeting content
         FileManager.default.createFile(
@@ -110,6 +117,16 @@ public class AudioCaptureSession {
         )
         let handle = try FileHandle(forWritingTo: appOutputURL)
         appFileHandle = handle
+        if let appManifestURL {
+            masterWriter = MasterAudioWriter(
+                outputFileDescriptor: handle.fileDescriptor,
+                masterURL: appOutputURL,
+                manifestURL: appManifestURL,
+                timelineAnchor: TimelineAnchor(),
+            )
+        } else {
+            masterWriter = nil
+        }
         do {
             try startApplicationCapture(
                 source: source,
@@ -119,6 +136,7 @@ public class AudioCaptureSession {
         } catch {
             try? handle.close()
             appFileHandle = nil
+            masterWriter = nil
             throw error
         }
 
@@ -169,6 +187,7 @@ public class AudioCaptureSession {
             )
         }
         stopApplicationCapture()
+        applicationSourceGeneration &+= 1
         self.source = source
         if case let .application(processes) = source {
             self.pids = processes
@@ -216,8 +235,10 @@ public class AudioCaptureSession {
             channels: channels,
             debugLogging: debugLogging,
             liveSink: liveSink,
-            timelineAnchor: appTimelineAnchor,
+            timelineAnchor: masterWriter?.timelineAnchor,
             sourceCallbackGate: callbackGate,
+            masterWriter: masterWriter,
+            sourceGeneration: applicationSourceGeneration,
         )
         try capture.start()
         appCapture = capture
@@ -266,9 +287,9 @@ public class AudioCaptureSession {
         micCapture?.stop()
 
         // Gather the raw per-track readings and hand the delay/rate/channel
-        // arithmetic to a pure, unit-tested builder. The app file is what
-        // `AppAudioCapture` actually WROTE — 16 kHz mono after the in-IOProc
-        // resample, not the device's raw capture format.
+        // arithmetic to a pure, unit-tested builder. New online sessions have
+        // a source-rate master; legacy direct callers without a manifest keep
+        // the historical fixed-rate output path.
         let result = AudioCaptureResult.make(
             appOutputURL: appOutputURL,
             micOutputURL: micOutputURL,
@@ -286,6 +307,7 @@ public class AudioCaptureSession {
 
         try? appFileHandle?.close()
         appFileHandle = nil
+        masterWriter = nil
         micCapture = nil
 
         logger.info("Capture session stopped (rate: \(result.actualSampleRate), channels: \(result.actualChannels), micDelay: \(result.micDelay))")

@@ -180,6 +180,7 @@ struct ClassMetadata: Identifiable, Equatable {
     var platform: String = "macos"
     var attemptID: SessionAttemptID? = nil
     var asrOriginalReference: ASRTranscriptReference? = nil
+    var audioManifestReference: AudioManifestReference? = nil
     var diarizationProposalReferences: [DiarizationProposalReference] = []
     var humanCorrectionOverlayReference: HumanCorrectionOverlayReference? = nil
 
@@ -207,6 +208,7 @@ struct ClassMetadata: Identifiable, Equatable {
         platform: String = "macos",
         attemptID: SessionAttemptID? = nil,
         asrOriginalReference: ASRTranscriptReference? = nil,
+        audioManifestReference: AudioManifestReference? = nil,
         diarizationProposalReferences: [DiarizationProposalReference] = [],
         humanCorrectionOverlayReference: HumanCorrectionOverlayReference? = nil,
     ) {
@@ -233,6 +235,7 @@ struct ClassMetadata: Identifiable, Equatable {
         self.platform = platform
         self.attemptID = attemptID
         self.asrOriginalReference = asrOriginalReference
+        self.audioManifestReference = audioManifestReference
         self.diarizationProposalReferences = diarizationProposalReferences
         self.humanCorrectionOverlayReference = humanCorrectionOverlayReference
     }

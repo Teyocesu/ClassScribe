@@ -332,6 +332,10 @@ struct HumanCorrectionOverlayReference: Codable, Equatable, Sendable {
     var relativePath: String
 }
 
+struct AudioManifestReference: Codable, Equatable, Sendable {
+    var relativePath = "audio-manifest.json"
+}
+
 extension ClassMetadata {
     var effectiveTranscriptionLanguage: TranscriptionLanguage {
         language ?? .spanish
@@ -364,6 +368,7 @@ extension ClassMetadata: Codable {
         case platform
         case sessionAttemptID
         case asrOriginalReference
+        case audioManifestReference
         case diarizationProposals
         case humanCorrectionOverlay
     }
@@ -456,6 +461,7 @@ extension ClassMetadata: Codable {
             platform: try container.decodeIfPresent(String.self, forKey: .platform) ?? "macos",
             attemptID: try container.decodeIfPresent(SessionAttemptID.self, forKey: .sessionAttemptID),
             asrOriginalReference: try container.decodeIfPresent(ASRTranscriptReference.self, forKey: .asrOriginalReference),
+            audioManifestReference: try container.decodeIfPresent(AudioManifestReference.self, forKey: .audioManifestReference),
             diarizationProposalReferences: try container.decodeIfPresent([DiarizationProposalReference].self, forKey: .diarizationProposals) ?? [],
             humanCorrectionOverlayReference: try container.decodeIfPresent(HumanCorrectionOverlayReference.self, forKey: .humanCorrectionOverlay),
         )
@@ -491,6 +497,7 @@ extension ClassMetadata: Codable {
         try container.encode(platform, forKey: .platform)
         try container.encodeIfPresent(attemptID, forKey: .sessionAttemptID)
         try container.encodeIfPresent(asrOriginalReference, forKey: .asrOriginalReference)
+        try container.encodeIfPresent(audioManifestReference, forKey: .audioManifestReference)
         try container.encode(diarizationProposalReferences, forKey: .diarizationProposals)
         try container.encodeIfPresent(humanCorrectionOverlayReference, forKey: .humanCorrectionOverlay)
     }

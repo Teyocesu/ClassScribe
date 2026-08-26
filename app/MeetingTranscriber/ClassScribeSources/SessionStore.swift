@@ -560,11 +560,16 @@ struct SessionStore {
         let audioDuration = hasAudio ? try? WavFile.validate(audioURL) : nil
         let audioIsValid = audioDuration != nil
         let rawURL = folder.appendingPathComponent("source.raw")
-        let hasRecoverableRawAudio = (try? WavFile.validateFloat32Raw(rawURL)) != nil
-        var metadata = decodedMetadata ?? inferredMetadata(for: folder, duration: audioDuration ?? 0)
+        let masterURL = folder.appendingPathComponent("master.raw")
+        let manifestURL = folder.appendingPathComponent("audio-manifest.json")
+        let masterDuration = (try? WavFile.validateMaster(masterURL, manifestURL: manifestURL))
+        let hasRecoverableMasterAudio = masterDuration != nil
+        let hasRecoverableLegacyAudio = (try? WavFile.validateFloat32Raw(rawURL)) != nil
+        let hasRecoverableRawAudio = hasRecoverableMasterAudio || hasRecoverableLegacyAudio
+        var metadata = decodedMetadata ?? inferredMetadata(for: folder, duration: audioDuration ?? masterDuration ?? 0)
         metadata.folderPath = folder.standardizedFileURL.path
-        if let audioDuration, audioDuration > metadata.duration {
-            metadata.duration = audioDuration
+        if let durableDuration = audioDuration ?? masterDuration, durableDuration > metadata.duration {
+            metadata.duration = durableDuration
         }
 
         let accumulator = loadLive(folder: folder)
@@ -572,7 +577,7 @@ struct SessionStore {
         let knownNames = [
             "live-transcript.txt", "live-transcript.json", "live-transcript-journal.jsonl",
             "live-transcript-edit.json", "recovered-transcript.txt", "all-speakers.txt",
-            "all-speakers.json", "professor.txt", "source.raw",
+            "all-speakers.json", "professor.txt", "source.raw", "master.raw", "audio-manifest.json",
             "asr-original.json", "diarization-proposals.json", "human-correction-overlay.json",
         ]
         let hasASROriginal = (try? fileManager.contentsOfDirectory(
@@ -580,7 +585,7 @@ struct SessionStore {
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles],
         ))?.contains { $0.lastPathComponent.hasPrefix("asr-original-") } == true
-        let hasKnownContent = hasAudio || metadataData != nil || hasASROriginal || knownNames.contains {
+        let hasKnownContent = hasAudio || hasRecoverableMasterAudio || metadataData != nil || hasASROriginal || knownNames.contains {
             fileManager.fileExists(atPath: folder.appendingPathComponent($0).path)
         }
         guard hasKnownContent else { return nil }
@@ -617,7 +622,9 @@ struct SessionStore {
             || invalidAudio
             || needsAudioRecovery
             || missingFinal
-        let reason: String? = if needsAudioRecovery {
+        let reason: String? = if needsAudioRecovery && hasRecoverableMasterAudio {
+            "El WAV derivado falta o está incompleto, pero el master fiel puede reconstruirse."
+        } else if needsAudioRecovery {
             "El WAV quedó incompleto, pero el audio crudo se conservó y puede recuperarse."
         } else if invalidAudio {
             "El audio no es válido; el texto disponible se conserva."

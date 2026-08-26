@@ -8,6 +8,7 @@ public static class PcmWaveFile
     public const short Channels = 1;
     public const short BitsPerSample = 16;
     public const string AudioFormatName = "pcm_s16le_16000_mono";
+    public const string MasterAudioFormatName = "float32le_master_manifest_v1";
     private const int HeaderSize = 44;
     private const int MaximumDataLength = int.MaxValue - HeaderSize;
 
@@ -159,6 +160,225 @@ public static class PcmWaveFile
         }
     }
 
+    /// Validates the new online-session master without imposing a RIFF/WAV
+    /// size limit. The manifest is the only authority for interpreting the
+    /// Float32 stream; a legacy source.raw never reaches this method.
+    public static double ValidateMaster(string masterPath, string manifestPath)
+    {
+        var manifest = AudioManifestFile.ReadValidated(manifestPath);
+        var expectedMasterPath = AudioManifestFile.ResolveWithinSession(
+            manifestPath,
+            manifest.Master.RelativePath);
+        var actualMasterPath = Path.GetFullPath(masterPath);
+        if (!string.Equals(actualMasterPath, expectedMasterPath, GetPathComparison()))
+        {
+            throw new InvalidDataException("El master no coincide con la ruta declarada por el manifest.");
+        }
+
+        ValidateRegularFile(masterPath);
+        var length = new FileInfo(masterPath).Length;
+        var bytesPerFrame = checked(manifest.Master.Channels * sizeof(float));
+        if (length <= 0 || length % bytesPerFrame != 0)
+        {
+            throw new InvalidDataException("El master Float32 está vacío o truncado.");
+        }
+
+        return length / (double)(bytesPerFrame * manifest.Master.SampleRate);
+    }
+
+    /// Materializes the fixed ASR WAV from the authoritative master. The
+    /// master and manifest are never removed, even when this operation fails.
+    public static async Task<double> DeriveFromMasterAsync(
+        string masterPath,
+        string manifestPath,
+        string destinationPath,
+        CancellationToken cancellationToken = default)
+    {
+        var manifest = AudioManifestFile.ReadValidated(manifestPath);
+        _ = ValidateMaster(masterPath, manifestPath);
+        var bytesPerFrame = checked(manifest.Master.Channels * sizeof(float));
+        var masterLength = new FileInfo(masterPath).Length;
+        var inputFrames = masterLength / bytesPerFrame;
+        var outputFrames = Math.Max(
+            1,
+            checked((long)Math.Round(
+                inputFrames * (double)SampleRate / manifest.Master.SampleRate,
+                MidpointRounding.AwayFromZero)));
+        var outputBytes = checked(outputFrames * (BitsPerSample / 8));
+        if (outputBytes > MaximumDataLength)
+        {
+            throw new InvalidDataException("El WAV derivado supera el tamaño RIFF compatible.");
+        }
+        var outputFramesWritten = 0L;
+
+        var directory = Path.GetDirectoryName(destinationPath)
+            ?? throw new InvalidOperationException("El WAV necesita una carpeta de destino.");
+        Directory.CreateDirectory(directory);
+        PreserveInvalidWaveIfPresent(destinationPath);
+
+        var temporaryRaw = Path.Combine(directory, $".classscribe-asr-{Guid.NewGuid():N}.raw");
+        try
+        {
+            await using (var input = new FileStream(
+                       masterPath,
+                       FileMode.Open,
+                       FileAccess.Read,
+                       FileShare.Read,
+                       128 * 1_024,
+                       FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await using (var output = new FileStream(
+                       temporaryRaw,
+                       FileMode.CreateNew,
+                       FileAccess.Write,
+                       FileShare.None,
+                       128 * 1_024,
+                       FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                var readBuffer = new byte[1 * 1_024 * 1_024];
+                var carry = Array.Empty<byte>();
+                var inputFramesRead = 0L;
+                var previousFrame = 0f;
+                var hasPreviousFrame = false;
+                while (true)
+                {
+                    var read = await input.ReadAsync(readBuffer, cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    var combined = new byte[checked(carry.Length + read)];
+                    carry.CopyTo(combined, 0);
+                    readBuffer.AsSpan(0, read).CopyTo(combined.AsSpan(carry.Length));
+                    var completeLength = combined.Length - (combined.Length % bytesPerFrame);
+                    if (completeLength > 0)
+                    {
+                        var masterSamples = DecodeMasterMono(
+                            combined.AsSpan(0, completeLength),
+                            manifest.Master.Channels);
+                        var blockStart = inputFramesRead;
+                        var blockEnd = checked(blockStart + masterSamples.Length);
+                        var asrSamples = new List<float>();
+                        while (outputFramesWritten < outputFrames)
+                        {
+                            var sourcePosition = outputFramesWritten
+                                * (double)manifest.Master.SampleRate / SampleRate;
+                            var lower = Math.Clamp(
+                                (long)Math.Floor(sourcePosition),
+                                0,
+                                inputFrames - 1);
+                            // Keep the final input frame until the next block
+                            // (or EOF), so interpolation is continuous across
+                            // the 1 MiB read boundary.
+                            if (lower >= blockEnd - 1)
+                            {
+                                break;
+                            }
+
+                            var first = lower < blockStart
+                                ? previousFrame
+                                : masterSamples[checked((int)(lower - blockStart))];
+                            var upper = lower + 1;
+                            var second = upper < blockStart
+                                ? previousFrame
+                                : masterSamples[checked((int)(upper - blockStart))];
+                            var fraction = (float)(sourcePosition - lower);
+                            asrSamples.Add(first + ((second - first) * fraction));
+                            outputFramesWritten++;
+                        }
+
+                        if (asrSamples.Count > 0)
+                        {
+                            await output.WriteAsync(
+                                    PcmAudioConverter.EncodePcmS16LE(asrSamples.ToArray()),
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+
+                        previousFrame = masterSamples[^1];
+                        hasPreviousFrame = true;
+                        inputFramesRead = blockEnd;
+                    }
+
+                    carry = completeLength == combined.Length
+                        ? []
+                        : combined[completeLength..];
+                }
+
+                if (carry.Length != 0 || inputFramesRead != inputFrames || !hasPreviousFrame)
+                {
+                    throw new InvalidDataException("El master termina en un frame incompleto.");
+                }
+
+                var finalSamples = new List<float>();
+                while (outputFramesWritten < outputFrames)
+                {
+                    var sourcePosition = outputFramesWritten
+                        * (double)manifest.Master.SampleRate / SampleRate;
+                    var lower = Math.Clamp(
+                        (long)Math.Floor(sourcePosition),
+                        0,
+                        inputFrames - 1);
+                    if (lower < inputFrames - 1)
+                    {
+                        throw new InvalidDataException("No se pudo completar la conversión temporal del master.");
+                    }
+
+                    finalSamples.Add(previousFrame);
+                    outputFramesWritten++;
+                }
+                if (finalSamples.Count > 0)
+                {
+                    await output.WriteAsync(
+                            PcmAudioConverter.EncodePcmS16LE(finalSamples.ToArray()),
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+                output.Flush(flushToDisk: true);
+            }
+
+            if (outputFramesWritten != outputFrames)
+            {
+                throw new InvalidDataException("El WAV derivado no contiene la duración completa del master.");
+            }
+
+            await WrapRawAsync(temporaryRaw, destinationPath, cancellationToken).ConfigureAwait(false);
+            return Validate(destinationPath);
+        }
+        finally
+        {
+            if (File.Exists(temporaryRaw))
+            {
+                File.Delete(temporaryRaw);
+            }
+        }
+    }
+
+    private static float[] DecodeMasterMono(ReadOnlySpan<byte> bytes, int channels)
+    {
+        var bytesPerFrame = checked(channels * sizeof(float));
+        var frameCount = bytes.Length / bytesPerFrame;
+        var samples = new float[frameCount];
+        for (var frame = 0; frame < frameCount; frame++)
+        {
+            var offset = frame * bytesPerFrame;
+            var sum = 0f;
+            for (var channel = 0; channel < channels; channel++)
+            {
+                var value = BitConverter.Int32BitsToSingle(
+                    BinaryPrimitives.ReadInt32LittleEndian(
+                        bytes.Slice(offset + (channel * sizeof(float)), sizeof(float))));
+                sum += float.IsFinite(value) ? value : 0;
+            }
+
+            samples[frame] = sum / channels;
+        }
+
+        return samples;
+    }
+
     public static float[] ReadSamples(string path)
     {
         Validate(path);
@@ -227,4 +447,31 @@ public static class PcmWaveFile
             throw new InvalidDataException("El audio debe ser un archivo regular, no un enlace o directorio.");
         }
     }
+
+    private static void PreserveInvalidWaveIfPresent(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        ValidateRegularFile(path);
+        try
+        {
+            _ = Validate(path);
+            return;
+        }
+        catch (Exception error) when (error is IOException or InvalidDataException)
+        {
+            var preserved = Path.Combine(
+                Path.GetDirectoryName(path)!,
+                $"source-invalid-preserved-{Guid.NewGuid():N}.wav");
+            File.Copy(path, preserved, overwrite: false);
+        }
+    }
+
+    private static StringComparison GetPathComparison() =>
+        OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
 }

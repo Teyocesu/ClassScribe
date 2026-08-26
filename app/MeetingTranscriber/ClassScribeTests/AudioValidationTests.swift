@@ -103,6 +103,60 @@ func truncatedRawDoesNotReplaceDestination() throws {
 }
 
 @Test
+func masterRecoveryRegeneratesASRDerivativeAndPreservesMaster() throws {
+    let folder = try makeAudioValidationFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let master = folder.appendingPathComponent("master.raw")
+    let manifest = folder.appendingPathComponent("audio-manifest.json")
+    let source = folder.appendingPathComponent("source.wav")
+    let samples = (0 ..< 480).flatMap { _ in [Float(0.2), Float(-0.2)] }
+
+    try masterFloat32LEData(samples).write(to: master, options: .atomic)
+    try AudioManifestStore.write(
+        AudioManifest(
+            master: AudioManifestMaster(sampleRate: 48_000, channels: 2),
+        ),
+        to: manifest,
+    )
+
+    #expect(try abs(WavFile.recoverMaster(master, manifestURL: manifest, destination: source) - 0.01) < 0.0001)
+    #expect(try abs(WavFile.validateMaster(master, manifestURL: manifest) - 0.01) < 0.0001)
+    #expect(try abs(WavFile.validate(source) - 0.01) < 0.0001)
+    #expect(FileManager.default.fileExists(atPath: master.path))
+    #expect(FileManager.default.fileExists(atPath: manifest.path))
+}
+
+@Test
+func failedMasterDerivativeLeavesAuthoritativeArtifactsAndDestinationEvidence() throws {
+    let folder = try makeAudioValidationFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let master = folder.appendingPathComponent("master.raw")
+    let manifest = folder.appendingPathComponent("audio-manifest.json")
+    let source = folder.appendingPathComponent("source.wav")
+    let previousSource = Data("source evidence".utf8)
+
+    try Data([0, 1, 2]).write(to: master)
+    try AudioManifestStore.write(
+        AudioManifest(
+            master: AudioManifestMaster(sampleRate: 48_000, channels: 2),
+        ),
+        to: manifest,
+    )
+    try previousSource.write(to: source)
+
+    #expect(throws: CaptureError.self) {
+        _ = try WavFile.deriveASRFromMaster(
+            masterURL: master,
+            manifestURL: manifest,
+            destination: source,
+        )
+    }
+    #expect(try Data(contentsOf: master) == Data([0, 1, 2]))
+    #expect(try Data(contentsOf: source) == previousSource)
+    #expect(FileManager.default.fileExists(atPath: manifest.path))
+}
+
+@Test
 func symbolicAudioIsRejectedWithoutTouchingItsTarget() throws {
     let folder = try makeAudioValidationFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
@@ -351,6 +405,15 @@ private func makeAudioValidationFolder() throws -> URL {
         .appendingPathComponent("classscribe-audio-validation-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
     return folder
+}
+
+private func masterFloat32LEData(_ samples: [Float]) -> Data {
+    var data = Data(capacity: samples.count * MemoryLayout<Float>.size)
+    for sample in samples {
+        var bits = (sample.isFinite ? sample : 0).bitPattern.littleEndian
+        data.append(Data(bytes: &bits, count: MemoryLayout<UInt32>.size))
+    }
+    return data
 }
 
 private func pcm16WAVHeader(dataBytes: UInt32) -> Data {

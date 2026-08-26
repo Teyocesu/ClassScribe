@@ -372,6 +372,19 @@ public sealed class SessionStore
             // Rebuild from the durable PCM stream below.
         }
 
+        var masterPath = Path.Combine(folder, "master.raw");
+        var manifestPath = Path.Combine(folder, "audio-manifest.json");
+        if (TryValidateMaster(masterPath, manifestPath, out _))
+        {
+            await PcmWaveFile.DeriveFromMasterAsync(
+                    masterPath,
+                    manifestPath,
+                    wavePath,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return wavePath;
+        }
+
         var rawPath = Path.Combine(folder, "source.raw");
         await PcmWaveFile.WrapRawAsync(rawPath, wavePath, cancellationToken).ConfigureAwait(false);
         File.Delete(rawPath);
@@ -470,10 +483,17 @@ public sealed class SessionStore
 
         var audioPath = Path.Combine(folder, "source.wav");
         var rawPath = Path.Combine(folder, "source.raw");
+        var masterPath = Path.Combine(folder, "master.raw");
+        var manifestPath = Path.Combine(folder, "audio-manifest.json");
         var audioValid = TryValidateWave(audioPath, out var duration);
         var rawValid = TryValidateRaw(rawPath);
+        var masterValid = TryValidateMaster(masterPath, manifestPath, out var masterDuration);
+        if (!audioValid && masterValid)
+        {
+            duration = masterDuration;
+        }
         var preferredText = PreferredTextPath(folder);
-        if (metadata is null && !audioValid && !rawValid && preferredText is null)
+        if (metadata is null && !audioValid && !rawValid && !masterValid && preferredText is null)
         {
             return null;
         }
@@ -492,6 +512,8 @@ public sealed class SessionStore
             || !hasFinal;
         var reason = metadataWasCorrupt
             ? "La metadata quedó truncada o corrupta; el audio y el texto disponibles se conservaron."
+            : !audioValid && masterValid
+            ? "El WAV derivado falta o está incompleto, pero el master fiel puede reconstruirse."
             : !audioValid && rawValid
             ? "El WAV quedó incompleto, pero el audio crudo puede reconstruirse."
             : !audioValid
@@ -501,7 +523,14 @@ public sealed class SessionStore
                     : metadata.State != ProcessingState.Complete
                         ? "La sesión quedó interrumpida antes de confirmar su estado final."
                         : null;
-        return new SessionSummary(folder, metadata, recoverable, audioValid, rawValid, preferredText, reason);
+        return new SessionSummary(
+            folder,
+            metadata,
+            recoverable,
+            audioValid,
+            masterValid || rawValid,
+            preferredText,
+            reason);
     }
 
     private static ClassMetadata InferMetadata(string folder, double duration)
@@ -658,6 +687,23 @@ public sealed class SessionStore
                                            or UnauthorizedAccessException
                                            or InvalidDataException)
         {
+            return false;
+        }
+    }
+
+    private static bool TryValidateMaster(string masterPath, string manifestPath, out double duration)
+    {
+        try
+        {
+            duration = PcmWaveFile.ValidateMaster(masterPath, manifestPath);
+            return true;
+        }
+        catch (Exception error) when (error is IOException
+                                           or UnauthorizedAccessException
+                                           or InvalidDataException
+                                           or JsonException)
+        {
+            duration = 0;
             return false;
         }
     }

@@ -387,6 +387,7 @@ final class CaptureNativeExecutor: @unchecked Sendable {
         rootPID: pid_t,
         pids: [pid_t],
         outputURL: URL,
+        manifestURL: URL? = nil,
         registrationTimeout: TimeInterval,
         liveSink: @escaping LiveAudioSink,
         sourceCallbackGate: @escaping @Sendable () -> Bool,
@@ -414,6 +415,7 @@ final class CaptureNativeExecutor: @unchecked Sendable {
             let session = AudioCaptureSession(
                 pids: pids,
                 appOutputURL: outputURL,
+                appManifestURL: manifestURL,
                 micOutputURL: nil,
                 appLiveSink: liveSink,
                 appCallbackGate: sourceCallbackGate,
@@ -444,6 +446,7 @@ final class CaptureNativeExecutor: @unchecked Sendable {
         sourceGeneration: CaptureSourceGeneration,
         authorization: SystemOutputCaptureAuthorization?,
         outputURL: URL,
+        manifestURL: URL? = nil,
         liveSink: @escaping LiveAudioSink,
         sourceCallbackGate: @escaping @Sendable () -> Bool,
     ) -> CaptureNativeWork<Void> {
@@ -458,6 +461,7 @@ final class CaptureNativeExecutor: @unchecked Sendable {
             let session = AudioCaptureSession(
                 source: .systemOutput,
                 appOutputURL: outputURL,
+                appManifestURL: manifestURL,
                 micOutputURL: nil,
                 appLiveSink: liveSink,
                 appCallbackGate: sourceCallbackGate,

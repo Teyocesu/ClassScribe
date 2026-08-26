@@ -304,6 +304,12 @@ public sealed record AudioFormatMetadata
     public string? Asr { get; init; }
 }
 
+public sealed record AudioManifestReference
+{
+    [JsonPropertyName("relativePath")]
+    public string RelativePath { get; init; } = "audio-manifest.json";
+}
+
 public sealed record ASRTranscriptReference
 {
     [JsonPropertyName("runID")]
@@ -603,6 +609,7 @@ internal sealed class ClassMetadataJsonConverter : JsonConverter<ClassMetadata>
             Platform = GetString(root, "platform") ?? "windows",
             AttemptID = Deserialize<SessionAttemptID>(root, "sessionAttemptID", options),
             AsrOriginalReference = Deserialize<ASRTranscriptReference>(root, "asrOriginalReference", options),
+            AudioManifestReference = Deserialize<AudioManifestReference>(root, "audioManifestReference", options),
             DiarizationProposalReferences = Deserialize<List<DiarizationProposalReference>>(root, "diarizationProposals", options) ?? [],
             HumanCorrectionOverlayReference = Deserialize<HumanCorrectionOverlayReference>(root, "humanCorrectionOverlay", options),
         };
@@ -636,6 +643,7 @@ internal sealed class ClassMetadataJsonConverter : JsonConverter<ClassMetadata>
         writer.WriteString("platform", value.Platform);
         WriteNullableObject(writer, "sessionAttemptID", value.AttemptID, options);
         WriteNullableObject(writer, "asrOriginalReference", value.AsrOriginalReference, options);
+        WriteNullableObject(writer, "audioManifestReference", value.AudioManifestReference, options);
         writer.WritePropertyName("diarizationProposals");
         JsonSerializer.Serialize(writer, value.DiarizationProposalReferences, options);
         WriteNullableObject(writer, "humanCorrectionOverlay", value.HumanCorrectionOverlayReference, options);

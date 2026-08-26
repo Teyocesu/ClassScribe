@@ -278,6 +278,11 @@ public sealed class MainViewModelSystemOutputConsentTests
 
         public event Action<Exception?>? RecordingStopped;
 
+        public AudioPcmFormat Format { get; } = AudioPcmFormat.Create(
+            48_000,
+            2,
+            AudioSampleEncoding.Float32LE);
+
         public void StartRecording() =>
             DataAvailable?.Invoke(new byte[] { 1, 0, 1, 0, 1, 0, 1, 0 });
 

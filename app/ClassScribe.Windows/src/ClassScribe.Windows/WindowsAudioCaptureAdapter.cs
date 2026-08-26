@@ -13,6 +13,11 @@ internal interface IWindowsAudioRecorder : IAsyncDisposable
 
     event Action<Exception?>? RecordingStopped;
 
+    /// Actual interleaved PCM contract delivered by this recorder. Online
+    /// sources expose the WASAPI mix format; the microphone keeps its legacy
+    /// fixed format in this phase.
+    AudioPcmFormat Format { get; }
+
     void StartRecording();
 
     void StopRecording();
@@ -66,12 +71,21 @@ internal interface IWindowsAudioCaptureFactory
 /// never a process-loopback capture and never enumerates all processes.
 internal sealed class NAudioWindowsAudioCaptureFactory : IWindowsAudioCaptureFactory
 {
-    private static WasapiRecorderBuilder CreateBuilder() => new WasapiRecorderBuilder()
+    private static WasapiRecorderBuilder CreateBuilder(bool fixedMicrophoneFormat = false)
+    {
+        var builder = new WasapiRecorderBuilder()
         .WithSharedMode()
         .WithEventSync()
-        .WithFormat(new WaveFormat(PcmWaveFile.SampleRate, PcmWaveFile.BitsPerSample, PcmWaveFile.Channels))
         .WithBufferLength(100)
         .WithMmcssThreadPriority("Audio");
+
+        return fixedMicrophoneFormat
+            ? builder.WithFormat(new WaveFormat(
+                PcmWaveFile.SampleRate,
+                PcmWaveFile.BitsPerSample,
+                PcmWaveFile.Channels))
+            : builder;
+    }
 
     public WindowsRenderEndpoint GetDefaultRenderEndpoint()
     {
@@ -121,7 +135,8 @@ internal sealed class NAudioWindowsAudioCaptureFactory : IWindowsAudioCaptureFac
     }
 
     public IWindowsAudioRecorder BuildDeviceRecorder(MMDevice device) =>
-        new NAudioWindowsAudioRecorder(CreateBuilder().WithDevice(device).Build());
+        new NAudioWindowsAudioRecorder(
+            CreateBuilder(fixedMicrophoneFormat: true).WithDevice(device).Build());
 }
 
 internal sealed class NAudioWindowsAudioRecorder : IWindowsAudioRecorder
@@ -131,6 +146,7 @@ internal sealed class NAudioWindowsAudioRecorder : IWindowsAudioRecorder
     public NAudioWindowsAudioRecorder(WasapiRecorder recorder)
     {
         this.recorder = recorder;
+        Format = ToPcmFormat(recorder.WaveFormat);
         this.recorder.DataAvailable += HandleDataAvailable;
         this.recorder.RecordingStopped += HandleRecordingStopped;
     }
@@ -138,6 +154,8 @@ internal sealed class NAudioWindowsAudioRecorder : IWindowsAudioRecorder
     public event Action<ReadOnlyMemory<byte>>? DataAvailable;
 
     public event Action<Exception?>? RecordingStopped;
+
+    public AudioPcmFormat Format { get; }
 
     public void StartRecording() => recorder.StartRecording();
 
@@ -166,5 +184,25 @@ internal sealed class NAudioWindowsAudioRecorder : IWindowsAudioRecorder
     {
         _ = sender;
         RecordingStopped?.Invoke(eventArgs.Exception);
+    }
+
+    private static AudioPcmFormat ToPcmFormat(WaveFormat waveFormat)
+    {
+        ArgumentNullException.ThrowIfNull(waveFormat);
+        var standard = waveFormat.AsStandardWaveFormat();
+        var encoding = standard.Encoding switch
+        {
+            WaveFormatEncoding.Pcm when standard.BitsPerSample == 16 => AudioSampleEncoding.PcmS16LE,
+            WaveFormatEncoding.IeeeFloat when standard.BitsPerSample == 32 => AudioSampleEncoding.Float32LE,
+            _ => throw new InvalidDataException(
+                $"Formato WASAPI no soportado: {standard.Encoding}, {standard.BitsPerSample} bits."),
+        };
+        var format = new AudioPcmFormat(
+            standard.SampleRate,
+            standard.Channels,
+            encoding,
+            standard.BlockAlign);
+        format.EnsureValid();
+        return format;
     }
 }

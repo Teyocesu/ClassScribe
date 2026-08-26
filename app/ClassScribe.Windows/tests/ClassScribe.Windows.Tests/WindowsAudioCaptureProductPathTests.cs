@@ -18,7 +18,8 @@ public sealed class WindowsAudioCaptureProductPathTests
         await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
             capture.StartAsync(SystemSource(), folder, attempt, CancellationToken.None));
 
-        Assert.IsFalse(File.Exists(Path.Combine(folder, "source.raw")));
+        Assert.IsFalse(File.Exists(Path.Combine(folder, "master.raw")));
+        Assert.IsFalse(File.Exists(Path.Combine(folder, "audio-manifest.json")));
         DeleteFolder(folder);
     }
 
@@ -112,7 +113,8 @@ public sealed class WindowsAudioCaptureProductPathTests
 
         Assert.IsTrue(File.Exists(wavePath));
         Assert.IsTrue(new FileInfo(wavePath).Length > 44, "Both generations must append to the durable session stream.");
-        Assert.IsFalse(File.Exists(Path.Combine(folder, "source.raw")));
+        Assert.IsTrue(File.Exists(Path.Combine(folder, "master.raw")));
+        Assert.IsTrue(File.Exists(Path.Combine(folder, "audio-manifest.json")));
         DeleteFolder(folder);
     }
 
@@ -505,6 +507,11 @@ public sealed class WindowsAudioCaptureProductPathTests
         public event Action<ReadOnlyMemory<byte>>? DataAvailable;
 
         public event Action<Exception?>? RecordingStopped;
+
+        public AudioPcmFormat Format { get; } = AudioPcmFormat.Create(
+            48_000,
+            2,
+            AudioSampleEncoding.Float32LE);
 
         public int StartCount { get; private set; }
 

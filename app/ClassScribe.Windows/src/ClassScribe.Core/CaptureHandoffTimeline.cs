@@ -9,7 +9,10 @@ namespace ClassScribe.Core;
 public sealed class CaptureHandoffTimeline
 {
     private readonly object sync = new();
-    private readonly int bytesPerSecond;
+    private readonly int? configuredBytesPerSecond;
+    private readonly int configuredBytesPerFrame;
+    private int? bytesPerSecond;
+    private int bytesPerFrame;
     private CaptureSourceGeneration? activeGeneration;
     private long? lastPacketEndTimestamp;
     private PendingHandoff? pendingHandoff;
@@ -21,7 +24,43 @@ public sealed class CaptureHandoffTimeline
             throw new ArgumentOutOfRangeException(nameof(bytesPerSecond));
         }
 
+        configuredBytesPerSecond = bytesPerSecond;
+        configuredBytesPerFrame = 2;
         this.bytesPerSecond = bytesPerSecond;
+        bytesPerFrame = configuredBytesPerFrame;
+    }
+
+    /// Creates a timeline whose durable units are selected by the first
+    /// accepted master format. No non-empty packet can be planned before
+    /// SetFormat has established those units.
+    public CaptureHandoffTimeline()
+    {
+        configuredBytesPerSecond = null;
+        configuredBytesPerFrame = 0;
+        bytesPerSecond = null;
+        bytesPerFrame = 0;
+    }
+
+    public void SetFormat(AudioPcmFormat format)
+    {
+        ArgumentNullException.ThrowIfNull(format);
+        format.EnsureValid();
+        lock (sync)
+        {
+            if (configuredBytesPerSecond is not null)
+            {
+                return;
+            }
+
+            if (lastPacketEndTimestamp is not null
+                && (bytesPerSecond != format.BytesPerSecond || bytesPerFrame != format.BytesPerFrame))
+            {
+                throw new InvalidOperationException("La unidad durable de la línea temporal ya está fijada.");
+            }
+
+            bytesPerSecond = format.BytesPerSecond;
+            bytesPerFrame = format.BytesPerFrame;
+        }
     }
 
     public void Reset()
@@ -31,6 +70,8 @@ public sealed class CaptureHandoffTimeline
             activeGeneration = null;
             lastPacketEndTimestamp = null;
             pendingHandoff = null;
+            bytesPerSecond = configuredBytesPerSecond;
+            bytesPerFrame = configuredBytesPerFrame;
         }
     }
 
@@ -78,6 +119,12 @@ public sealed class CaptureHandoffTimeline
                 return CapturePacketWritePlan.Empty(generation);
             }
 
+            if (bytesPerSecond is null || bytesPerFrame <= 0)
+            {
+                throw new InvalidOperationException(
+                    "El primer PCM durable debe fijar el formato antes de calcular la línea temporal.");
+            }
+
             var handoff = pendingHandoff;
             if (handoff is not null && handoff.Generation != generation)
             {
@@ -94,8 +141,9 @@ public sealed class CaptureHandoffTimeline
                 : CaptureGapSilence.Assess(
                     lastPacketEndTimestamp,
                     arrival!.Value,
-                    bytesPerSecond,
-                    maximumGap: maximumGap);
+                    bytesPerSecond.Value,
+                    maximumGap: maximumGap,
+                    bytesPerFrame: bytesPerFrame);
             var baseTimestamp = arrival ?? lastPacketEndTimestamp;
             var packetEndTimestamp = baseTimestamp is null
                 ? null
@@ -144,7 +192,7 @@ public sealed class CaptureHandoffTimeline
 
     private long DurationTicks(int byteCount) =>
         checked((long)Math.Round(
-            byteCount / (double)bytesPerSecond * Stopwatch.Frequency,
+            byteCount / (double)bytesPerSecond!.Value * Stopwatch.Frequency,
             MidpointRounding.AwayFromZero));
 
     private sealed record PendingHandoff(CaptureSourceGeneration Generation);
