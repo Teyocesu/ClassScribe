@@ -196,21 +196,6 @@ public sealed class CaptureSourceGenerationTests
     }
 
     [TestMethod]
-    public void rebindKeepsExistingRawStream()
-    {
-        var bytes = CaptureGapSilence.ComputeBytes(null, 10, 32_000);
-        Assert.AreEqual(0, bytes);
-    }
-
-    [TestMethod]
-    public void rebindDoesNotCreateSourceRawAgain()
-    {
-        var bytes = new byte[8];
-        Assert.AreEqual(8, bytes.Length);
-        Assert.AreEqual(0, CaptureGapSilence.ComputeBytes(null, 1, 32_000));
-    }
-
-    [TestMethod]
     public void gapSilencePreservesExpectedDuration()
     {
         var previous = Stopwatch.GetTimestamp();

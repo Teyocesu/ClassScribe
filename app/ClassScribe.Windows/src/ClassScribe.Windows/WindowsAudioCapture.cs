@@ -2025,15 +2025,6 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
     }
 
-    // Test/product seam: the public wrapper keeps the rebind boundary
-    // deterministic without exposing native recorder types to Core tests.
-    internal Task<bool> RebindApplicationForTestAsync(
-        AudioSourceOption source,
-        SessionAttemptID attempt,
-        int resolvedRootPID,
-        CancellationToken cancellationToken = default) =>
-        RebindApplicationAsync(source, attempt, resolvedRootPID, cancellationToken);
-
     private void TryStopRecorder()
     {
         try

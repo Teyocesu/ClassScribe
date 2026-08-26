@@ -468,52 +468,6 @@ final class CaptureStartupResourceOwner<Resource> {
     }
 }
 
-/// Detects a dead callback stream without treating digital silence as a
-/// failure. `sampleCount` advances for both audible and silent buffers; only a
-/// complete absence of frames for `stallTimeout` is terminal.
-struct AudioFrameWatchdog: Sendable {
-    let stallTimeout: TimeInterval
-    private(set) var lastSampleCount: Int64 = 0
-    private(set) var lastProgressTime: TimeInterval = 0
-
-    mutating func reset(sampleCount: Int64, now: TimeInterval) {
-        lastSampleCount = sampleCount
-        lastProgressTime = now
-    }
-
-    mutating func observe(sampleCount: Int64, now: TimeInterval) -> Bool {
-        if sampleCount > lastSampleCount || now < lastProgressTime {
-            reset(sampleCount: sampleCount, now: now)
-            return false
-        }
-        return now - lastProgressTime >= stallTimeout
-    }
-}
-
-/// Awaits the transient CoreAudio registration that follows process launch.
-/// The wait stays inside the caller's structured task: cancellation ends it
-/// immediately, and there is no delayed retry block that could start capture
-/// after Stop or after the owning workflow has gone away.
-struct AudioProcessStartupWaiter {
-    static func waitUntilRegistered(
-        pids: [pid_t],
-        timeout: TimeInterval,
-        pollInterval: TimeInterval = 0.05,
-        registrationProbe: @escaping @Sendable ([pid_t]) -> Bool = AppAudioCapture.hasRegisteredAudioProcess(in:),
-    ) async throws -> Bool {
-        guard !pids.isEmpty else { return false }
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(max(0, timeout)))
-        let interval = max(0.01, pollInterval)
-        while true {
-            try Task.checkCancellation()
-            if registrationProbe(pids) { return true }
-            guard clock.now < deadline else { return false }
-            try await Task.sleep(for: .seconds(interval))
-        }
-    }
-}
-
 typealias CaptureApplicationReconcile = @Sendable (
     _ selectedIdentity: ApplicationIdentity,
     _ previousPID: pid_t,
@@ -528,8 +482,6 @@ final class CaptureController {
     // signal-health budgets in CaptureSignalThresholds.
     nonisolated static let onlineFirstBufferTimeout =
         CaptureSignalThresholds.macOSApplication.initialCallbackBudget
-    nonisolated static let onlineStallTimeout =
-        CaptureSignalThresholds.macOSApplication.stallBudget
     nonisolated static let microphoneFirstBufferTimeout =
         CaptureSignalThresholds.macOSMicrophone.initialCallbackBudget
     nonisolated static let onlineProcessRegistrationTimeout: TimeInterval = 3

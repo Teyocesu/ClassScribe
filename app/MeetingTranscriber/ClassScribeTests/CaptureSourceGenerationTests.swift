@@ -323,37 +323,6 @@ func oldTapFullyStopsBeforeNewTapStarts() async {
 }
 
 @Test
-func rebindUsesSameDurableOutputFile() throws {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("classscribe-rebind-\(UUID().uuidString).raw")
-    defer { try? FileManager.default.removeItem(at: url) }
-    FileManager.default.createFile(atPath: url.path, contents: Data([1, 2]))
-    let handle = try FileHandle(forWritingTo: url)
-    try handle.seekToEnd()
-    try handle.write(contentsOf: Data([3, 4]))
-    try handle.close()
-
-    #expect(try Data(contentsOf: url) == Data([1, 2, 3, 4]))
-}
-
-@Test
-func rebindDoesNotTruncateExistingRawAudio() throws {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("classscribe-rebind-\(UUID().uuidString).raw")
-    defer { try? FileManager.default.removeItem(at: url) }
-    FileManager.default.createFile(atPath: url.path, contents: Data(repeating: 7, count: 8))
-    let before = try Data(contentsOf: url)
-    let handle = try FileHandle(forWritingTo: url)
-    try handle.seekToEnd()
-    try handle.write(contentsOf: Data(repeating: 0, count: 4))
-    try handle.close()
-
-    let after = try Data(contentsOf: url)
-    #expect(after.starts(with: before))
-    #expect(after.count == before.count + 4)
-}
-
-@Test
 func rebindGapPreservesTimelineDuration() {
     let anchor = TimelineAnchor(rate: 16_000)
     _ = anchor.silenceFramesBefore(hostSeconds: 100, frameCount: 1_600)
@@ -373,19 +342,6 @@ func newTapFirstCallbackCompletesOnlyNewGeneration() {
     if gate.accepts(attempt, generation: next) { accepted.increment() }
 
     #expect(accepted.current == 1)
-}
-
-@Test
-func rebindFailurePreservesExistingAudio() throws {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("classscribe-rebind-\(UUID().uuidString).raw")
-    defer { try? FileManager.default.removeItem(at: url) }
-    let original = Data(repeating: 3, count: 16)
-    FileManager.default.createFile(atPath: url.path, contents: original)
-
-    // A failed source generation changes no durable session file; the
-    // existing evidence remains readable for recovery/finalization.
-    #expect(try Data(contentsOf: url) == original)
 }
 
 @MainActor
