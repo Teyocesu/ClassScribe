@@ -14,9 +14,10 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
-    private readonly SessionStore sessionStore = new();
+    private readonly SessionStore sessionStore;
     private readonly LocalModelProvisioner modelProvisioner = new();
-    private readonly WindowsAudioCapture audioCapture = new();
+    private readonly WindowsAudioCapture audioCapture;
+    private readonly Func<bool> systemOutputConsentPrompt;
     private readonly WhisperTranscriber transcriber;
     private readonly List<TranscriptSegment> segments = [];
     private CancellationTokenSource? liveCancellation;
@@ -27,7 +28,10 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private Task? timerTask;
     private CaptureModeChoice selectedMode;
     private LanguageChoice selectedLanguage;
+    private OnlineCaptureSourceChoice selectedOnlineSource;
     private AudioSourceOption? selectedSource;
+    private SystemOutputConsentRequest? pendingSystemOutputConsent;
+    private CaptureRecoverySuggestion? captureRecoverySuggestion;
     private HistoryRow? selectedHistory;
     private SpeakerRecord? selectedProfessor;
     private ClassMetadata? currentMetadata;
@@ -56,17 +60,28 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private SessionAttemptCallbackLease? captureCallbackLease;
     private Action<SessionAttemptID, double>? captureLevelHandler;
     private Action<SessionAttemptID, CaptureSignalHealthSnapshot>? captureSignalHealthHandler;
-    private Action<SessionAttemptID, Exception>? captureFaultHandler;
+    private Action<SessionAttemptID, CaptureFault>? captureFaultHandler;
     private ASRTranscriptReference? asrOriginalReference;
     private DiarizationProposal? activeDiarizationProposal;
     private HumanCorrectionOverlay? activeHumanCorrectionOverlay;
 
-    public MainViewModel()
+    public MainViewModel(
+        SessionStore? sessionStore = null,
+        WindowsAudioCapture? audioCapture = null,
+        Func<bool>? systemOutputConsentPrompt = null)
     {
+        this.sessionStore = sessionStore ?? new SessionStore();
+        this.audioCapture = audioCapture ?? new WindowsAudioCapture();
+        this.systemOutputConsentPrompt = systemOutputConsentPrompt ?? (() => false);
         CaptureModes =
         [
             new CaptureModeChoice(CaptureMode.Online, "Clase online · audio de una aplicación"),
             new CaptureModeChoice(CaptureMode.InPerson, "Clase presencial · micrófono"),
+        ];
+        OnlineSourceChoices =
+        [
+            new OnlineCaptureSourceChoice(OnlineCaptureSource.Application, "Una aplicación"),
+            new OnlineCaptureSourceChoice(OnlineCaptureSource.SystemOutput, "Audio del equipo"),
         ];
         Languages =
         [
@@ -75,11 +90,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             new LanguageChoice("fr", "Français"),
         ];
         selectedMode = CaptureModes[0];
+        selectedOnlineSource = OnlineSourceChoices[0];
         selectedLanguage = Languages[0];
         transcriber = new WhisperTranscriber(modelProvisioner);
     }
 
     public IReadOnlyList<CaptureModeChoice> CaptureModes { get; }
+
+    public IReadOnlyList<OnlineCaptureSourceChoice> OnlineSourceChoices { get; }
 
     public IReadOnlyList<LanguageChoice> Languages { get; }
 
@@ -98,7 +116,31 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             if (SetProperty(ref selectedMode, value))
             {
+                InvalidatePendingSystemOutputConsent();
+                captureRecoverySuggestion = null;
+                OnPropertyChanged(nameof(ShowSystemOutputRecovery));
                 SelectedSource = null;
+                if (value.Value != CaptureMode.Online)
+                {
+                    SelectedOnlineSource = OnlineSourceChoices[0];
+                }
+                NotifySourcePresentation();
+                NotifyAvailability();
+            }
+        }
+    }
+
+    public OnlineCaptureSourceChoice SelectedOnlineSource
+    {
+        get => selectedOnlineSource;
+        set
+        {
+            if (SetProperty(ref selectedOnlineSource, value))
+            {
+                InvalidatePendingSystemOutputConsent();
+                captureRecoverySuggestion = null;
+                OnPropertyChanged(nameof(ShowSystemOutputRecovery));
+                NotifySourcePresentation();
                 NotifyAvailability();
             }
         }
@@ -117,6 +159,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             if (SetProperty(ref selectedSource, value))
             {
+                InvalidatePendingSystemOutputConsent();
                 NotifyAvailability();
             }
         }
@@ -141,6 +184,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             if (SetProperty(ref subject, value))
             {
+                InvalidatePendingSystemOutputConsent();
                 NotifyAvailability();
             }
         }
@@ -197,6 +241,23 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     }
 
     public bool HasWarning => !string.IsNullOrWhiteSpace(WarningText);
+
+    public bool IsOnline => SelectedMode.Value == CaptureMode.Online;
+
+    public bool IsInPerson => SelectedMode.Value == CaptureMode.InPerson;
+
+    public bool IsApplicationSource => IsOnline
+        && SelectedOnlineSource.Value == OnlineCaptureSource.Application;
+
+    public bool IsSystemOutputSource => IsOnline
+        && SelectedOnlineSource.Value == OnlineCaptureSource.SystemOutput;
+
+    public bool ShowSystemOutputRecovery => captureRecoverySuggestion == CaptureRecoverySuggestion.SystemOutput
+        && IsApplicationSource
+        && !IsRecording
+        && !IsBusy;
+
+    public SystemOutputConsentRequest? PendingSystemOutputConsent => pendingSystemOutputConsent;
 
     public string ElapsedText
     {
@@ -262,8 +323,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public bool CanStart => !IsBusy
         && !IsRecording
-        && SelectedSource is not null
-        && !string.IsNullOrWhiteSpace(Subject);
+        && pendingSystemOutputConsent is null
+        && !string.IsNullOrWhiteSpace(Subject)
+        && (IsSystemOutputSource
+            || (IsApplicationSource && SelectedSource?.Kind == AudioSourceKind.Process)
+            || (IsInPerson && SelectedSource?.Kind == AudioSourceKind.Microphone));
 
     public bool CanStop => IsRecording && !IsBusy;
 
@@ -291,18 +355,34 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task RefreshSourcesAsync()
     {
+        if (pendingSystemOutputConsent is not null)
+        {
+            InvalidatePendingSystemOutputConsent();
+            return;
+        }
+
         if (IsRecording || IsBusy)
         {
             return;
         }
 
-        StatusText = SelectedMode.Value == CaptureMode.Online
+        var mode = SelectedMode.Value;
+        if (mode == CaptureMode.Online
+            && SelectedOnlineSource.Value == OnlineCaptureSource.SystemOutput)
+        {
+            WarningText = string.Empty;
+            StatusText = "Audio del equipo listo para grabar";
+            NotifyAvailability();
+            return;
+        }
+
+        StatusText = mode == CaptureMode.Online
             ? "Buscando aplicaciones abiertas…"
             : "Buscando micrófonos…";
         WarningText = string.Empty;
         try
         {
-            var mode = SelectedMode.Value;
+            var previousSourceID = SelectedSource?.Id;
             var found = await Task.Run(() => mode == CaptureMode.Online
                     ? WindowsAudioCapture.EnumerateApplications()
                     : WindowsAudioCapture.EnumerateMicrophones())
@@ -313,7 +393,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 Sources.Add(source);
             }
 
-            SelectedSource = Sources.FirstOrDefault();
+            SelectedSource = Sources.FirstOrDefault(source => source.Id == previousSourceID)
+                ?? Sources.FirstOrDefault();
             StatusText = Sources.Count == 0
                 ? mode == CaptureMode.Online
                     ? "No hay aplicaciones con ventana abierta"
@@ -333,15 +414,121 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task StartAsync()
     {
-        if (!CanStart || SelectedSource is null)
+        if (pendingSystemOutputConsent is not null)
+        {
+            InvalidatePendingSystemOutputConsent();
+            return;
+        }
+
+        if (!CanStart)
         {
             WarningText = "Completa la materia y selecciona una fuente de audio.";
             return;
         }
 
+        var mode = SelectedMode.Value;
+        var onlineSource = SelectedOnlineSource.Value;
+        var captureScope = mode == CaptureMode.Online
+            ? onlineSource == OnlineCaptureSource.SystemOutput
+                ? CaptureScope.SystemOutput
+                : CaptureScope.Application
+            : CaptureScope.Microphone;
+        var source = captureScope == CaptureScope.SystemOutput
+            ? new AudioSourceOption(AudioSourceKind.SystemOutput, "system-output", "Audio del equipo")
+            : SelectedSource;
+        if (source is null)
+        {
+            WarningText = "Completa la materia y selecciona una fuente de audio.";
+            return;
+        }
+
+        var subjectSnapshot = Subject.Trim();
+        var vocabularySnapshot = Vocabulary.Trim();
+        var languageSnapshot = SelectedLanguage.Code;
+        var attempt = BeginAttempt(Guid.NewGuid());
+        if (captureScope == CaptureScope.SystemOutput)
+        {
+            var request = new SystemOutputConsentRequest(
+                Guid.NewGuid(),
+                attempt,
+                subjectSnapshot);
+            pendingSystemOutputConsent = request;
+            NotifyAvailability();
+            bool accepted;
+            try
+            {
+                accepted = systemOutputConsentPrompt();
+            }
+            catch
+            {
+                InvalidatePendingSystemOutputConsent();
+                throw;
+            }
+            if (pendingSystemOutputConsent != request)
+            {
+                return;
+            }
+
+            pendingSystemOutputConsent = null;
+            OnPropertyChanged(nameof(PendingSystemOutputConsent));
+            NotifyAvailability();
+            if (!accepted)
+            {
+                InvalidateAttempt(attempt);
+                StatusText = "Captura del audio del equipo cancelada.";
+                return;
+            }
+
+            if (!IsCurrent(attempt)
+                || SelectedMode.Value != mode
+                || SelectedOnlineSource.Value != onlineSource
+                || Subject.Trim() != subjectSnapshot)
+            {
+                InvalidateAttempt(attempt);
+                return;
+            }
+
+            var authorization = audioCapture.IssueSystemOutputAuthorizationAfterExplicitUserConsent(attempt);
+            await StartAttemptAsync(
+                    source,
+                    attempt,
+                    mode,
+                    captureScope,
+                    subjectSnapshot,
+                    vocabularySnapshot,
+                    languageSnapshot,
+                    authorization)
+                .ConfigureAwait(true);
+            return;
+        }
+
+        await StartAttemptAsync(
+                source,
+                attempt,
+                mode,
+                captureScope,
+                subjectSnapshot,
+                vocabularySnapshot,
+                languageSnapshot,
+                systemOutputAuthorization: null)
+            .ConfigureAwait(true);
+    }
+
+    private async Task StartAttemptAsync(
+        AudioSourceOption source,
+        SessionAttemptID attempt,
+        CaptureMode mode,
+        CaptureScope captureScope,
+        string subjectSnapshot,
+        string vocabularySnapshot,
+        string languageSnapshot,
+        SystemOutputCaptureAuthorization? systemOutputAuthorization)
+    {
         var operation = BeginOperation();
         IsBusy = true;
         WarningText = string.Empty;
+        captureRecoverySuggestion = null;
+        OnPropertyChanged(nameof(ShowSystemOutputRecovery));
         ModelProgress = 0;
         segments.Clear();
         Speakers.Clear();
@@ -356,34 +543,29 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         NotifyAvailability();
         var cancellationToken = processingCancellation.Token;
         var startedAt = DateTimeOffset.Now;
-        var sessionID = Guid.NewGuid();
-        var attempt = BeginAttempt(sessionID);
+        var sessionID = attempt.SessionID;
         SignalState = CaptureSignalState.AwaitingCallbacks;
         lastPresentedCaptureSignalState = null;
         RegisterCaptureCallbacks(attempt);
         var captureStarted = false;
+        var captureStartInvoked = false;
         asrOriginalReference = null;
         activeDiarizationProposal = null;
         activeHumanCorrectionOverlay = null;
 
         try
         {
-            currentFolder = sessionStore.CreateFolder(Subject.Trim(), startedAt);
+            currentFolder = sessionStore.CreateFolder(subjectSnapshot, startedAt);
             currentMetadata = new ClassMetadata
             {
                 Id = sessionID,
-                Subject = Subject.Trim(),
+                Subject = subjectSnapshot,
                 StartedAt = startedAt,
-                Mode = SelectedMode.Value,
-                CaptureScope = SelectedSource.Kind switch
-                {
-                    AudioSourceKind.Process => CaptureScope.Application,
-                    AudioSourceKind.SystemOutput => CaptureScope.SystemOutput,
-                    _ => CaptureScope.Microphone,
-                },
-                Source = SelectedSource.DisplayName,
-                TechnicalVocabulary = Vocabulary.Trim(),
-                Language = SelectedLanguage.Code,
+                Mode = mode,
+                CaptureScope = captureScope,
+                Source = source.DisplayName,
+                TechnicalVocabulary = vocabularySnapshot,
+                Language = languageSnapshot,
                 State = ProcessingState.StartingCapture,
                 SessionPhase = ClassScribe.Core.SessionPhase.Starting,
                 CapturePhase = ClassScribe.Core.CapturePhase.Connecting,
@@ -400,7 +582,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
 
             StatusText = "Esperando el primer callback de audio…";
-            await audioCapture.StartAsync(SelectedSource, currentFolder, attempt, cancellationToken).ConfigureAwait(true);
+            captureStartInvoked = true;
+            await audioCapture.StartAsync(
+                    source,
+                    currentFolder,
+                    attempt,
+                    cancellationToken,
+                    systemOutputAuthorization)
+                .ConfigureAwait(true);
             captureStarted = true;
             if (!IsCurrent(attempt))
             {
@@ -449,6 +638,13 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
+            if (captureStartInvoked
+                && captureScope == CaptureScope.Application
+                && audioCapture.LastStartFailureCategory == CaptureFailureCategory.Source)
+            {
+                captureRecoverySuggestion = CaptureRecoverySuggestion.SystemOutput;
+                OnPropertyChanged(nameof(ShowSystemOutputRecovery));
+            }
             WarningText = error.Message;
             StatusText = "No se pudo iniciar la grabación";
             await MarkCurrentStateAsync(ProcessingState.Failed, attempt).ConfigureAwait(true);
@@ -465,6 +661,10 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
             finally
             {
+                if (!captureStarted && systemOutputAuthorization is not null)
+                {
+                    audioCapture.InvalidateSystemOutputAuthorization(attempt);
+                }
                 if (!captureStarted)
                 {
                     UnregisterCaptureCallbacks(attempt);
@@ -632,12 +832,25 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public void CancelCurrentOperation()
     {
+        if (pendingSystemOutputConsent is not null)
+        {
+            InvalidatePendingSystemOutputConsent();
+            StatusText = "Captura del audio del equipo cancelada.";
+            return;
+        }
+
         processingCancellation?.Cancel();
         StatusText = "Cancelando de forma segura…";
     }
 
     public async Task LoadSelectedHistoryAsync()
     {
+        if (pendingSystemOutputConsent is not null)
+        {
+            InvalidatePendingSystemOutputConsent();
+            return;
+        }
+
         if (SelectedHistory is null || IsRecording || IsBusy)
         {
             return;
@@ -648,6 +861,12 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task ReprocessCurrentAsync()
     {
+        if (pendingSystemOutputConsent is not null)
+        {
+            InvalidatePendingSystemOutputConsent();
+            return;
+        }
+
         if (!CanReprocess || currentFolder is null || currentMetadata is null)
         {
             WarningText = "Esta sesión no conserva audio suficiente para reprocesar.";
@@ -881,6 +1100,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         disposed = true;
+        InvalidatePendingSystemOutputConsent();
         liveCancellation?.Cancel();
         timerCancellation?.Cancel();
         processingCancellation?.Cancel();
@@ -1308,6 +1528,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 ?? Languages[0];
             SelectedMode = CaptureModes.FirstOrDefault(mode => mode.Value == summary.Metadata.Mode)
                 ?? CaptureModes[0];
+            SelectedOnlineSource = OnlineSourceChoices.FirstOrDefault(source =>
+                    source.Value == (summary.Metadata.CaptureScope == CaptureScope.SystemOutput
+                        ? OnlineCaptureSource.SystemOutput
+                        : OnlineCaptureSource.Application))
+                ?? OnlineSourceChoices[0];
 
             var loadedSegments = await ReadJsonAsync<TranscriptSegment[]>(
                     Path.Combine(summary.Folder, "all-speakers.json"))
@@ -1353,6 +1578,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
             SelectedProfessor = Speakers.FirstOrDefault(speaker =>
                 speaker.Id == summary.Metadata.ProfessorSpeakerID);
+            captureRecoverySuggestion = null;
+            OnPropertyChanged(nameof(ShowSystemOutputRecovery));
             WarningText = summary.RecoveryReason ?? string.Empty;
             StatusText = summary.IsRecoverable ? "Sesión recuperable abierta" : "Sesión abierta";
             ElapsedText = Timecode.Display(summary.Metadata.Duration);
@@ -1543,7 +1770,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
             lease.TryAccept(() => RunOnUi(() => lease.TryAccept(() => ApplyCaptureSignal(snapshot, eventAttempt))));
         };
-        Action<SessionAttemptID, Exception> faultHandler = (eventAttempt, error) =>
+        Action<SessionAttemptID, CaptureFault> faultHandler = (eventAttempt, fault) =>
         {
             if (eventAttempt != lease.Attempt)
             {
@@ -1552,7 +1779,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
             lease.TryAccept(() => RunOnUi(() => lease.TryAccept(() =>
             {
-                WarningText = $"La fuente de audio se interrumpió: {error.Message}";
+                if (fault.Category == CaptureFailureCategory.Source
+                    && currentMetadata?.CaptureScope == CaptureScope.Application)
+                {
+                    captureRecoverySuggestion = CaptureRecoverySuggestion.SystemOutput;
+                    OnPropertyChanged(nameof(ShowSystemOutputRecovery));
+                }
+
+                WarningText = $"La fuente de audio se interrumpió: {fault.Error.Message}";
                 StatusText = "Detén la sesión para validar y recuperar el audio recibido";
             })));
         };
@@ -1603,6 +1837,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanPause));
         OnPropertyChanged(nameof(CanCancel));
         OnPropertyChanged(nameof(CanReprocess));
+        OnPropertyChanged(nameof(PendingSystemOutputConsent));
+        OnPropertyChanged(nameof(ShowSystemOutputRecovery));
     }
 
     private TaskCompletionSource BeginOperation()
@@ -1631,11 +1867,58 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CurrentStartedAt));
     }
 
+    private void NotifySourcePresentation()
+    {
+        OnPropertyChanged(nameof(IsOnline));
+        OnPropertyChanged(nameof(IsInPerson));
+        OnPropertyChanged(nameof(IsApplicationSource));
+        OnPropertyChanged(nameof(IsSystemOutputSource));
+    }
+
     private SessionAttemptID BeginAttempt(Guid sessionID)
     {
+        if (activeAttempt is { } previousAttempt)
+        {
+            audioCapture.InvalidateSystemOutputAuthorization(previousAttempt);
+        }
+
         var attempt = SessionAttemptID.Create(sessionID, ++attemptGeneration);
         activeAttempt = attempt;
         return attempt;
+    }
+
+    private void InvalidateAttempt(SessionAttemptID attempt)
+    {
+        audioCapture.InvalidateSystemOutputAuthorization(attempt);
+        if (activeAttempt == attempt)
+        {
+            activeAttempt = null;
+            NotifyAvailability();
+        }
+    }
+
+    private void InvalidatePendingSystemOutputConsent()
+    {
+        if (pendingSystemOutputConsent is not { } request)
+        {
+            return;
+        }
+
+        pendingSystemOutputConsent = null;
+        OnPropertyChanged(nameof(PendingSystemOutputConsent));
+        InvalidateAttempt(request.Attempt);
+    }
+
+    public void SelectSystemOutputAfterApplicationFailure()
+    {
+        if (!ShowSystemOutputRecovery)
+        {
+            return;
+        }
+
+        SelectedOnlineSource = OnlineSourceChoices.First(choice =>
+            choice.Value == OnlineCaptureSource.SystemOutput);
+        StatusText = "Audio del equipo seleccionado. Presiona Iniciar grabación para continuar.";
     }
 
     private bool IsCurrent(SessionAttemptID? attempt) =>

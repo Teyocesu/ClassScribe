@@ -34,6 +34,25 @@ struct RetryAudioPreparation: Sendable, Equatable {
 
 typealias RetryAudioPreparer = @Sendable (URL, URL) async throws -> RetryAudioPreparation
 
+struct CaptureStartRequest {
+    var attempt: SessionAttemptID
+    var mode: CaptureMode
+    var captureScope: CaptureScope
+    var application: RunningApplication?
+    var microphone: MicrophoneOption?
+    var folder: URL
+    var systemOutputAuthorization: SystemOutputCaptureAuthorization?
+}
+
+typealias CaptureStartOverride = @MainActor (CaptureStartRequest) async throws -> URL
+
+struct SystemOutputConsentRequest: Identifiable, Equatable {
+    let id: UUID
+    let attempt: SessionAttemptID
+    let subject: String
+    let source: OnlineCaptureSource
+}
+
 private func prepareRetryAudio(audioURL: URL, rawURL: URL) async throws -> RetryAudioPreparation {
     try await Task.detached(priority: .userInitiated) {
         do {
@@ -51,10 +70,28 @@ private func prepareRetryAudio(audioURL: URL, rawURL: URL) async throws -> Retry
 @MainActor
 @Observable
 final class ClassScribeModel {
-    var mode: CaptureMode = .online
+    var mode: CaptureMode = .online {
+        didSet {
+            guard oldValue != mode else { return }
+            captureRecoverySuggestion = nil
+            invalidatePendingSystemOutputConsent()
+        }
+    }
     var language: TranscriptionLanguage = .spanish
-    var subject = ""
+    var subject = "" {
+        didSet {
+            guard oldValue != subject else { return }
+            invalidatePendingSystemOutputConsent()
+        }
+    }
     var technicalVocabulary = ""
+    var onlineCaptureSource: OnlineCaptureSource = .application {
+        didSet {
+            guard oldValue != onlineCaptureSource else { return }
+            captureRecoverySuggestion = nil
+            invalidatePendingSystemOutputConsent()
+        }
+    }
     var selectedApplicationIdentityID: String?
     var selectedMicrophoneID: String?
     var selectedTab: TranscriptTab = .professor
@@ -79,6 +116,8 @@ final class ClassScribeModel {
     var editedAllText: String?
     var history: [SessionSummary] = []
     var errorMessage: String?
+    var pendingSystemOutputConsent: SystemOutputConsentRequest?
+    var captureRecoverySuggestion: CaptureRecoverySuggestion?
     var isCalibrating = false
     var calibrationSecondsRemaining = 0
     private(set) var isStopping = false
@@ -89,6 +128,7 @@ final class ClassScribeModel {
     private let store: SessionStore
     private let finalProcessor: any FinalProcessingProviding
     private let retryAudioPreparer: RetryAudioPreparer
+    private let captureStartOverride: CaptureStartOverride?
     private let liveTaskStopGrace: TimeInterval
     private var classFolder: URL?
     private var startedAt: Date?
@@ -118,6 +158,7 @@ final class ClassScribeModel {
         finalProcessor injectedFinalProcessor: (any FinalProcessingProviding)? = nil,
         retryAudioPreparer: @escaping RetryAudioPreparer = prepareRetryAudio,
         liveTaskStopGrace: TimeInterval = 3,
+        captureStartOverride: CaptureStartOverride? = nil,
     ) {
         let parakeet = injectedParakeet ?? ParakeetService()
         self.parakeet = parakeet
@@ -125,6 +166,7 @@ final class ClassScribeModel {
         finalProcessor = injectedFinalProcessor ?? FinalProcessor(parakeet: parakeet)
         self.retryAudioPreparer = retryAudioPreparer
         self.liveTaskStopGrace = max(0, liveTaskStopGrace)
+        self.captureStartOverride = captureStartOverride
         capture = injectedCapture ?? CaptureController()
         capture.refreshSources()
         history = store.history()
@@ -143,9 +185,19 @@ final class ClassScribeModel {
     }
 
     var canStart: Bool {
-        !capture.isBusy && !isStopping && !isRetrying && finalTask == nil
-            && !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && (mode == .online ? selectedApplication != nil : selectedMicrophone != nil)
+        guard !capture.isBusy,
+              !isStopping,
+              !isRetrying,
+              finalTask == nil,
+              pendingSystemOutputConsent == nil,
+              !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        return switch mode {
+        case .online:
+            onlineCaptureSource == .systemOutput || selectedApplication != nil
+        case .inPerson:
+            selectedMicrophone != nil
+        }
     }
 
     var isProcessing: Bool {
@@ -153,7 +205,7 @@ final class ClassScribeModel {
     }
 
     var isSessionBusy: Bool {
-        capture.isBusy || isStopping || isProcessing
+        capture.isBusy || isStopping || isProcessing || pendingSystemOutputConsent != nil
     }
 
     var selectedApplication: RunningApplication? {
@@ -165,7 +217,33 @@ final class ClassScribeModel {
     }
 
     var selectedSourceName: String {
-        mode == .online ? (selectedApplication?.name ?? "Sin aplicación") : (selectedMicrophone?.name ?? "Sin micrófono")
+        switch mode {
+        case .online where onlineCaptureSource == .systemOutput:
+            "Audio del equipo"
+        case .online:
+            selectedApplication?.name ?? "Sin aplicación"
+        case .inPerson:
+            selectedMicrophone?.name ?? "Sin micrófono"
+        }
+    }
+
+    var selectedCaptureScope: CaptureScope {
+        switch mode {
+        case .online where onlineCaptureSource == .systemOutput:
+            .systemOutput
+        case .online:
+            .application
+        case .inPerson:
+            .microphone
+        }
+    }
+
+    var canSelectSystemOutputAfterApplicationFailure: Bool {
+        captureRecoverySuggestion == .systemOutput
+            && mode == .online
+            && onlineCaptureSource == .application
+            && !isRecording
+            && !isSessionBusy
     }
 
     var professorSegments: [TranscriptSegment] {
@@ -290,9 +368,82 @@ final class ClassScribeModel {
     }
 
     func startClass() async {
+        if pendingSystemOutputConsent != nil {
+            invalidatePendingSystemOutputConsent()
+            return
+        }
         guard canStart else { return }
         cancelCalibration()
         guard flushEditedLiveText() else { return }
+
+        let sessionID = UUID()
+        let attemptID = generationGate.begin(sessionID: sessionID)
+        if selectedCaptureScope == .systemOutput {
+            pendingSystemOutputConsent = SystemOutputConsentRequest(
+                id: UUID(),
+                attempt: attemptID,
+                subject: subject,
+                source: onlineCaptureSource,
+            )
+            statusDetail = "Confirma el alcance de captura para iniciar el audio del equipo."
+            return
+        }
+
+        await performStart(
+            sessionID: sessionID,
+            attemptID: attemptID,
+            systemOutputAuthorization: nil,
+        )
+    }
+
+    func confirmSystemOutputConsent(_ request: SystemOutputConsentRequest) async {
+        guard pendingSystemOutputConsent == request,
+              generationGate.accepts(request.attempt),
+              mode == .online,
+              onlineCaptureSource == .systemOutput,
+              subject == request.subject
+        else { return }
+
+        pendingSystemOutputConsent = nil
+        let authorization = capture.issueSystemOutputAuthorizationAfterExplicitUserConsent(
+            for: request.attempt,
+        )
+        await performStart(
+            sessionID: request.attempt.sessionID,
+            attemptID: request.attempt,
+            systemOutputAuthorization: authorization,
+        )
+    }
+
+    func cancelSystemOutputConsent(_ request: SystemOutputConsentRequest) {
+        guard pendingSystemOutputConsent == request else { return }
+        pendingSystemOutputConsent = nil
+        capture.invalidateSystemOutputAuthorization(for: request.attempt)
+        generationGate.invalidate(request.attempt)
+        statusDetail = "Captura del audio del equipo cancelada."
+    }
+
+    func selectSystemOutputAfterApplicationFailure() {
+        guard canSelectSystemOutputAfterApplicationFailure else { return }
+        onlineCaptureSource = .systemOutput
+        statusDetail = "Audio del equipo seleccionado. Presiona Iniciar grabación para continuar."
+    }
+
+    private func performStart(
+        sessionID: UUID,
+        attemptID: SessionAttemptID,
+        systemOutputAuthorization: SystemOutputCaptureAuthorization?,
+    ) async {
+        let now = Date()
+        let modeSnapshot = mode
+        let captureScopeSnapshot = selectedCaptureScope
+        let applicationSnapshot = captureScopeSnapshot == .application ? selectedApplication : nil
+        let microphoneSnapshot = captureScopeSnapshot == .microphone ? selectedMicrophone : nil
+        let sourceSnapshot = selectedSourceName
+        let subjectSnapshot = subject
+        let languageSnapshot = language
+        let technicalVocabularySnapshot = technicalVocabulary
+        captureRecoverySuggestion = nil
         errorMessage = nil
         liveTranscriptionError = nil
         finalReplacedLive = false
@@ -313,14 +464,18 @@ final class ClassScribeModel {
         selectedTab = .professor
         accumulator = LiveTranscriptAccumulator()
         liveEditReconciler.reset()
-        let now = Date()
-        let sessionID = UUID()
-        let attemptID = generationGate.begin(sessionID: sessionID)
         asrOriginalReference = nil
         activeDiarizationProposal = nil
         var startedSession: ClassSessionContext?
+        var captureStartInvoked = false
+        var captureStartCompleted = false
+        defer {
+            if !captureStartCompleted, systemOutputAuthorization != nil {
+                capture.invalidateSystemOutputAuthorization(for: attemptID)
+            }
+        }
         do {
-            let folder = try store.createFolder(subject: subject, date: now)
+            let folder = try store.createFolder(subject: subjectSnapshot, date: now)
             classFolder = folder
             startedAt = now
             technicalVocabularyURL = try makeVocabularyFile(in: folder)
@@ -328,13 +483,13 @@ final class ClassScribeModel {
                 id: sessionID,
                 attemptID: attemptID,
                 folder: folder,
-                subject: subject,
+                subject: subjectSnapshot,
                 startedAt: now,
-                mode: mode,
-                captureScope: mode.captureScope,
-                source: selectedSourceName,
-                language: language,
-                technicalVocabulary: technicalVocabulary,
+                mode: modeSnapshot,
+                captureScope: captureScopeSnapshot,
+                source: sourceSnapshot,
+                language: languageSnapshot,
+                technicalVocabulary: technicalVocabularySnapshot,
                 technicalVocabularyURL: technicalVocabularyURL,
             )
             startedSession = session
@@ -343,19 +498,29 @@ final class ClassScribeModel {
             sessionPhase = .starting
             capturePhase = .connecting
             asrPhase = .idle
-            statusDetail = mode == .inPerson
-                ? "Esperando el primer callback de audio antes de iniciar el contador."
-                : "Iniciando la captura de audio de la aplicación seleccionada."
+            statusDetail = switch captureScopeSnapshot {
+            case .microphone:
+                "Esperando el primer callback de audio antes de iniciar el contador."
+            case .application:
+                "Iniciando la captura de audio de la aplicación seleccionada."
+            case .systemOutput:
+                "Iniciando la captura de todo el audio que sale por tu equipo."
+            }
             try checkpointLive("session-created", session: session)
             try store.saveMetadata(metadata(session: session, state: .startingCapture), folder: folder)
-            _ = try await capture.start(
-                attempt: session.attemptID,
-                mode: mode,
-                captureScope: session.captureScope,
-                application: selectedApplication,
-                microphone: selectedMicrophone,
-                folder: folder,
+            captureStartInvoked = true
+            _ = try await startCapture(
+                CaptureStartRequest(
+                    attempt: session.attemptID,
+                    mode: modeSnapshot,
+                    captureScope: session.captureScope,
+                    application: applicationSnapshot,
+                    microphone: microphoneSnapshot,
+                    folder: folder,
+                    systemOutputAuthorization: systemOutputAuthorization,
+                ),
             )
+            captureStartCompleted = true
             guard isCurrent(session) else { return }
             state = .recording
             sessionPhase = .recording
@@ -384,6 +549,12 @@ final class ClassScribeModel {
                 finishCancelledStartCleanup(session)
                 return
             }
+            if captureStartInvoked,
+               session.captureScope == .application,
+               Self.isApplicationCaptureFailure(error)
+            {
+                captureRecoverySuggestion = .systemOutput
+            }
             state = .failed
             sessionPhase = .failed
             capturePhase = .failedTerminal
@@ -391,6 +562,36 @@ final class ClassScribeModel {
             errorMessage = error.localizedDescription
             statusDetail = error.localizedDescription
             persistCurrentState(checkpoint: "start-failed")
+        }
+    }
+
+    private func startCapture(_ request: CaptureStartRequest) async throws -> URL {
+        if let captureStartOverride {
+            return try await captureStartOverride(request)
+        }
+        return try await capture.start(
+            attempt: request.attempt,
+            mode: request.mode,
+            captureScope: request.captureScope,
+            application: request.application,
+            microphone: request.microphone,
+            folder: request.folder,
+            systemOutputAuthorization: request.systemOutputAuthorization,
+        )
+    }
+
+    private static func isApplicationCaptureFailure(_ error: Error) -> Bool {
+        guard let captureError = error as? CaptureError else { return false }
+        return switch captureError {
+        case .noProcesses,
+             .applicationIdentityAmbiguous,
+             .applicationIdentityUnsupported,
+             .applicationAudioUnavailable,
+             .applicationAudioStopped,
+             .captureCallbacksStalled:
+            true
+        default:
+            false
         }
     }
 
@@ -481,6 +682,10 @@ final class ClassScribeModel {
     }
 
     func cancelStart() {
+        if let request = pendingSystemOutputConsent {
+            cancelSystemOutputConsent(request)
+            return
+        }
         guard capture.isStarting, let session = activeSession, isCurrent(session) else { return }
         generationGate.invalidate()
         capture.cancelStart(for: session.attemptID)
@@ -757,6 +962,7 @@ final class ClassScribeModel {
         startedAt = metadata.startedAt
         subject = metadata.subject
         mode = metadata.mode
+        onlineCaptureSource = metadata.captureScope == .systemOutput ? .systemOutput : .application
         language = metadata.language ?? .spanish
         let restoredAttemptID = generationGate.begin(sessionID: metadata.id)
         sessionPhase = metadata.sessionPhase
@@ -796,6 +1002,7 @@ final class ClassScribeModel {
             ? "Sesión recuperable cargada. El audio y el mejor texto disponible permanecen intactos."
             : "Sesión del historial cargada."
         errorMessage = summary.recoveryReason
+        captureRecoverySuggestion = nil
         let vocabularyURL = summary.folder.appendingPathComponent("technical-vocabulary.txt")
         activeSession = ClassSessionContext(
             id: metadata.id,
@@ -921,7 +1128,7 @@ final class ClassScribeModel {
         }
     }
 
-    private func failActiveCapture(_ message: String) async {
+    private func failActiveCapture(_ failure: CaptureTerminalFailure) async {
         guard !isStopping, let session = activeSession else { return }
         isStopping = true
         cancelCalibration()
@@ -955,14 +1162,16 @@ final class ClassScribeModel {
             sessionPhase = .recoverable
             capturePhase = .failedRecoverable
             asrPhase = .failedRecoverable
-            errorMessage = message
+            errorMessage = failure.message
+            captureRecoverySuggestion = failure.recoverySuggestion
             statusDetail = "La captura se detuvo, pero el audio se conservó y puede reprocesarse."
         case let .failure(validationError):
             state = .failed
             sessionPhase = .failed
             capturePhase = .failedTerminal
             asrPhase = .failedRecoverable
-            errorMessage = "\(message) El audio no pudo validarse: \(validationError.localizedDescription)"
+            errorMessage = "\(failure.message) El audio no pudo validarse: \(validationError.localizedDescription)"
+            captureRecoverySuggestion = failure.recoverySuggestion
             statusDetail = "La captura se detuvo y el audio quedó conservado para diagnóstico."
         }
         persistCurrentState(checkpoint: "capture-failed", session: session)
@@ -1531,6 +1740,13 @@ final class ClassScribeModel {
 
     private func cancelCalibration() {
         calibrationTask?.cancel()
+    }
+
+    private func invalidatePendingSystemOutputConsent() {
+        guard let request = pendingSystemOutputConsent else { return }
+        pendingSystemOutputConsent = nil
+        capture.invalidateSystemOutputAuthorization(for: request.attempt)
+        generationGate.invalidate(request.attempt)
     }
 }
 

@@ -7,7 +7,7 @@ func systemOutputAuthorizationIsBoundToOneAttemptAndInvalidates() {
     let authority = SystemOutputCaptureAuthorizationAuthority()
     let firstAttempt = SessionAttemptID(generation: 1)
     let secondAttempt = SessionAttemptID(generation: 2)
-    let authorization = authority.issueForTesting(for: firstAttempt)
+    let authorization = authority.issueAfterExplicitUserConsent(for: firstAttempt)
 
     #expect(authority.accepts(authorization, for: firstAttempt))
     #expect(!authority.accepts(authorization, for: secondAttempt))
@@ -15,7 +15,7 @@ func systemOutputAuthorizationIsBoundToOneAttemptAndInvalidates() {
     authority.invalidate(firstAttempt)
     #expect(!authority.accepts(authorization, for: firstAttempt))
 
-    let replacement = authority.issueForTesting(for: firstAttempt)
+    let replacement = authority.issueAfterExplicitUserConsent(for: firstAttempt)
     #expect(!authority.accepts(authorization, for: firstAttempt))
     #expect(authority.accepts(replacement, for: firstAttempt))
 }

@@ -7,6 +7,31 @@ enum CaptureMode: String, Codable, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// Online capture has two explicit sources while the durable capture mode
+/// remains only `online` or `inPerson`.
+enum OnlineCaptureSource: CaseIterable, Hashable, Identifiable, Sendable {
+    case application
+    case systemOutput
+
+    var id: Self { self }
+
+    var displayName: String {
+        switch self {
+        case .application: "Una aplicación"
+        case .systemOutput: "Audio del equipo"
+        }
+    }
+}
+
+enum CaptureRecoverySuggestion: Equatable, Sendable {
+    case systemOutput
+}
+
+struct CaptureTerminalFailure: Equatable, Sendable {
+    var message: String
+    var recoverySuggestion: CaptureRecoverySuggestion?
+}
+
 enum TranscriptionLanguage: String, Codable, CaseIterable, Identifiable, Sendable {
     case spanish = "es"
     case english = "en"

@@ -479,7 +479,7 @@ final class CaptureController {
     private var levelTimer: Timer?
     private var rawOnlineURL: URL?
     private var sourceWAVURL: URL?
-    private var terminalCaptureFailure: String?
+    private var terminalCaptureFailure: CaptureTerminalFailure?
     private var completedStop: Result<CaptureStopResult, CaptureError>?
     private var stopTask: Task<Result<CaptureStopResult, CaptureError>, Never>?
     private var liveBufferContinuation: AsyncStream<LiveAudioBuffer>.Continuation?
@@ -552,6 +552,17 @@ final class CaptureController {
         microphones = discovery.devices.map {
             MicrophoneOption(id: $0.uniqueID, name: $0.localizedName)
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    // Focused model tests can inject the same source shapes that the product
+    // discovery path publishes without replacing the capture controller.
+    @MainActor
+    func setSourcesForTesting(
+        applications: [RunningApplication],
+        microphones: [MicrophoneOption],
+    ) {
+        self.applications = applications
+        self.microphones = microphones
     }
 
     func start(
@@ -1103,18 +1114,22 @@ final class CaptureController {
         _ = try? await stop()
     }
 
-    func takeTerminalFailure() -> String? {
+    func takeTerminalFailure() -> CaptureTerminalFailure? {
         defer { terminalCaptureFailure = nil }
         return terminalCaptureFailure
     }
 
-    /// 2C.1 test seam for the future consent modal. Production UI does not
-    /// expose system-output selection yet; the returned capability remains
-    /// bound to this controller and exactly one attempt.
-    func issueSystemOutputAuthorizationForTest(
+    /// Issues a capability only after the product consent modal has received
+    /// an affirmative action. The capability remains bound to this controller
+    /// and exactly one attempt.
+    func issueSystemOutputAuthorizationAfterExplicitUserConsent(
         for attempt: SessionAttemptID,
     ) -> SystemOutputCaptureAuthorization {
-        systemOutputAuthorizationAuthority.issueForTesting(for: attempt)
+        systemOutputAuthorizationAuthority.issueAfterExplicitUserConsent(for: attempt)
+    }
+
+    func invalidateSystemOutputAuthorization(for attempt: SessionAttemptID) {
+        systemOutputAuthorizationAuthority.invalidate(attempt)
     }
 
     // Product lifecycle seam used by focused tests. It prepares the same
@@ -1244,7 +1259,10 @@ final class CaptureController {
                           self.attemptGate.accepts(attempt)
                     else { return }
                     if let terminalErrorMessage = snapshot.terminalErrorMessage {
-                        self.reportTerminalFailure(terminalErrorMessage)
+                        self.reportTerminalFailure(
+                            terminalErrorMessage,
+                            recoverySuggestion: .systemOutput,
+                        )
                         return
                     }
                     self.levelDBFS = snapshot.levelDBFS
@@ -1255,7 +1273,10 @@ final class CaptureController {
                           self.attemptGate.accepts(attempt)
                     else { return }
                     if let terminalErrorMessage = snapshot.terminalErrorMessage {
-                        self.reportTerminalFailure(terminalErrorMessage)
+                        self.reportTerminalFailure(
+                            terminalErrorMessage,
+                            recoverySuggestion: .systemOutput,
+                        )
                         return
                     }
                     self.levelDBFS = snapshot.levelDBFS
@@ -1367,7 +1388,10 @@ final class CaptureController {
                     } else if signalState == .noCallbacks,
                               let deadline = self.onlineRecoveryDeadline,
                               ProcessInfo.processInfo.systemUptime >= deadline {
-                        self.reportTerminalFailure(CaptureError.captureCallbacksStalled.localizedDescription)
+                    self.reportTerminalFailure(
+                        CaptureError.captureCallbacksStalled.localizedDescription,
+                        recoverySuggestion: .systemOutput,
+                    )
                     }
                 }
             } catch {
@@ -1378,7 +1402,10 @@ final class CaptureController {
                 if signalState == .noCallbacks,
                    let deadline = self.onlineRecoveryDeadline,
                    ProcessInfo.processInfo.systemUptime >= deadline {
-                    self.reportTerminalFailure(CaptureError.applicationAudioStopped.localizedDescription)
+                    self.reportTerminalFailure(
+                        CaptureError.applicationAudioStopped.localizedDescription,
+                        recoverySuggestion: .systemOutput,
+                    )
                 }
             }
         }
@@ -1664,7 +1691,10 @@ final class CaptureController {
                 else { return }
                 self.onlineRebindFailureCount += 1
                 if self.onlineRebindFailureCount >= 2 {
-                    self.reportTerminalFailure(CaptureError.applicationAudioUnavailable.localizedDescription)
+                    self.reportTerminalFailure(
+                        CaptureError.applicationAudioUnavailable.localizedDescription,
+                        recoverySuggestion: .systemOutput,
+                    )
                 }
             }
         }
@@ -1681,9 +1711,15 @@ final class CaptureController {
     /// `isCapturing` true until `abortPreservingAudio()` performs the same
     /// idempotent stop/finalization used by a normal user stop. Clearing the
     /// recording flag here would strand a valid partial WAV outside that path.
-    private func reportTerminalFailure(_ message: String) {
+    private func reportTerminalFailure(
+        _ message: String,
+        recoverySuggestion: CaptureRecoverySuggestion? = nil,
+    ) {
         guard terminalCaptureFailure == nil else { return }
-        terminalCaptureFailure = message
+        terminalCaptureFailure = CaptureTerminalFailure(
+            message: message,
+            recoverySuggestion: recoverySuggestion,
+        )
         levelTimer?.invalidate()
         levelTimer = nil
         levelDBFS = -120

@@ -94,13 +94,32 @@
                        Margin="5,2,5,4" Foreground="#777287" FontSize="12" TextWrapping="Wrap" />
 
             <TextBlock Style="{StaticResource SectionLabel}" Text="Fuente de audio" />
-            <DockPanel LastChildFill="True">
-              <Button DockPanel.Dock="Right" Content="Actualizar" Click="RefreshSources_Click"
-                      Padding="10,7" ToolTip="Volver a buscar aplicaciones o micrófonos" />
-              <ComboBox ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedSource}"
-                        DisplayMemberPath="DisplayName" MinWidth="225"
-                        automation:AutomationProperties.Name="Fuente de audio" />
-            </DockPanel>
+            <StackPanel Visibility="{Binding IsOnline, Converter={StaticResource BoolToVisibility}}">
+              <ComboBox ItemsSource="{Binding OnlineSourceChoices}" SelectedItem="{Binding SelectedOnlineSource}"
+                        DisplayMemberPath="Name"
+                        automation:AutomationProperties.Name="Fuente de audio online" />
+              <DockPanel LastChildFill="True" Margin="0,5,0,0"
+                         Visibility="{Binding IsApplicationSource, Converter={StaticResource BoolToVisibility}}">
+                <Button DockPanel.Dock="Right" Content="Actualizar" Click="RefreshSources_Click"
+                        Padding="10,7" ToolTip="Volver a buscar aplicaciones abiertas" />
+                <ComboBox ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedSource}"
+                          DisplayMemberPath="DisplayName" MinWidth="225"
+                          automation:AutomationProperties.Name="Aplicación de audio" />
+              </DockPanel>
+              <TextBlock Text="Captura todo el audio que sale por tu equipo."
+                         Visibility="{Binding IsSystemOutputSource, Converter={StaticResource BoolToVisibility}}"
+                         Margin="5,5,5,0" Foreground="#777287" FontSize="12" TextWrapping="Wrap"
+                         automation:AutomationProperties.Name="Captura todo el audio que sale por tu equipo" />
+            </StackPanel>
+            <StackPanel Visibility="{Binding IsInPerson, Converter={StaticResource BoolToVisibility}}">
+              <DockPanel LastChildFill="True">
+                <Button DockPanel.Dock="Right" Content="Actualizar" Click="RefreshSources_Click"
+                        Padding="10,7" ToolTip="Volver a buscar micrófonos" />
+                <ComboBox ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedSource}"
+                          DisplayMemberPath="DisplayName" MinWidth="225"
+                          automation:AutomationProperties.Name="Micrófono de audio" />
+              </DockPanel>
+            </StackPanel>
 
             <TextBlock Style="{StaticResource SectionLabel}" Text="Vocabulario técnico (opcional)" />
             <TextBox Text="{Binding Vocabulary, UpdateSourceTrigger=PropertyChanged}"
@@ -133,6 +152,12 @@
                     Visibility="{Binding HasWarning, Converter={StaticResource BoolToVisibility}}">
               <TextBlock Text="{Binding WarningText}" TextWrapping="Wrap" Foreground="#6A4B0B" />
             </Border>
+            <Button Content="Capturar audio del equipo"
+                    Visibility="{Binding ShowSystemOutputRecovery, Converter={StaticResource BoolToVisibility}}"
+                    IsEnabled="{Binding ShowSystemOutputRecovery}"
+                    Click="SelectSystemOutputRecovery_Click"
+                    automation:AutomationProperties.Name="Capturar audio del equipo"
+                    Margin="3,4,3,0" />
 
             <Separator Margin="3,15,3,10" />
             <TextBlock Text="Sesión actual" FontWeight="SemiBold" />

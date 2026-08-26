@@ -39,6 +39,11 @@ struct SessionGenerationGate: Sendable {
         activeAttempt = nil
     }
 
+    mutating func invalidate(_ attempt: SessionAttemptID) {
+        guard activeAttempt == attempt else { return }
+        invalidate()
+    }
+
     func accepts(_ attempt: SessionAttemptID) -> Bool {
         activeAttempt == attempt
     }

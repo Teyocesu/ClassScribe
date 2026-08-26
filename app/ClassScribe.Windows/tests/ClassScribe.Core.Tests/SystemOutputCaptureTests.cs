@@ -11,7 +11,7 @@ public sealed class SystemOutputCaptureTests
         var authority = new SystemOutputCaptureAuthorizationAuthority();
         var first = SessionAttemptID.Create(Guid.NewGuid(), 1);
         var second = SessionAttemptID.Create(first.SessionID, 2);
-        var authorization = authority.IssueForTesting(first);
+        var authorization = authority.IssueAfterExplicitUserConsent(first);
 
         Assert.IsTrue(authority.Accepts(authorization, first));
         Assert.IsFalse(authority.Accepts(authorization, second));
@@ -26,8 +26,8 @@ public sealed class SystemOutputCaptureTests
     {
         var authority = new SystemOutputCaptureAuthorizationAuthority();
         var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
-        var first = authority.IssueForTesting(attempt);
-        var second = authority.IssueForTesting(attempt);
+        var first = authority.IssueAfterExplicitUserConsent(attempt);
+        var second = authority.IssueAfterExplicitUserConsent(attempt);
 
         Assert.IsFalse(authority.Accepts(first, attempt));
         Assert.IsTrue(authority.Accepts(second, attempt));

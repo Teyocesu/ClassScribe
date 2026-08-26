@@ -13,9 +13,9 @@ final class SystemOutputCaptureAuthorization: @unchecked Sendable {
     }
 }
 
-/// In-memory authority for system-output consent. The only issuer in 2C.1 is
-/// the focused/test seam; 2C.2 will replace that seam with the real consent
-/// modal. A new authority is created per capture controller and nothing here
+/// In-memory authority for system-output consent. The only issuer is the
+/// explicit consent action in the product control-plane (and its deterministic
+/// tests). A new authority is created per capture controller and nothing here
 /// is persisted or shared across attempts.
 final class SystemOutputCaptureAuthorizationAuthority: @unchecked Sendable {
     private let lock = NSLock()
@@ -38,9 +38,10 @@ final class SystemOutputCaptureAuthorizationAuthority: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Internal-only seam for deterministic tests and the 2C.2 consent layer.
-    /// There is intentionally no Bool-based or persisted issuance path.
-    func issueForTesting(for attempt: SessionAttemptID) -> SystemOutputCaptureAuthorization {
+    /// Issues one in-memory capability only after the caller has completed the
+    /// explicit system-output consent action for this exact attempt. There is
+    /// intentionally no Bool-based or persisted issuance path.
+    func issueAfterExplicitUserConsent(for attempt: SessionAttemptID) -> SystemOutputCaptureAuthorization {
         let nonce = UUID()
         lock.lock()
         issuedNonces[attempt] = nonce

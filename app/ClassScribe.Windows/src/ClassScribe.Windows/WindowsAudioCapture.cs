@@ -59,7 +59,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
     public event Action<SessionAttemptID, CaptureSignalHealthSnapshot>? SignalHealthChanged;
 
-    public event Action<SessionAttemptID, Exception>? CaptureFaulted;
+    public event Action<SessionAttemptID, CaptureFault>? CaptureFaulted;
 
     internal WindowsAudioCapture(IWindowsAudioCaptureFactory? captureFactory = null)
     {
@@ -67,6 +67,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     }
 
     public string? LastWarning { get; private set; }
+
+    internal CaptureFailureCategory? LastStartFailureCategory { get; private set; }
 
     public bool IsRecording
     {
@@ -202,6 +204,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(attempt);
+        LastStartFailureCategory = null;
         if (source.Kind == AudioSourceKind.SystemOutput
             && !systemOutputAuthorizationAuthority.Accepts(systemOutputAuthorization, attempt))
         {
@@ -237,12 +240,17 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
 
         CaptureSourceGeneration sourceGeneration;
+        var resourcesInitialized = false;
         try
         {
             sourceGeneration = InitializeSessionResources(source, sessionFolder, attempt);
+            resourcesInitialized = true;
         }
-        catch
+        catch (Exception error)
         {
+            LastStartFailureCategory = error is OperationCanceledException
+                ? CaptureFailureCategory.Other
+                : CaptureFailureCategory.Storage;
             await AbortAsync().ConfigureAwait(false);
             throw;
         }
@@ -301,8 +309,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 sourceGeneration,
                 cancellationToken).ConfigureAwait(false);
         }
-        catch
+        catch (Exception error)
         {
+            LastStartFailureCategory = error is OperationCanceledException
+                ? CaptureFailureCategory.Other
+                : resourcesInitialized
+                    ? CaptureFailureCategory.Source
+                    : CaptureFailureCategory.Storage;
             try
             {
                 await AbortAsync().ConfigureAwait(false);
@@ -755,7 +768,9 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
         if (shouldPublish)
         {
-            CaptureFaulted?.Invoke(attempt, error);
+            CaptureFaulted?.Invoke(
+                attempt,
+                new CaptureFault(error, CaptureFailureCategory.Source));
         }
 
         TryStopRecorder();
@@ -804,7 +819,9 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         captureFailure ??= error;
         if (error is not null)
         {
-            CaptureFaulted?.Invoke(attempt, error);
+            CaptureFaulted?.Invoke(
+                attempt,
+                new CaptureFault(error, CaptureFailureCategory.Source));
         }
     }
 
@@ -1459,7 +1476,9 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 rebindFailureCount++;
                 if (rebindFailureCount >= 2)
                 {
-                    CaptureFaulted?.Invoke(attempt, error);
+                    CaptureFaulted?.Invoke(
+                        attempt,
+                        new CaptureFault(error, CaptureFailureCategory.Source));
                 }
             }
             return false;
@@ -1620,7 +1639,9 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 rebindFailureCount++;
                 if (rebindFailureCount >= 2)
                 {
-                    CaptureFaulted?.Invoke(attempt, error);
+                    CaptureFaulted?.Invoke(
+                        attempt,
+                        new CaptureFault(error, CaptureFailureCategory.Source));
                 }
             }
             return false;
@@ -1700,18 +1721,23 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 noCallbackReportedAttempt = attempt;
                 CaptureFaulted?.Invoke(
                     attempt,
-                    new IOException("Windows dejó de entregar callbacks de audio; el audio recibido se conserva."));
+                    new CaptureFault(
+                        new IOException("Windows dejó de entregar callbacks de audio; el audio recibido se conserva."),
+                        CaptureFailureCategory.Source));
             }
         }
 
         return snapshot;
     }
 
-    // 2C.1 seam for deterministic tests and the future consent modal. The
-    // normal Windows UI does not enumerate or select this source yet.
-    internal SystemOutputCaptureAuthorization IssueSystemOutputAuthorizationForTest(
+    // This is the only product issuance boundary. The UI calls it only after
+    // the explicit consent presenter returns an affirmative decision.
+    internal SystemOutputCaptureAuthorization IssueSystemOutputAuthorizationAfterExplicitUserConsent(
         SessionAttemptID attempt) =>
-        systemOutputAuthorizationAuthority.IssueForTesting(attempt);
+        systemOutputAuthorizationAuthority.IssueAfterExplicitUserConsent(attempt);
+
+    internal void InvalidateSystemOutputAuthorization(SessionAttemptID attempt) =>
+        systemOutputAuthorizationAuthority.Invalidate(attempt);
 
     // Product-path seams for deterministic Windows lifecycle tests. They call
     // the same endpoint observation and rebind implementation used by the

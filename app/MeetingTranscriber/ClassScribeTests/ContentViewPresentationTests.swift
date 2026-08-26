@@ -73,6 +73,15 @@ func captureStartGuidance() {
     )
     #expect(ready == .ready)
     #expect(ready.message == nil)
+
+    let readyForSystemOutput = CaptureStartGuidance.resolve(
+        subject: "Álgebra",
+        mode: .online,
+        hasSelectedSource: true,
+    )
+    #expect(readyForSystemOutput == .ready)
+    #expect(OnlineCaptureSource.application.displayName == "Una aplicación")
+    #expect(OnlineCaptureSource.systemOutput.displayName == "Audio del equipo")
 }
 
 @Test("El seguimiento en vivo distingue observación, edición y texto pendiente")

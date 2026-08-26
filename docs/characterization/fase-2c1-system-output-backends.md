@@ -5,8 +5,9 @@ Fecha: 2026-08-25
 Baseline correctivo final: `v0.8.0-development` = `524319e579e954fc374b07c95ab917f1bd53fe3c`
 Estado final: revisión independiente **APPROVED**; arquitectura/backend/lifecycle
 local **APPROVED**; Windows compile/runtime **SKIPPED — dotnet/csc unavailable**;
-gates físicos **PENDING**. Esto no implica release readiness completo; Fase 2C.2
-permanece **NOT STARTED**.
+gates físicos **PENDING**. Esto no implica release readiness completo; la UX de
+Fase 2C.2 se documenta separadamente en
+[`fase-2c2-system-output-consent.md`](fase-2c2-system-output-consent.md).
 
 ## Alcance
 
@@ -40,8 +41,9 @@ El árbol estaba limpio y `HEAD` coincidía con `origin/v0.8.0-development`.
 - no implementa `Codable`, no lee un `Bool` de metadata y no tiene “recordar para siempre”;
 - se comprueba en el boundary MainActor y nuevamente dentro del owner nativo.
 
-La única emisión en 2C.1 es el seam interno de tests/futura capa de consentimiento.
-Por eso una sesión histórica puede conservar `captureScope: systemOutput`, pero
+En el estado de 2C.1 la única emisión disponible era el seam interno de tests y
+la futura capa de consentimiento. La emisión productiva de 2C.2 está descrita en
+la caracterización separada. Por eso una sesión histórica puede conservar `captureScope: systemOutput`, pero
 esa metadata nunca autoriza una captura nueva.
 
 La ruta de fallo de aplicación, `noCallbacks`, silencio o error no llama a este
@@ -180,6 +182,6 @@ ClassScribe, cambio de default output y teardown sin callbacks posteriores — n
 se ejecutó en esta sesión. Tampoco se ejecutó el gate TCC ni el gate físico
 Windows. Estos estados son `SKIPPED/PENDING`, no PASS.
 
-Fase 2C.2 queda pendiente para conectar la UI de consentimiento explícito y el
-CTA. La fidelidad master source-rate/stereo frente al derivado ASR 16 kHz mono,
+La UI de consentimiento explícito y el CTA de Fase 2C.2 están descritos en la
+caracterización separada. La fidelidad master source-rate/stereo frente al derivado ASR 16 kHz mono,
 el contenedor largo RF64/W64 o segmentación también permanecen diferidos.

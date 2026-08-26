@@ -9,13 +9,15 @@ namespace ClassScribe.Windows;
 
 public partial class MainWindow : Window, IAsyncDisposable
 {
-    private readonly MainViewModel viewModel = new();
+    private readonly MainViewModel viewModel;
     private bool initialized;
     private bool closeReady;
 
     public MainWindow()
     {
         InitializeComponent();
+        viewModel = new MainViewModel(
+            systemOutputConsentPrompt: () => SystemOutputConsentDialog.Show(this));
         DataContext = viewModel;
     }
 
@@ -52,6 +54,9 @@ public partial class MainWindow : Window, IAsyncDisposable
     private void Pause_Click(object sender, RoutedEventArgs e) => viewModel.TogglePause();
 
     private void Cancel_Click(object sender, RoutedEventArgs e) => viewModel.CancelCurrentOperation();
+
+    private void SelectSystemOutputRecovery_Click(object sender, RoutedEventArgs e) =>
+        viewModel.SelectSystemOutputAfterApplicationFailure();
 
     private async void Reprocess_Click(object sender, RoutedEventArgs e) =>
         await RunUiActionAsync(viewModel.ReprocessCurrentAsync).ConfigureAwait(true);
@@ -202,5 +207,70 @@ public partial class MainWindow : Window, IAsyncDisposable
             CrashLog.Write(error);
             viewModel.ReportUiError(error);
         }
+    }
+}
+
+internal static class SystemOutputConsentDialog
+{
+    public static bool Show(Window owner)
+    {
+        var dialog = new Window
+        {
+            Owner = owner,
+            Title = "Capturar audio del equipo",
+            Width = 500,
+            SizeToContent = SizeToContent.Height,
+            ResizeMode = ResizeMode.NoResize,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            ShowInTaskbar = false,
+        };
+        var root = new System.Windows.Controls.StackPanel
+        {
+            Margin = new Thickness(24),
+        };
+        root.Children.Add(new System.Windows.Controls.TextBlock
+        {
+            Text = "ClassScribe capturará todo el audio que salga por el dispositivo de salida del equipo. "
+                + "Esto puede incluir otras aplicaciones, notificaciones y sonidos del sistema.\n\n"
+                + "El audio se procesa y guarda localmente en tu dispositivo.\n\n"
+                + "¿Quieres continuar?",
+            TextWrapping = TextWrapping.Wrap,
+            MaxWidth = 440,
+        });
+
+        var buttons = new System.Windows.Controls.StackPanel
+        {
+            Orientation = System.Windows.Controls.Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Margin = new Thickness(0, 22, 0, 0),
+        };
+        var accepted = false;
+        var confirm = new System.Windows.Controls.Button
+        {
+            Content = "Capturar audio del equipo",
+            IsDefault = true,
+            MinWidth = 180,
+            Margin = new Thickness(0, 0, 8, 0),
+            Padding = new Thickness(10, 6, 10, 6),
+        };
+        confirm.Click += (_, _) =>
+        {
+            accepted = true;
+            dialog.DialogResult = true;
+        };
+        var cancel = new System.Windows.Controls.Button
+        {
+            Content = "Cancelar",
+            IsCancel = true,
+            MinWidth = 90,
+            Padding = new Thickness(10, 6, 10, 6),
+        };
+        cancel.Click += (_, _) => dialog.DialogResult = false;
+        buttons.Children.Add(confirm);
+        buttons.Children.Add(cancel);
+        root.Children.Add(buttons);
+        dialog.Content = root;
+
+        return dialog.ShowDialog() == true && accepted;
     }
 }

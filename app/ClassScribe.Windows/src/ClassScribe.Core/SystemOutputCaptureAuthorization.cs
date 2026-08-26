@@ -23,10 +23,9 @@ public sealed class SystemOutputCaptureAuthorization
         Guid nonce) => new(attempt, nonce);
 }
 
-/// In-memory authority for system-output consent. 2C.1 exposes only an
-/// internal deterministic issuance seam; 2C.2 will call the same authority
-/// after its real consent modal. Nothing is persisted or shared across
-/// attempts.
+/// In-memory authority for system-output consent. The only issuer is the
+/// explicit consent action in the product control-plane (and its deterministic
+/// tests). Nothing is persisted or shared across attempts.
 public sealed class SystemOutputCaptureAuthorizationAuthority
 {
     private readonly object sync = new();
@@ -57,9 +56,10 @@ public sealed class SystemOutputCaptureAuthorizationAuthority
         }
     }
 
-    /// Internal-only seam for deterministic tests and the 2C.2 consent layer.
-    /// There is deliberately no Bool-based or persisted issuance path.
-    internal SystemOutputCaptureAuthorization IssueForTesting(SessionAttemptID attempt)
+    /// Issues one in-memory capability only after the caller has completed the
+    /// explicit system-output consent action for this exact attempt. There is
+    /// deliberately no Bool-based or persisted issuance path.
+    internal SystemOutputCaptureAuthorization IssueAfterExplicitUserConsent(SessionAttemptID attempt)
     {
         var nonce = Guid.NewGuid();
         lock (sync)

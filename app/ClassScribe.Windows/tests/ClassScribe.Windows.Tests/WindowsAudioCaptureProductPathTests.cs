@@ -179,7 +179,7 @@ public sealed class WindowsAudioCaptureProductPathTests
         var rebindTask = capture.ProbeSystemOutputForTestAsync(attempt);
         Assert.IsTrue(factory.BuildEntered.Wait(TimeSpan.FromSeconds(3)));
 
-        var authorization = capture.IssueSystemOutputAuthorizationForTest(secondAttempt);
+        var authorization = capture.IssueSystemOutputAuthorizationAfterExplicitUserConsent(secondAttempt);
         await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
             capture.StartAsync(
                 SystemSource(),
@@ -213,7 +213,7 @@ public sealed class WindowsAudioCaptureProductPathTests
         Assert.IsTrue(capture.IsRecording, "Session ownership must survive a source-less failed rebind.");
 
         await capture.StopAsync(CancellationToken.None);
-        var recoveryAuthorization = capture.IssueSystemOutputAuthorizationForTest(recoveryAttempt);
+        var recoveryAuthorization = capture.IssueSystemOutputAuthorizationAfterExplicitUserConsent(recoveryAttempt);
         await capture.StartAsync(
             SystemSource(),
             recoveryFolder,
@@ -319,7 +319,7 @@ public sealed class WindowsAudioCaptureProductPathTests
         var stop = capture.StopAsync(CancellationToken.None);
         await finalization.Entered.Task;
 
-        var authorization = capture.IssueSystemOutputAuthorizationForTest(secondAttempt);
+        var authorization = capture.IssueSystemOutputAuthorizationAfterExplicitUserConsent(secondAttempt);
         await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
             capture.StartAsync(
                 SystemSource(),
@@ -387,7 +387,7 @@ public sealed class WindowsAudioCaptureProductPathTests
         string folder,
         SessionAttemptID attempt)
     {
-        var authorization = capture.IssueSystemOutputAuthorizationForTest(attempt);
+        var authorization = capture.IssueSystemOutputAuthorizationAfterExplicitUserConsent(attempt);
         await capture.StartAsync(
             SystemSource(),
             folder,

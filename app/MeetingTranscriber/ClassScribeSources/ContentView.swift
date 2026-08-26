@@ -111,6 +111,28 @@ struct ContentView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .alert(item: $model.pendingSystemOutputConsent) { request in
+            Alert(
+                title: Text("Capturar audio del equipo"),
+                message: Text(
+                    "ClassScribe capturará todo el audio que salga por el dispositivo de salida del equipo. "
+                        + "Esto puede incluir otras aplicaciones, notificaciones y sonidos del sistema.\n\n"
+                        + "El audio se procesa y guarda localmente en tu dispositivo.\n\n"
+                        + "¿Quieres continuar?",
+                ),
+                primaryButton: .default(Text("Capturar audio del equipo")) {
+                    Task { await model.confirmSystemOutputConsent(request) }
+                },
+                secondaryButton: .cancel(Text("Cancelar")) {
+                    model.cancelSystemOutputConsent(request)
+                },
+            )
+        }
+        .onDisappear {
+            if let request = model.pendingSystemOutputConsent {
+                model.cancelSystemOutputConsent(request)
+            }
+        }
     }
 
     private var header: some View {
@@ -187,21 +209,53 @@ struct ContentView: View {
                 .frame(width: 105)
 
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(model.mode == .online ? "Aplicación" : "Micrófono")
-                        .font(.caption.bold())
-                        .foregroundStyle(.secondary)
-                    HStack(spacing: 6) {
-                        sourcePicker
-                        Button {
-                            model.refreshSources()
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
+                    if model.mode == .online {
+                        Text("Fuente online")
+                            .font(.caption.bold())
+                            .foregroundStyle(.secondary)
+                        Picker("Fuente online", selection: $model.onlineCaptureSource) {
+                            ForEach(OnlineCaptureSource.allCases) { source in
+                                Text(source.displayName).tag(source)
+                            }
                         }
-                        .help("Actualizar fuentes de audio")
-                        .accessibilityLabel("Actualizar fuentes de audio")
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .accessibilityLabel("Fuente de audio online")
+                        if model.onlineCaptureSource == .systemOutput {
+                            Text("Captura todo el audio que sale por tu equipo.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityLabel("Captura todo el audio que sale por tu equipo")
+                        } else {
+                            HStack(spacing: 6) {
+                                sourcePicker
+                                Button {
+                                    model.refreshSources()
+                                } label: {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                .help("Actualizar fuentes de audio")
+                                .accessibilityLabel("Actualizar fuentes de audio")
+                            }
+                        }
+                    } else {
+                        Text("Micrófono")
+                            .font(.caption.bold())
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 6) {
+                            sourcePicker
+                            Button {
+                                model.refreshSources()
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .help("Actualizar fuentes de audio")
+                            .accessibilityLabel("Actualizar fuentes de audio")
+                        }
                     }
-                    .disabled(model.isSessionBusy)
                 }
+                .disabled(model.isSessionBusy)
                 .frame(minWidth: 250, idealWidth: 300)
 
                 Spacer(minLength: 0)
@@ -273,7 +327,7 @@ struct ContentView: View {
             subject: model.subject,
             mode: model.mode,
             hasSelectedSource: model.mode == .online
-                ? model.selectedApplication != nil
+                ? model.onlineCaptureSource == .systemOutput || model.selectedApplication != nil
                 : model.selectedMicrophone != nil,
         )
     }
@@ -825,6 +879,12 @@ struct ContentView: View {
             Spacer()
             Button("Ocultar") { model.errorMessage = nil }
                 .controlSize(.small)
+            if model.canSelectSystemOutputAfterApplicationFailure {
+                Button("Capturar audio del equipo") {
+                    model.selectSystemOutputAfterApplicationFailure()
+                }
+                .controlSize(.small)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
