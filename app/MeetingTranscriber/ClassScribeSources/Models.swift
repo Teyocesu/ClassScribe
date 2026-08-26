@@ -27,9 +27,37 @@ enum CaptureRecoverySuggestion: Equatable, Sendable {
     case systemOutput
 }
 
+enum CaptureTerminalFailureCategory: Equatable, Sendable {
+    case source
+    case durableMaster
+    case storage
+    case finalization
+}
+
 struct CaptureTerminalFailure: Equatable, Sendable {
     var message: String
+    var category: CaptureTerminalFailureCategory
     var recoverySuggestion: CaptureRecoverySuggestion?
+
+    init(
+        message: String,
+        category: CaptureTerminalFailureCategory = .source,
+        recoverySuggestion: CaptureRecoverySuggestion? = nil,
+    ) {
+        self.message = message
+        self.category = category
+        self.recoverySuggestion = recoverySuggestion
+    }
+}
+
+enum CaptureRecoveryPolicy {
+    static func suggestion(
+        for category: CaptureTerminalFailureCategory,
+        scope: CaptureScope?,
+    ) -> CaptureRecoverySuggestion? {
+        guard category == .source, scope == .application else { return nil }
+        return .systemOutput
+    }
 }
 
 enum TranscriptionLanguage: String, Codable, CaseIterable, Identifiable, Sendable {

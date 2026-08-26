@@ -87,17 +87,26 @@ public class AppAudioCapture: @unchecked Sendable {
     var debugRMS = DebugRMSReporter()
     var debugTotalBytes: UInt64 = 0
     let levelPublisher = LevelPublisher()
-    private let terminalErrorLock = OSAllocatedUnfairLock(initialState: Optional<String>.none)
+    private let terminalErrorLock = OSAllocatedUnfairLock(
+        initialState: Optional<CaptureNativeTerminalFailure>.none,
+    )
 
     /// A bounded output-device restart that gives up is a source-owned
     /// terminal signal. It remains readable after the native source is
     /// stopped, allowing the control plane to preserve and finalize the
     /// durable file instead of presenting a healthy but source-less capture.
-    public var terminalErrorMessage: String? {
-        if let masterFailure = masterWriter?.failureMessage {
+    public var terminalFailure: CaptureNativeTerminalFailure? {
+        if let masterFailure = masterWriter?.terminalFailure {
             return masterFailure
         }
         return terminalErrorLock.withLock { $0 }
+    }
+
+    /// Compatibility projection for native callers that only need to display
+    /// the terminal message. Control-plane recovery uses `terminalFailure` so
+    /// durable-master failures cannot be mistaken for source loss.
+    public var terminalErrorMessage: String? {
+        terminalFailure?.message
     }
 
     /// Returns the instantaneous app-audio level in dBFS, decayed to -120 if
@@ -753,7 +762,12 @@ extension AppAudioCapture {
             // lifecycle and `stop()` becomes the only eventual cleanup.
             stopCapture()
             let message = "La fuente de salida de audio no pudo recuperarse después de varios cambios de dispositivo; el audio recibido se conserva."
-            terminalErrorLock.withLock { $0 = message }
+            terminalErrorLock.withLock {
+                $0 = CaptureNativeTerminalFailure(
+                    message: message,
+                    category: .source,
+                )
+            }
             logger.error("App audio: retry failed; giving up")
         }
     }

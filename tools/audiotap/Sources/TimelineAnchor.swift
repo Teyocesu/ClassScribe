@@ -19,7 +19,10 @@ import Foundation
 public final class TimelineAnchor: @unchecked Sendable {
     private(set) var rate: Int?
     private var anchorHostSeconds: Double?
-    private var framesWritten = 0
+    /// Logical durable coverage, not bytes currently emitted by a converter.
+    /// A streaming converter may hold look-ahead frames, so physical output
+    /// must never be used to infer a wall-clock gap.
+    private var logicalFramesWritten = 0
 
     /// Gaps beyond this are treated as a corrupt timestamp, not a real device
     /// outage: no silence is inserted (the write would be gigabytes of zeros on
@@ -39,33 +42,43 @@ public final class TimelineAnchor: @unchecked Sendable {
         self.rate = rate
     }
 
-    /// Silent frames to insert before a buffer that presents at `hostSeconds`
-    /// carrying `frameCount` frames, to keep the written stream aligned to
-    /// wall-clock. The first call sets the anchor and inserts nothing. Never
-    /// negative — an early/jittered timestamp just appends.
-    func silenceFramesBefore(hostSeconds: Double, frameCount: Int) -> Int {
+    /// Silent frames to insert before a logical source segment that presents
+    /// at `hostSeconds`. The segment count is supplied by the session clock,
+    /// not by the converter's physically emitted sample count. The first call
+    /// sets the anchor and inserts nothing. Never negative — an early/jittered
+    /// timestamp just appends.
+    func silenceFramesBefore(hostSeconds: Double, logicalFrameCount: Int) -> Int {
         guard let rate, rate > 0 else { return 0 }
         guard let anchor = anchorHostSeconds else {
             anchorHostSeconds = hostSeconds
-            framesWritten += frameCount
+            logicalFramesWritten += logicalFrameCount
             return 0
         }
         let expected = Int(((hostSeconds - anchor) * Double(rate)).rounded())
-        let silence = max(0, expected - framesWritten)
+        let silence = max(0, expected - logicalFramesWritten)
         guard silence <= Int(Self.maxGapSeconds * Double(rate)) else {
-            framesWritten += frameCount
+            logicalFramesWritten += logicalFrameCount
             return 0
         }
-        framesWritten += silence + frameCount
+        logicalFramesWritten += silence + logicalFrameCount
         return silence
     }
 
-    /// Accounts for converter-drained frames that continue the already
-    /// accepted stream but have no new hardware timestamp of their own. This
-    /// is used at a generation/format handoff and during final stop, before the
-    /// next timestamped packet can calculate a gap.
+    /// Compatibility label for legacy fixed-rate callers. New durable master
+    /// callers should use `logicalFrameCount` explicitly.
+    func silenceFramesBefore(hostSeconds: Double, frameCount: Int) -> Int {
+        silenceFramesBefore(
+            hostSeconds: hostSeconds,
+            logicalFrameCount: frameCount,
+        )
+    }
+
+    /// Legacy compatibility hook for callers that account physical frames
+    /// directly. The session-owned master path must not call this for a
+    /// converter tail: that tail is already included in the logical budget
+    /// committed by `silenceFramesBefore(hostSeconds:logicalFrameCount:)`.
     func advance(frames: Int) {
         guard frames > 0 else { return }
-        framesWritten += frames
+        logicalFramesWritten += frames
     }
 }

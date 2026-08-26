@@ -25,7 +25,7 @@ public class AudioCaptureSession: @unchecked Sendable {
 
     private var appCapture: AppAudioCapture?
     private var masterWriter: MasterAudioWriter?
-    private var stoppedAppTerminalErrorMessage: String?
+    private var stoppedAppTerminalFailure: CaptureNativeTerminalFailure?
     private var micCapture: MicCaptureHandler?
     private var appFileHandle: FileHandle?
     private var applicationSourceGeneration: UInt64 = 1
@@ -109,7 +109,7 @@ public class AudioCaptureSession: @unchecked Sendable {
     /// Start capturing app audio (and optionally mic audio).
     public func start() throws {
         applicationSourceGeneration = 1
-        stoppedAppTerminalErrorMessage = nil
+        stoppedAppTerminalFailure = nil
         // Create app output file and get its file descriptor
         // Restrict permissions to owner-only (0600) — audio may contain sensitive meeting content
         FileManager.default.createFile(
@@ -189,13 +189,17 @@ public class AudioCaptureSession: @unchecked Sendable {
             )
         }
         stopApplicationCapture()
-        if let failureMessage = masterWriter?.failureMessage {
+        if let failure = masterWriter?.terminalFailure {
             throw NSError(
                 domain: "audiotap.master",
                 code: -1,
-                userInfo: [NSLocalizedDescriptionKey: failureMessage],
+                userInfo: [NSLocalizedDescriptionKey: failure.message],
             )
         }
+        // A source-owned failure belongs to the generation that just ended.
+        // A successful rebind starts a fresh source failure scope while the
+        // session-owned master clock and durable writer remain intact.
+        stoppedAppTerminalFailure = nil
         applicationSourceGeneration &+= 1
         self.source = source
         if case let .application(processes) = source {
@@ -220,12 +224,19 @@ public class AudioCaptureSession: @unchecked Sendable {
     /// Stops the current native app source but leaves the session file open so
     /// a subsequent source generation can append at the same offset.
     public func stopApplicationCapture() {
+        let sourceFailure: CaptureNativeTerminalFailure?
         if let capture = appCapture {
             capture.stop()
             rememberApplicationReadings(capture)
+            sourceFailure = capture.terminalFailure
             appCapture = nil
+        } else {
+            sourceFailure = nil
         }
         finishMasterWriter()
+        if stoppedAppTerminalFailure == nil {
+            stoppedAppTerminalFailure = sourceFailure
+        }
     }
 
     private func startApplicationCapture(
@@ -282,10 +293,15 @@ public class AudioCaptureSession: @unchecked Sendable {
     /// The session retains the first failure after source teardown so the
     /// control plane can perform recoverable finalization without discarding
     /// durable evidence.
+    public var appTerminalFailure: CaptureNativeTerminalFailure? {
+        masterWriter?.terminalFailure
+            ?? appCapture?.terminalFailure
+            ?? stoppedAppTerminalFailure
+    }
+
+    /// Compatibility projection for callers that only display the message.
     public var appTerminalErrorMessage: String? {
-        masterWriter?.failureMessage
-            ?? appCapture?.terminalErrorMessage
-            ?? stoppedAppTerminalErrorMessage
+        appTerminalFailure?.message
     }
 
     /// Instantaneous mic level in dBFS, decayed to -120 when no buffer has arrived
@@ -319,7 +335,7 @@ public class AudioCaptureSession: @unchecked Sendable {
             ),
         )
 
-        stoppedAppTerminalErrorMessage = masterWriter?.failureMessage
+        stoppedAppTerminalFailure = masterWriter?.terminalFailure ?? stoppedAppTerminalFailure
         try? appFileHandle?.close()
         appFileHandle = nil
         masterWriter = nil
@@ -340,7 +356,7 @@ public class AudioCaptureSession: @unchecked Sendable {
     ) {
         masterWriter = writer
         appFileHandle = fileHandle
-        stoppedAppTerminalErrorMessage = nil
+        stoppedAppTerminalFailure = nil
     }
 
     private func finishMasterWriter() {
@@ -353,6 +369,8 @@ public class AudioCaptureSession: @unchecked Sendable {
                 "Master audio finalization failed: \(error.localizedDescription, privacy: .public)",
             )
         }
-        stoppedAppTerminalErrorMessage = writer.failureMessage
+        if let failure = writer.terminalFailure {
+            stoppedAppTerminalFailure = failure
+        }
     }
 }

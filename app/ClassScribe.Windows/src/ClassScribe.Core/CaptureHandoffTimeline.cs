@@ -99,12 +99,18 @@ public sealed class CaptureHandoffTimeline
         CaptureSourceGeneration generation,
         int byteCount,
         Func<long>? arrivalTimestamp = null,
-        TimeSpan maximumGap = default)
+        TimeSpan maximumGap = default,
+        int? logicalFrameCount = null)
     {
         ArgumentNullException.ThrowIfNull(generation);
         if (byteCount < 0)
         {
             throw new ArgumentOutOfRangeException(nameof(byteCount));
+        }
+
+        if (logicalFrameCount is < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(logicalFrameCount));
         }
 
         lock (sync)
@@ -114,7 +120,7 @@ public sealed class CaptureHandoffTimeline
                 return CapturePacketWritePlan.Rejected(generation, byteCount);
             }
 
-            if (byteCount == 0)
+            if (byteCount == 0 && logicalFrameCount.GetValueOrDefault() == 0)
             {
                 return CapturePacketWritePlan.Empty(generation);
             }
@@ -147,25 +153,34 @@ public sealed class CaptureHandoffTimeline
             var baseTimestamp = arrival ?? lastPacketEndTimestamp;
             var packetEndTimestamp = baseTimestamp is null
                 ? null
-                : checked(baseTimestamp.Value + DurationTicks(byteCount));
+                : checked(baseTimestamp.Value + (
+                    logicalFrameCount is null
+                        ? DurationTicks(byteCount)
+                        : DurationTicksForFrames(logicalFrameCount.Value)));
 
-            // Claim at the writer boundary. A zero-length callback never gets
-            // here, so it cannot consume a pending handoff gap.
+            // Claim at the writer boundary. A physical zero-length packet can
+            // still consume its logical master budget when a converter is
+            // holding look-ahead; only a truly empty callback leaves a pending
+            // handoff untouched.
             pendingHandoff = null;
             return new CapturePacketWritePlan(
                 Generation: generation,
                 ByteCount: byteCount,
                 IsAccepted: true,
-                IsEmpty: false,
+                IsEmpty: byteCount == 0,
                 HandoffGap: assessment,
-                PacketEndTimestamp: packetEndTimestamp,
-            );
+                PacketEndTimestamp: packetEndTimestamp)
+            {
+                LogicalFrameCount = logicalFrameCount ?? 0,
+            };
         }
     }
 
     public void CommitPacket(CapturePacketWritePlan plan)
     {
-        if (!plan.IsAccepted || plan.IsEmpty || plan.PacketEndTimestamp is null)
+        if (!plan.IsAccepted
+            || (plan.IsEmpty && plan.LogicalFrameCount <= 0)
+            || plan.PacketEndTimestamp is null)
         {
             return;
         }
@@ -179,9 +194,10 @@ public sealed class CaptureHandoffTimeline
         }
     }
 
-    /// Advances the durable end by converter-drained frames that continue the
-    /// accepted stream but have no new arrival timestamp. This must run before
-    /// a subsequent generation plans its handoff gap.
+    /// Advances the legacy byte-duration end by converter-drained frames that
+    /// have no new arrival timestamp. The master-contract path uses the
+    /// logical frame count on `PreparePacket` instead and must not call this
+    /// method for a drained tail.
     public void AdvanceDurableFrames(int frames)
     {
         if (frames <= 0)
@@ -215,6 +231,11 @@ public sealed class CaptureHandoffTimeline
             byteCount / (double)bytesPerSecond!.Value * Stopwatch.Frequency,
             MidpointRounding.AwayFromZero));
 
+    private long DurationTicksForFrames(int frameCount) =>
+        checked((long)Math.Round(
+            frameCount * (double)bytesPerFrame / bytesPerSecond!.Value * Stopwatch.Frequency,
+            MidpointRounding.AwayFromZero));
+
     private sealed record PendingHandoff(CaptureSourceGeneration Generation);
 }
 
@@ -228,6 +249,11 @@ public readonly record struct CapturePacketWritePlan(
 {
     public bool IsRejected => !IsAccepted;
 
+    /// Logical master coverage assigned by the session frame clock. This can
+    /// be positive while `ByteCount` is zero because a converter retained
+    /// interpolation look-ahead.
+    public int LogicalFrameCount { get; init; }
+
     public bool RequiresExplicitFailure =>
         IsAccepted && HandoffGap.IsExplicitFailure;
 
@@ -239,7 +265,10 @@ public readonly record struct CapturePacketWritePlan(
             IsAccepted: false,
             IsEmpty: byteCount == 0,
             HandoffGap: new CaptureGapAssessment(CaptureGapDisposition.NoGap, 0, 0),
-            PacketEndTimestamp: null);
+            PacketEndTimestamp: null)
+        {
+            LogicalFrameCount = 0,
+        };
 
     internal static CapturePacketWritePlan Empty(
         CaptureSourceGeneration generation) => new(
@@ -248,5 +277,8 @@ public readonly record struct CapturePacketWritePlan(
             IsAccepted: true,
             IsEmpty: true,
             HandoffGap: new CaptureGapAssessment(CaptureGapDisposition.NoGap, 0, 0),
-            PacketEndTimestamp: null);
+            PacketEndTimestamp: null)
+        {
+            LogicalFrameCount = 0,
+        };
 }

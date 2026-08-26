@@ -14,14 +14,23 @@ public final class MasterAudioWriter: @unchecked Sendable {
     private(set) public var format: AudioManifestMaster?
     private(set) public var manifest: AudioManifest?
     private(set) public var framesWritten: Int64 = 0
-    private var storedFailureMessage: String?
+    private(set) public var frameClock: MasterFrameClock?
+    private var storedFailure: CaptureNativeTerminalFailure?
     private var converter: StreamingMasterResampler?
     private var converterKey: ConverterKey?
+    private var converterSourceFrameStart: Int64 = 0
+    private var converterTargetFrames: Int64 = 0
 
+    /// Compatibility projection retained for existing capture and validation
+    /// callers. The category-bearing value is `terminalFailure`.
     public var failureMessage: String? {
+        terminalFailure?.message
+    }
+
+    public var terminalFailure: CaptureNativeTerminalFailure? {
         failureLock.lock()
         defer { failureLock.unlock() }
-        return storedFailureMessage
+        return storedFailure
     }
 
     public init(
@@ -52,8 +61,8 @@ public final class MasterAudioWriter: @unchecked Sendable {
         hostTicks: UInt64,
         sourceGeneration: UInt64,
     ) throws -> Bool {
-        if let failureMessage {
-            throw Self.terminalError(failureMessage)
+        if let terminalFailure {
+            throw Self.terminalError(terminalFailure.message)
         }
         guard !samples.isEmpty, inputRate > 0, inputChannels > 0 else { return false }
         do {
@@ -74,8 +83,8 @@ public final class MasterAudioWriter: @unchecked Sendable {
     /// returned tail is written before a new generation's timeline gap, so a
     /// format handoff never interpolates through silence.
     public func finish() throws {
-        if let failureMessage {
-            throw Self.terminalError(failureMessage)
+        if let terminalFailure {
+            throw Self.terminalError(terminalFailure.message)
         }
         do {
             try flushConverter()
@@ -120,6 +129,14 @@ public final class MasterAudioWriter: @unchecked Sendable {
             try AudioManifestStore.write(candidateManifest, to: manifestURL)
             format = selected
             manifest = candidateManifest
+            guard let clock = MasterFrameClock(masterRate: selected.sampleRate) else {
+                throw NSError(
+                    domain: "audiotap.master",
+                    code: -3,
+                    userInfo: [NSLocalizedDescriptionKey: "El formato master no tiene una frecuencia válida."],
+                )
+            }
+            frameClock = clock
             timelineAnchor.setRateIfUnanchored(selected.sampleRate)
         } else if needsConversion,
                   let current = manifest,
@@ -164,15 +181,24 @@ public final class MasterAudioWriter: @unchecked Sendable {
             }
             converter = newConverter
             converterKey = key
+            converterSourceFrameStart = frameClock?.targetSourceFrames ?? 0
+            converterTargetFrames = 0
         }
 
-        guard let converter else { return false }
-        let converted = converter.process(complete)
-        guard !converted.isEmpty else { return false }
-        let outputFrames = converted.count / selected.channels
+        guard let converter, let frameClock else { return false }
+        let budget = frameClock.reserveSourceFrames(
+            inputFrameCount: frameCount,
+            inputRate: inputRate,
+        )
+        converterTargetFrames = budget.endFrame - converterSourceFrameStart
+        let converted = converter.process(
+            complete,
+            targetOutputFrames: converterTargetFrames,
+        )
+        let logicalFrameCount = Int(budget.frameCount)
         let silenceFrames = timelineAnchor.silenceFramesBefore(
             hostSeconds: machTicksToSeconds(hostTicks),
-            frameCount: outputFrames,
+            logicalFrameCount: logicalFrameCount,
         )
         if silenceFrames > 0 {
             try write(Self.float32LEData(
@@ -181,9 +207,11 @@ public final class MasterAudioWriter: @unchecked Sendable {
             ))
             framesWritten += Int64(silenceFrames)
         }
-        try write(Self.float32LEData(converted))
-        framesWritten += Int64(outputFrames)
-        return true
+        if !converted.isEmpty {
+            try write(Self.float32LEData(converted))
+            framesWritten += Int64(converted.count / selected.channels)
+        }
+        return silenceFrames > 0 || !converted.isEmpty
     }
 
     /// Whether the next callback belongs to a source stream whose converter
@@ -211,8 +239,11 @@ public final class MasterAudioWriter: @unchecked Sendable {
     /// recovery while allowing the independent live ASR branch to continue.
     public func recordFailure(_ error: Error) {
         failureLock.lock()
-        if storedFailureMessage == nil {
-            storedFailureMessage = error.localizedDescription
+        if storedFailure == nil {
+            storedFailure = CaptureNativeTerminalFailure(
+                message: error.localizedDescription,
+                category: .durableMaster,
+            )
         }
         failureLock.unlock()
     }
@@ -221,10 +252,11 @@ public final class MasterAudioWriter: @unchecked Sendable {
         guard let converter else { return }
         self.converter = nil
         converterKey = nil
-        let tail = converter.finish()
+        let tail = converter.finish(targetOutputFrames: converterTargetFrames)
+        converterSourceFrameStart = frameClock?.targetSourceFrames ?? converterSourceFrameStart
+        converterTargetFrames = 0
         guard !tail.isEmpty, let format else { return }
         let outputFrames = tail.count / format.channels
-        timelineAnchor.advance(frames: outputFrames)
         try write(Self.float32LEData(tail))
         framesWritten += Int64(outputFrames)
     }

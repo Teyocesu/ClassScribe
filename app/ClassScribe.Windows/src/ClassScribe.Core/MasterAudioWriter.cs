@@ -10,6 +10,8 @@ public sealed class MasterAudioWriter
     private AudioManifest? manifest;
     private StreamingMasterResampler? resampler;
     private ConverterKey? converterKey;
+    private long converterSourceFrameStart;
+    private long converterTargetFrames;
 
     public MasterAudioWriter(string manifestPath)
     {
@@ -21,6 +23,8 @@ public sealed class MasterAudioWriter
     public AudioManifest? Manifest => manifest;
 
     public long FramesWritten { get; private set; }
+
+    public MasterFrameClock? FrameClock { get; private set; }
 
     public double DurationSeconds => Format is { } format && format.SampleRate > 0
         ? FramesWritten / (double)format.SampleRate
@@ -79,6 +83,7 @@ public sealed class MasterAudioWriter
             AudioManifestFile.WriteAtomic(manifestPath, candidateManifest);
             Format = outputFormat;
             manifest = candidateManifest;
+            FrameClock = new MasterFrameClock(outputFormat.SampleRate);
         }
         else if (conversion)
         {
@@ -106,13 +111,25 @@ public sealed class MasterAudioWriter
                 outputFormat.SampleRate,
                 outputFormat.Channels);
             converterKey = key;
+            converterSourceFrameStart = FrameClock?.TargetSourceFrames ?? 0;
+            converterTargetFrames = 0;
         }
 
-        var samples = resampler.Process(PcmAudioConverter.Decode(input, inputFormat));
+        var inputFrameCount = checked(input.Length / inputFormat.BytesPerFrame);
+        var clock = FrameClock
+            ?? throw new InvalidOperationException("El reloj de frames master no está inicializado.");
+        var budget = clock.ReserveSourceFrames(inputFrameCount, inputFormat.SampleRate);
+        converterTargetFrames = checked(budget.EndFrame - converterSourceFrameStart);
+        var samples = resampler.Process(
+            PcmAudioConverter.Decode(input, inputFormat),
+            targetOutputFrames: converterTargetFrames);
         return new MasterAudioPacket(
             PcmAudioConverter.EncodeFloat32LE(samples),
             samples.Length / outputFormat.Channels,
-            outputFormat);
+            outputFormat)
+        {
+            LogicalFrameCount = checked((int)budget.FrameCount),
+        };
     }
 
     public bool RequiresConverterReset(
@@ -139,9 +156,11 @@ public sealed class MasterAudioWriter
             return MasterAudioPacket.Empty;
         }
 
-        var pending = resampler.Finish();
+        var pending = resampler.Finish(converterTargetFrames);
         resampler = null;
         converterKey = null;
+        converterSourceFrameStart = FrameClock?.TargetSourceFrames ?? converterSourceFrameStart;
+        converterTargetFrames = 0;
         return new MasterAudioPacket(
             PcmAudioConverter.EncodeFloat32LE(pending),
             pending.Length / format.Channels,
@@ -205,5 +224,10 @@ public readonly record struct MasterAudioPacket(
 {
     public static MasterAudioPacket Empty => new([], 0, AudioPcmFormat.Create(1, 1, AudioSampleEncoding.Float32LE));
 
-    public bool IsEmpty => FrameCount == 0 || Bytes.Length == 0;
+    /// Logical source coverage assigned by the session frame clock. It can be
+    /// positive while `Bytes` is empty because a streaming converter is still
+    /// holding look-ahead; the timeline must commit this budget anyway.
+    public int LogicalFrameCount { get; init; }
+
+    public bool IsEmpty => Bytes.Length == 0;
 }

@@ -406,6 +406,7 @@ enum CaptureError: LocalizedError, Sendable {
     case invalidRawAudio
     case notRecording
     case audioFinalization(String)
+    case terminalFailure(CaptureTerminalFailure)
 
     var errorDescription: String? {
         switch self {
@@ -432,6 +433,7 @@ enum CaptureError: LocalizedError, Sendable {
         case .invalidRawAudio: "El audio crudo conservado está vacío, truncado o no es un archivo regular."
         case .notRecording: "No hay una clase en grabación."
         case let .audioFinalization(detail): "No se pudo finalizar el audio: \(detail)"
+        case let .terminalFailure(failure): "No se pudo finalizar el audio: \(failure.message)"
         }
     }
 }
@@ -1078,6 +1080,7 @@ final class CaptureController {
         // terminal channel error. Once teardown owns the session, the parked
         // failure must not leave `isBusy` stuck after finalization.
         terminalCaptureFailure = nil
+        let stoppedScope = activeCaptureScope
         let stoppedAttempt = activeAttempt
         if let stoppedAttempt {
             if let tracker = signalHealthTracker {
@@ -1143,10 +1146,19 @@ final class CaptureController {
         stopTask = finalization
         let finalizedResult = await finalization.value
         let result: Result<CaptureStopResult, CaptureError>
-        if let terminalErrorMessage = nativeStopResult?.terminalErrorMessage {
-            result = .failure(.audioFinalization(
-                "La escritura durable del master falló: \(terminalErrorMessage)",
-            ))
+        if let terminalFailure = nativeStopResult?.terminalFailure {
+            let category: CaptureTerminalFailureCategory = switch terminalFailure.category {
+            case .source: .source
+            case .durableMaster: .durableMaster
+            }
+            result = .failure(.terminalFailure(CaptureTerminalFailure(
+                message: terminalFailure.message,
+                category: category,
+                recoverySuggestion: CaptureRecoveryPolicy.suggestion(
+                    for: category,
+                    scope: stoppedScope,
+                ),
+            )))
         } else {
             result = finalizedResult
         }
@@ -1357,11 +1369,8 @@ final class CaptureController {
                           self.activeAttempt == attempt,
                           self.attemptGate.accepts(attempt)
                     else { return }
-                    if let terminalErrorMessage = snapshot.terminalErrorMessage {
-                        self.reportTerminalFailure(
-                            terminalErrorMessage,
-                            recoverySuggestion: .systemOutput,
-                        )
+                    if let terminalFailure = snapshot.terminalFailure {
+                        self.reportNativeTerminalFailure(terminalFailure)
                         return
                     }
                     self.levelDBFS = snapshot.levelDBFS
@@ -1371,11 +1380,8 @@ final class CaptureController {
                           self.activeAttempt == attempt,
                           self.attemptGate.accepts(attempt)
                     else { return }
-                    if let terminalErrorMessage = snapshot.terminalErrorMessage {
-                        self.reportTerminalFailure(
-                            terminalErrorMessage,
-                            recoverySuggestion: .systemOutput,
-                        )
+                    if let terminalFailure = snapshot.terminalFailure {
+                        self.reportNativeTerminalFailure(terminalFailure)
                         return
                     }
                     self.levelDBFS = snapshot.levelDBFS
@@ -1812,16 +1818,42 @@ final class CaptureController {
     /// recording flag here would strand a valid partial WAV outside that path.
     private func reportTerminalFailure(
         _ message: String,
+        category: CaptureTerminalFailureCategory = .source,
         recoverySuggestion: CaptureRecoverySuggestion? = nil,
     ) {
         guard terminalCaptureFailure == nil else { return }
+        let allowedSuggestion = CaptureRecoveryPolicy.suggestion(
+            for: category,
+            scope: activeCaptureScope,
+        )
         terminalCaptureFailure = CaptureTerminalFailure(
             message: message,
-            recoverySuggestion: recoverySuggestion,
+            category: category,
+            recoverySuggestion: recoverySuggestion == allowedSuggestion
+                ? recoverySuggestion
+                : nil,
         )
         levelTimer?.invalidate()
         levelTimer = nil
         levelDBFS = -120
+    }
+
+    private func reportNativeTerminalFailure(
+        _ failure: CaptureNativeTerminalFailure,
+    ) {
+        let category: CaptureTerminalFailureCategory = switch failure.category {
+        case .source: .source
+        case .durableMaster: .durableMaster
+        }
+        let suggestion = CaptureRecoveryPolicy.suggestion(
+            for: category,
+            scope: activeCaptureScope,
+        )
+        reportTerminalFailure(
+            failure.message,
+            category: category,
+            recoverySuggestion: suggestion,
+        )
     }
 
     private func stopLiveBufferPump() {

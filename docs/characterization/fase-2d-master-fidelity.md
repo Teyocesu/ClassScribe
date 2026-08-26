@@ -1,6 +1,6 @@
 # Caracterización Fase 2D — master fiel y derivado ASR
 
-Fecha: 2026-08-25
+Fecha: 2026-08-26
 
 Estado: **FIXED / PARTIAL**. La separación entre el master durable de
 application/systemOutput y el derivado ASR 16 kHz mono está implementada en el
@@ -96,23 +96,36 @@ source-rate/stereo, mientras el resampler existente alimenta el sink live a
 
 El writer acepta la primera entrada no vacía, mantiene el descriptor de master,
 downmixea entradas de más de dos canales y convierte el sample rate mediante un
-`StreamingMasterResampler` stateful. Conserva phase fraccional, frame previo,
-conteos acumulados y el formato master inmutable; por eso el conteo acumulado
-sigue la conversión racional con error máximo de un frame master y no reinicia
-la interpolación en cada callback. La generación y los leases existentes siguen
-filtrando callbacks tardíos. En un cambio de generation/format se drena y
-finaliza el converter anterior antes del gap durable y se crea un converter
-nuevo; no se interpola audio a través del silencio del handoff. La ruta de
-micrófono conserva el camino legacy de esta fase; no se afirma fidelidad master
-source-rate para micrófono.
+`StreamingMasterResampler` stateful. El `MasterFrameClock` pertenece al
+`SessionAttemptID` completo: acumula la duración exacta de cada fuente en frames
+master y redondea sólo el total acumulado, conservando el remainder entre
+generations y cambios de formato. Cada converter conserva su phase/interpolación
+local y se drena antes de resetearse; no comparte muestras ni interpola a través
+del silencio del handoff. La ruta de sample-rate idéntico usa un fast path que
+normaliza canales pero entrega todos los frames sin lookahead temporal.
+
+La `TimelineAnchor` usa cobertura lógica asignada por el clock, no el número de
+frames físicamente emitidos en ese callback. Así, el lookahead de un converter no
+se convierte en un cero sintético; un salto real del host time sigue insertando
+silencio. El tail de `finish()` sólo completa el presupuesto ya reservado y no
+avanza la línea temporal por segunda vez. La generación y los leases existentes
+siguen filtrando callbacks tardíos. La ruta de micrófono conserva el camino
+legacy de esta fase; no se afirma fidelidad master source-rate para micrófono.
 
 Un fallo de escritura del master es terminal y recoverable: gana el primer
 error, bloquea nuevas escrituras y conserva el `master.raw`/manifest válido ya
-existente. `AudioCaptureSession` lo expone al `CaptureNativeExecutor`; el
-resultado llega al `CaptureController`, que no puede informar éxito de
-finalización simplemente porque un master parcial permita derivar `source.wav`.
-El live ASR puede conservar datos transitorios, pero no oculta el fallo de la
-fuente durable. Un nuevo `SessionAttemptID` recibe estado limpio.
+existente. Se transporta como `CaptureNativeTerminalFailure` tipado (`source` o
+`durableMaster`) desde `MasterAudioWriter`/fuente, a través de
+`AudioCaptureSession` y `CaptureNativeExecutor`, hasta `CaptureController`.
+El control plane no puede informar éxito de finalización simplemente porque un
+master parcial permita derivar `source.wav`. El live ASR puede conservar datos
+transitorios, pero no oculta el fallo de la fuente durable. Un nuevo
+`SessionAttemptID` recibe estado limpio.
+
+Sólo un fallo de la fuente de una aplicación puede ofrecer la sugerencia
+explícita `.systemOutput`. Un fallo `durableMaster`, de almacenamiento o de
+finalización nunca ofrece esa sugerencia; tampoco la ofrece un fallo durable de
+`systemOutput`. No hay fallback automático ni hot-switch.
 
 La recuperación de una sesión nueva intenta primero `master.raw` + manifest
 válido y regenera `source.wav` si falta o es inválido. Si ese par no es válido,
@@ -132,11 +145,12 @@ El callback con attempt y generation válidos convierte el PCM nativo al
 descriptor inmutable del master y lo escribe en `master.raw` mediante un
 resampler streaming stateful. En paralelo, convierte a 16 kHz mono para el
 snapshot ASR reciente. Los contadores de duración durable y de ASR son
-independientes; `CaptureHandoffTimeline` usa el `FrameCount` real producido por
-el converter, incluido el tail drenado antes de un handoff o stop. El stop
-conserva el ownership single-flight existente, deriva `source.wav` una vez
-desde el master y deja el master/manifest disponibles para recovery si la
-derivación falla.
+independientes; `MasterFrameClock` mantiene el presupuesto entre generations y
+`CaptureHandoffTimeline` recibe la cobertura lógica aunque el paquete físico sea
+vacío por lookahead. El tail drenado completa el presupuesto existente y no se
+vuelve a sumar a la timeline. El stop conserva el ownership single-flight
+existente, deriva `source.wav` una vez desde el master y deja el master/manifest
+disponibles para recovery si la derivación falla.
 
 Para process-loopback, Windows consulta el mix del default render endpoint
 observable por ClassScribe y solicita explícitamente ese formato con
@@ -148,16 +162,18 @@ real del render endpoint.
 
 Se escribieron pruebas del product path para formato real del recorder,
 elección por primer PCM no vacío, cambio de formato en rebind, timeline/gap,
-single-flight, derivación, recovery y compatibilidad legacy. El compile/runtime
-Windows queda **SKIPPED — dotnet/csc unavailable**; no se instaló SDK.
+single-flight, derivación, recovery, compatibilidad legacy y el presupuesto
+global de frames entre generations/formats. El compile/runtime Windows queda
+**SKIPPED — dotnet/csc unavailable**; no se instaló SDK.
 
 Los contratos deterministas cubren 44.1 kHz → 48 kHz con 10.000 callbacks de
 256 frames, 48 kHz → 44.1 kHz con callbacks de 127 frames, tamaños alternos
 127/256/511, una rampa dividida frente a un bloque único, continuidad de
-boundaries y el `FrameCount` real usado por `CaptureHandoffTimeline`. También
-se verifica que la conversión del manifest aparezca una sola vez por
-generation/format. Estos casos permanecen sujetos a la disponibilidad de cada
-suite indicada en la tabla de evidencia.
+boundaries, presupuesto global en diez generations, cambios de formato,
+lookahead sin cero sintético, gap real, tail idempotente y la cobertura lógica
+usada por `CaptureHandoffTimeline`. También se verifica que la conversión del
+manifest aparezca una sola vez por generation/format. Estos casos permanecen
+sujetos a la disponibilidad de cada suite indicada en la tabla de evidencia.
 
 ## Timeline, rebind y duración
 
@@ -165,9 +181,11 @@ La línea durable usa frames, bytes por frame y sample rate del master. Un
 callback vacío o stale no fija el formato. Durante un rebind se drena la
 generación vieja, se avanza la generación, se reutiliza el mismo descriptor y
 archivo de master, y un nuevo formato de entrada crea un converter independiente
-antes de escribir. El tail drenado se registra antes de planear el gap durable;
-no se interpola a través del silencio y el evento queda registrado una sola vez
-en `conversions` del manifest por generation/format.
+antes de escribir. El frame clock no se reinicia: sólo el estado de interpolación
+se reinicia. El tail drenado se registra físicamente antes de planear el gap
+durable, pero su cobertura ya estaba reservada; no se interpola a través del
+silencio y el evento queda registrado una sola vez en `conversions` del manifest
+por generation/format.
 
 Los gaps se insertan como silencio alineado al master y el derivado conserva la
 misma duración temporal mediante resampling global. La duración online se
@@ -190,7 +208,7 @@ Resultados reproducibles de este checkout:
 | Validación | Resultado |
 | --- | --- |
 | `./scripts/run_app.sh --build-only` | **PASS**; bundle release macOS y codesign verificado |
-| `./scripts/pre-push.sh --with-tests` | **PASS**; bundle macOS, compilación de tests y 240 tests pasaron |
+| `./scripts/pre-push.sh --with-tests` | **PASS**; bundle macOS, compilación de tests y 251 tests pasaron |
 | `swift build --package-path tools/audiotap -c release -j 2` con el `.toolchain` local y `-strict-concurrency=complete` | **PASS** |
 | `swift test --package-path tools/audiotap -j 2` con el `.toolchain` local, `-resource-dir` y `-strict-concurrency=complete` | **SKIPPED — XCTest unavailable**; Command Line Tools devuelve `no such module 'XCTest'` |
 | Product path Windows y contratos equivalentes | código y tests escritos; revisión estática disponible; runtime/compile **SKIPPED — dotnet/csc unavailable** |

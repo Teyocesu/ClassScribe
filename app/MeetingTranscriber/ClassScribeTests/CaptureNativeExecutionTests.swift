@@ -282,7 +282,7 @@ func staleMicStartupResourceIsStoppedAndReleased() {
 @MainActor
 @Test
 @available(macOS 14.2, *)
-func durableMasterFailureReachesProductStopBoundaryAndPreservesEvidence() async throws {
+func durableMasterFailureStillBecomesRecoverable() async throws {
     let folder = FileManager.default.temporaryDirectory
         .appendingPathComponent("classscribe-master-failure-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
@@ -334,6 +334,7 @@ func durableMasterFailureReachesProductStopBoundaryAndPreservesEvidence() async 
 
     let snapshot = await executor.levelSnapshot(for: attempt)
     #expect(snapshot.terminalErrorMessage == "synthetic durable master failure")
+    #expect(snapshot.terminalFailure?.category == .durableMaster)
 
     do {
         _ = try writer.append(
@@ -352,6 +353,7 @@ func durableMasterFailureReachesProductStopBoundaryAndPreservesEvidence() async 
     let stop = executor.beginStop(attempt: attempt)
     let stopResult = try await stop.value()
     #expect(stopResult.terminalErrorMessage == "synthetic durable master failure")
+    #expect(stopResult.terminalFailure?.category == .durableMaster)
     #expect(try Data(contentsOf: manifestURL) == validManifest)
     try AudioManifestStore.validate(try AudioManifestStore.read(from: manifestURL))
 
@@ -386,6 +388,7 @@ func durableMasterFailureReachesProductStopBoundaryAndPreservesEvidence() async 
     await executor.installSessionForTesting(nextSession, for: nextAttempt)
     let nextSnapshot = await executor.levelSnapshot(for: nextAttempt)
     #expect(nextSnapshot.terminalErrorMessage == nil)
+    #expect(nextSnapshot.terminalFailure == nil)
     let nextStop = executor.beginStop(attempt: nextAttempt)
     _ = try await nextStop.value()
 }

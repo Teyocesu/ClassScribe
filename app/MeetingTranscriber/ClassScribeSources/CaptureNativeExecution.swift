@@ -278,11 +278,21 @@ enum CaptureFirstSampleRace {
 
 struct CaptureNativeLevelSnapshot: Sendable {
     let levelDBFS: Double
-    let terminalErrorMessage: String?
+    let terminalFailure: CaptureNativeTerminalFailure?
+
+    /// Compatibility projection for focused tests and display-only callers.
+    var terminalErrorMessage: String? {
+        terminalFailure?.message
+    }
 }
 
 struct CaptureNativeStopResult: Sendable {
-    let terminalErrorMessage: String?
+    let terminalFailure: CaptureNativeTerminalFailure?
+
+    /// Compatibility projection for focused tests and display-only callers.
+    var terminalErrorMessage: String? {
+        terminalFailure?.message
+    }
 }
 
 /// Product seam for the online mid-recording handoff. The default adapter
@@ -560,11 +570,11 @@ final class CaptureNativeExecutor: @unchecked Sendable {
     func beginStop(attempt: SessionAttemptID) -> CaptureNativeWork<CaptureNativeStopResult> {
         submit(attempt: attempt) { [self] _ in
             guard let session = captureSessions.removeValue(forKey: attempt) else {
-                return CaptureNativeStopResult(terminalErrorMessage: nil)
+                return CaptureNativeStopResult(terminalFailure: nil)
             }
             _ = session.stop()
             return CaptureNativeStopResult(
-                terminalErrorMessage: session.appTerminalErrorMessage,
+                terminalFailure: session.appTerminalFailure,
             )
         }
     }
@@ -590,13 +600,13 @@ final class CaptureNativeExecutor: @unchecked Sendable {
                 if let session = captureSessions[attempt] {
                     continuation.resume(returning: CaptureNativeLevelSnapshot(
                         levelDBFS: session.appLevelDBFS,
-                        terminalErrorMessage: session.appTerminalErrorMessage,
+                        terminalFailure: session.appTerminalFailure,
                     ))
                     return
                 }
                 continuation.resume(returning: CaptureNativeLevelSnapshot(
                     levelDBFS: -120,
-                    terminalErrorMessage: nil,
+                    terminalFailure: nil,
                 ))
             }
         }

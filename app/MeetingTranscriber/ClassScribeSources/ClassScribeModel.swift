@@ -700,7 +700,18 @@ final class ClassScribeModel {
             sessionPhase = .failed
             capturePhase = .failedRecoverable
             asrPhase = .failedRecoverable
-            errorMessage = error.localizedDescription
+            let terminalFailure: CaptureTerminalFailure?
+            if let captureError = error as? CaptureError,
+               case let .terminalFailure(failure) = captureError {
+                terminalFailure = failure
+            } else {
+                terminalFailure = nil
+            }
+            // Only the typed source failure may carry the explicit next-source
+            // CTA. Storage, finalization, and durable-master failures arrive
+            // here with no suggestion and cannot be relabeled as source loss.
+            captureRecoverySuggestion = terminalFailure?.recoverySuggestion
+            errorMessage = terminalFailure?.message ?? error.localizedDescription
             statusDetail = "El audio se conservó, pero no se pudo validar: \(error.localizedDescription)"
             persistCurrentState(checkpoint: "audio-stop-failed")
         }

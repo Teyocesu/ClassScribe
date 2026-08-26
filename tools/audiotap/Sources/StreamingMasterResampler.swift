@@ -45,7 +45,15 @@ public final class StreamingMasterResampler: @unchecked Sendable {
 
     /// Appends one interleaved callback. An incomplete trailing frame is
     /// ignored, matching the existing PCM callback boundary behavior.
-    public func process(_ samples: [Float]) -> [Float] {
+    ///
+    /// `targetOutputFrames` is the cumulative budget assigned by the
+    /// session-owned `MasterFrameClock`. Leaving it nil retains the
+    /// converter-local rational budget for callers that use this primitive in
+    /// isolation.
+    public func process(
+        _ samples: [Float],
+        targetOutputFrames: Int64? = nil,
+    ) -> [Float] {
         guard !finished, !samples.isEmpty else { return [] }
         let inputFrameCount = samples.count / inputChannels
         guard inputFrameCount > 0 else { return [] }
@@ -54,16 +62,39 @@ public final class StreamingMasterResampler: @unchecked Sendable {
             appendNormalizedFrame(samples, frame: frame)
         }
         totalInputFrames += Int64(inputFrameCount)
-        return emitAvailable(final: false)
+
+        // Equal-rate input needs no temporal lookahead. Returning every
+        // normalized frame here keeps converter latency separate from the
+        // hardware timeline and makes continuous callbacks byte-exact.
+        if inputRate == outputRate {
+            let output = buffer
+            buffer.removeAll(keepingCapacity: true)
+            bufferStartFrame = totalInputFrames
+            previousFrame = lastInputFrame
+            totalOutputFrames += Int64(inputFrameCount)
+            fractionalPhase = 0
+            return output
+        }
+
+        return emitAvailable(
+            final: false,
+            targetFrames: targetOutputFrames,
+        )
     }
 
     /// Drains the deterministic tail for this source stream. The final input
     /// frame is held only for output positions that cannot have a look-ahead
     /// frame; no state is retained after this call.
-    public func finish() -> [Float] {
+    public func finish(targetOutputFrames: Int64? = nil) -> [Float] {
         guard !finished else { return [] }
         finished = true
-        return emitAvailable(final: true)
+        if inputRate == outputRate {
+            return []
+        }
+        return emitAvailable(
+            final: true,
+            targetFrames: targetOutputFrames,
+        )
     }
 
     private func appendNormalizedFrame(_ samples: [Float], frame: Int) {
@@ -114,20 +145,25 @@ public final class StreamingMasterResampler: @unchecked Sendable {
         hasInput = true
     }
 
-    private func emitAvailable(final: Bool) -> [Float] {
+    private func emitAvailable(final: Bool, targetFrames: Int64?) -> [Float] {
         guard hasInput else { return [] }
-        let targetFrames = roundedRatio(totalInputFrames)
-        guard totalOutputFrames < targetFrames else {
+        let target = targetFrames ?? roundedRatio(totalInputFrames)
+        guard target >= totalOutputFrames else {
+            updatePhase()
+            compactBuffer()
+            return []
+        }
+        guard totalOutputFrames < target else {
             updatePhase()
             compactBuffer()
             return []
         }
 
-        let remainingFrames = targetFrames - totalOutputFrames
+        let remainingFrames = target - totalOutputFrames
         var output = [Float]()
         output.reserveCapacity(Int(remainingFrames) * outputChannels)
 
-        while totalOutputFrames < targetFrames {
+        while totalOutputFrames < target {
             let positionNumerator = totalOutputFrames * Int64(inputRate)
             let lower = positionNumerator / Int64(outputRate)
             guard lower < totalInputFrames else { break }

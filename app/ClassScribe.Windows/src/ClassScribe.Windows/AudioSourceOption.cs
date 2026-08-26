@@ -25,6 +25,7 @@ internal enum CaptureRecoverySuggestion
 internal enum CaptureFailureCategory
 {
     Source,
+    DurableMaster,
     Storage,
     Other,
 }

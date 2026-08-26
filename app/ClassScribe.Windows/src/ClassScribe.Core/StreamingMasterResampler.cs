@@ -49,7 +49,11 @@ public sealed class StreamingMasterResampler
     /// Fractional source-frame position of the next output frame.
     public double FractionalPhase { get; private set; }
 
-    public float[] Process(ReadOnlySpan<float> samples)
+    /// <param name="targetOutputFrames">
+    /// Cumulative output budget assigned by the session-owned master clock.
+    /// Null retains the converter-local budget for isolated callers.
+    /// </param>
+    public float[] Process(ReadOnlySpan<float> samples, long? targetOutputFrames = null)
     {
         if (finished || samples.Length == 0)
         {
@@ -68,10 +72,25 @@ public sealed class StreamingMasterResampler
         }
 
         TotalInputFrames = checked(TotalInputFrames + inputFrameCount);
-        return EmitAvailable(final: false);
+
+        // Equal-rate input has no temporal interpolation to prime. Copy every
+        // normalized frame immediately so converter look-ahead cannot become a
+        // false handoff gap in the durable timeline.
+        if (InputRate == OutputRate)
+        {
+            var output = buffer.ToArray();
+            buffer.Clear();
+            bufferStartFrame = TotalInputFrames;
+            Array.Copy(lastInputFrame, previousFrame, OutputChannels);
+            TotalOutputFrames = checked(TotalOutputFrames + inputFrameCount);
+            FractionalPhase = 0;
+            return output;
+        }
+
+        return EmitAvailable(final: false, targetOutputFrames: targetOutputFrames);
     }
 
-    public float[] Finish()
+    public float[] Finish(long? targetOutputFrames = null)
     {
         if (finished)
         {
@@ -79,7 +98,12 @@ public sealed class StreamingMasterResampler
         }
 
         finished = true;
-        return EmitAvailable(final: true);
+        if (InputRate == OutputRate)
+        {
+            return [];
+        }
+
+        return EmitAvailable(final: true, targetOutputFrames: targetOutputFrames);
     }
 
     private void AppendNormalizedFrame(ReadOnlySpan<float> samples, int frame)
@@ -150,14 +174,21 @@ public sealed class StreamingMasterResampler
         hasInput = true;
     }
 
-    private float[] EmitAvailable(bool final)
+    private float[] EmitAvailable(bool final, long? targetOutputFrames)
     {
         if (!hasInput)
         {
             return [];
         }
 
-        var targetFrames = RoundedRatio(TotalInputFrames);
+        var targetFrames = targetOutputFrames ?? RoundedRatio(TotalInputFrames);
+        if (targetFrames < TotalOutputFrames)
+        {
+            UpdatePhase();
+            CompactBuffer();
+            return [];
+        }
+
         if (TotalOutputFrames >= targetFrames)
         {
             UpdatePhase();

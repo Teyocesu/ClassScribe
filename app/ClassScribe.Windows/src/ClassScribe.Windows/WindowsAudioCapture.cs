@@ -32,6 +32,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private TaskCompletionSource firstPacket = NewSignal();
     private TaskCompletionSource stopped = NewSignal();
     private Exception? captureFailure;
+    private CaptureFailureCategory? captureFailureCategory;
     private string? rawPath;
     private string? manifestPath;
     private MasterAudioWriter? masterWriter;
@@ -385,10 +386,17 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             SingleWriter = true,
             FullMode = BoundedChannelFullMode.Wait,
         });
-        writerTask = WritePacketsAsync(packetChannel.Reader, rawStream);
+        writerTask = WritePacketsAsync(
+            packetChannel.Reader,
+            rawStream,
+            attempt,
+            usesMasterContract
+                ? CaptureFailureCategory.DurableMaster
+                : CaptureFailureCategory.Storage);
         firstPacket = NewSignal();
         stopped = NewSignal();
         captureFailure = null;
+        captureFailureCategory = null;
         LastWarning = null;
         capturedBytes = 0;
         recentBytes = 0;
@@ -788,7 +796,6 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     {
         MasterAudioPacket packet;
         AudioPcmFormat durableFormat;
-        var converterProducedNoPacket = false;
         lock (sync)
         {
             if (!IsCurrentSourceGeneration(attempt, generation)
@@ -810,7 +817,6 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 masterFormat = durableFormat;
                 packetTimeline.SetFormat(durableFormat);
                 AddAsrPacketToSnapshot(copy, inputFormat);
-                converterProducedNoPacket = packet.IsEmpty;
             }
             catch (Exception error) when (error is IOException
                                                or UnauthorizedAccessException
@@ -819,16 +825,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                                                or InvalidOperationException
                                                or JsonException)
             {
-                FailCapture(attempt, error);
-                return;
-            }
-
-            if (converterProducedNoPacket)
-            {
-                // The streaming converter may hold one look-ahead frame. A
-                // callback still counts for startup/health; the held frame is
-                // drained on the next callback, handoff, or final stop.
-                generationFirstPacket.TrySetResult();
+                FailCapture(attempt, error, CaptureFailureCategory.DurableMaster);
                 return;
             }
 
@@ -836,7 +833,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 generation,
                 packet.Bytes.Length,
                 arrivalTimestamp: Stopwatch.GetTimestamp,
-                maximumGap: RebindGapSafetyBound);
+                maximumGap: RebindGapSafetyBound,
+                logicalFrameCount: packet.LogicalFrameCount);
             if (plan.IsRejected)
             {
                 return;
@@ -847,7 +845,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 var error = new IOException(
                     $"La pausa de rebind ({plan.HandoffGap.GapSeconds:F1}s) excede el límite seguro de {RebindGapSafetyBound.TotalSeconds:F0}s.");
                 generationFirstPacket.TrySetException(error);
-                FailCapture(attempt, error);
+                FailCapture(attempt, error, CaptureFailureCategory.DurableMaster);
                 return;
             }
 
@@ -857,7 +855,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                         attempt,
                         generation,
                         plan.HandoffGap.SilenceBytes,
-                        durableFormat))
+                        durableFormat,
+                        CaptureFailureCategory.DurableMaster))
                 {
                     return;
                 }
@@ -865,13 +864,20 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 masterWriter.CommitFrames(plan.HandoffGap.SilenceBytes / durableFormat.BytesPerFrame);
             }
 
-            if (!IsCurrentSourceGeneration(attempt, generation)
-                || !TryQueuePacket(packet.Bytes))
+            if (!IsCurrentSourceGeneration(attempt, generation))
             {
                 return;
             }
 
-            masterWriter.CommitFrames(packet.FrameCount);
+            if (!packet.IsEmpty)
+            {
+                if (!TryQueuePacket(packet.Bytes, CaptureFailureCategory.DurableMaster))
+                {
+                    return;
+                }
+
+                masterWriter.CommitFrames(packet.FrameCount);
+            }
             masterFramesWritten = masterWriter.FramesWritten;
             packetTimeline.CommitPacket(plan);
         }
@@ -893,14 +899,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             return true;
         }
 
-        if (!TryQueuePacket(pending.Bytes))
+        if (!TryQueuePacket(pending.Bytes, CaptureFailureCategory.DurableMaster))
         {
             return false;
         }
 
         writer.CommitFrames(pending.FrameCount);
         masterFramesWritten = writer.FramesWritten;
-        packetTimeline.AdvanceDurableFrames(pending.FrameCount);
         return true;
     }
 
@@ -920,7 +925,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             // Durable master conversion already owns the capture failure
             // boundary. A malformed ASR conversion cannot reinterpret it as
             // master data or corrupt the live ring.
-            captureFailure ??= error;
+            RecordFailure(error, CaptureFailureCategory.Other);
         }
     }
 
@@ -931,7 +936,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         SessionAttemptID attempt,
         CaptureSourceGeneration generation,
         int silenceBytes,
-        AudioPcmFormat? masterFormat = null)
+        AudioPcmFormat? masterFormat = null,
+        CaptureFailureCategory failureCategory = CaptureFailureCategory.Storage)
     {
         const int maximumChunkBytes = 64 * 1024;
         var durableBytesPerFrame = masterFormat?.BytesPerFrame ?? 2;
@@ -955,7 +961,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 return false;
             }
             var silence = new byte[chunkBytes];
-            if (!TryQueuePacket(silence))
+            if (!TryQueuePacket(silence, failureCategory))
             {
                 return false;
             }
@@ -1001,13 +1007,27 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
     private void FailCapture(SessionAttemptID attempt, Exception error)
     {
+        FailCapture(attempt, error, CaptureFailureCategory.Source);
+    }
+
+    private void FailCapture(
+        SessionAttemptID attempt,
+        Exception error,
+        CaptureFailureCategory category)
+    {
         var shouldPublish = false;
+        var publishedCategory = category;
         lock (sync)
         {
             if (captureFailure is null)
             {
                 captureFailure = error;
+                captureFailureCategory = category;
                 shouldPublish = true;
+            }
+            else
+            {
+                publishedCategory = captureFailureCategory ?? category;
             }
         }
 
@@ -1015,20 +1035,57 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         {
             CaptureFaulted?.Invoke(
                 attempt,
-                new CaptureFault(error, CaptureFailureCategory.Source));
+                new CaptureFault(error, publishedCategory));
         }
 
         TryStopRecorder();
     }
 
-    private bool TryQueuePacket(byte[] packet)
+    private void RecordFailure(Exception error, CaptureFailureCategory category)
+    {
+        lock (sync)
+        {
+            if (captureFailure is null)
+            {
+                captureFailure = error;
+                captureFailureCategory = category;
+            }
+        }
+    }
+
+    private bool TryQueuePacket(
+        byte[] packet,
+        CaptureFailureCategory category = CaptureFailureCategory.Storage)
     {
         if (packetChannel?.Writer.TryWrite(packet) == true)
         {
             return true;
         }
 
-        captureFailure ??= new IOException("El disco no pudo guardar el audio con suficiente rapidez.");
+        var error = new IOException("El disco no pudo guardar el audio con suficiente rapidez.");
+        SessionAttemptID? attempt;
+        var shouldPublish = false;
+        var publishedCategory = category;
+        lock (sync)
+        {
+            attempt = captureAttempt;
+            if (captureFailure is null)
+            {
+                captureFailure = error;
+                captureFailureCategory = category;
+                shouldPublish = true;
+            }
+            else
+            {
+                publishedCategory = captureFailureCategory ?? category;
+            }
+        }
+        if (shouldPublish && attempt is not null)
+        {
+            CaptureFaulted?.Invoke(
+                attempt,
+                new CaptureFault(error, publishedCategory));
+        }
         TryStopRecorder();
         return false;
     }
@@ -1061,16 +1118,17 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             return;
         }
 
-        captureFailure ??= error;
         if (error is not null)
         {
-            CaptureFaulted?.Invoke(
-                attempt,
-                new CaptureFault(error, CaptureFailureCategory.Source));
+            FailCapture(attempt, error, CaptureFailureCategory.Source);
         }
     }
 
-    private async Task WritePacketsAsync(ChannelReader<byte[]> reader, FileStream destination)
+    private async Task WritePacketsAsync(
+        ChannelReader<byte[]> reader,
+        FileStream destination,
+        SessionAttemptID attempt,
+        CaptureFailureCategory failureCategory)
     {
         var bytesSinceDurableFlush = 0;
         try
@@ -1089,9 +1147,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
-            captureFailure ??= error;
+            FailCapture(attempt, error, failureCategory);
             firstPacket.TrySetException(error);
-            TryStopRecorder();
         }
     }
 
@@ -1294,7 +1351,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
-            captureFailure ??= error;
+            RecordFailure(error, CaptureFailureCategory.Storage);
         }
         finally
         {
@@ -1307,7 +1364,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException)
                 {
-                    captureFailure ??= error;
+                    RecordFailure(error, CaptureFailureCategory.Storage);
                 }
                 finally
                 {
@@ -1647,7 +1704,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             }
             if (stopFailure is not null)
             {
-                captureFailure ??= stopFailure;
+                RecordFailure(stopFailure, CaptureFailureCategory.Source);
             }
 
             MMDevice? oldDevice;
@@ -1737,7 +1794,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                     catch (Exception disposeError) when (
                         disposeError is InvalidOperationException or System.Runtime.InteropServices.COMException)
                     {
-                        captureFailure ??= disposeError;
+                        RecordFailure(disposeError, CaptureFailureCategory.Source);
                     }
                 }
             }
@@ -1803,7 +1860,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             }
             if (stopFailure is not null)
             {
-                captureFailure ??= stopFailure;
+                RecordFailure(stopFailure, CaptureFailureCategory.Source);
             }
 
             var nextGeneration = sourceGenerationGate.Advance(attempt);
@@ -1901,7 +1958,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                     }
                     catch (Exception disposeError) when (disposeError is InvalidOperationException or System.Runtime.InteropServices.COMException)
                     {
-                        captureFailure ??= disposeError;
+                        RecordFailure(disposeError, CaptureFailureCategory.Source);
                     }
                 }
             }
