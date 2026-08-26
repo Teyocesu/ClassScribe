@@ -151,6 +151,46 @@ public sealed class MainViewModelSystemOutputConsentTests
     }
 
     [TestMethod]
+    public async Task durableMasterFailureDoesNotRunFinalProcessing()
+    {
+        var (model, _, root) = NewModel(() => true);
+        try
+        {
+            SelectSystemOutput(model);
+            await model.StartAsync();
+            var started = new SessionStore(root).ScanSessions().Single();
+            model.LiveText = "texto parcial conservado";
+
+            model.RecordCaptureFailureForTest(
+                new IOException("synthetic durable master failure"),
+                CaptureFailureCategory.DurableMaster);
+            await model.StopAsync();
+
+            var stopped = new SessionStore(root).ScanSessions().Single();
+            Assert.AreEqual(0, model.FinalProcessingInvocationCountForTest);
+            Assert.IsFalse(model.IsRecording);
+            Assert.IsFalse(model.ShowSystemOutputRecovery);
+            Assert.IsTrue(model.WarningText.Contains("durable", StringComparison.OrdinalIgnoreCase));
+            Assert.IsTrue(model.StatusText.Contains("reprocesar", StringComparison.OrdinalIgnoreCase));
+            Assert.AreEqual(ProcessingState.Recoverable, stopped.Metadata.State);
+            Assert.AreEqual(SessionPhase.Recoverable, stopped.Metadata.SessionPhase);
+            Assert.AreEqual(CapturePhase.FailedRecoverable, stopped.Metadata.CapturePhase);
+            Assert.AreEqual(AsrPhase.FailedRecoverable, stopped.Metadata.AsrPhase);
+            Assert.IsTrue(stopped.IsRecoverable);
+            Assert.IsTrue(File.Exists(Path.Combine(started.Folder, "master.raw")));
+            Assert.IsTrue(File.Exists(Path.Combine(started.Folder, "audio-manifest.json")));
+            Assert.IsTrue(File.Exists(Path.Combine(started.Folder, "source.wav")));
+            Assert.IsTrue(File.ReadAllText(Path.Combine(started.Folder, "live-transcript.txt"))
+                .Contains("texto parcial conservado", StringComparison.Ordinal));
+        }
+        finally
+        {
+            await model.DisposeAsync();
+            DeleteFolder(root);
+        }
+    }
+
+    [TestMethod]
     public async Task changingSourceWhileConsentIsVisibleInvalidatesTheStaleAttempt()
     {
         MainViewModel? model = null;

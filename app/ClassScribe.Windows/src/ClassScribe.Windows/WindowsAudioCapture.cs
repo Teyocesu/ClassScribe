@@ -62,6 +62,9 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private readonly CaptureSignalHealthTracker signalHealthTracker =
         new(CaptureSignalThresholds.Windows);
 
+    internal static CaptureFailureCategory HandoffTimeoutFailureCategory =>
+        CaptureFailureCategory.Source;
+
     public event Action<SessionAttemptID, double>? LevelChanged;
 
     public event Action<SessionAttemptID, CaptureSignalHealthSnapshot>? SignalHealthChanged;
@@ -618,18 +621,46 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         var stopFailure = await StopCurrentRecorderAsync(cancellationToken).ConfigureAwait(false);
 
         var rawPathForAttempt = await FinishCaptureResourcesAsync().ConfigureAwait(false);
-        var wavePath = await FinalizeRawAsync(
-                rawPathForAttempt
-                    ?? throw new InvalidOperationException("No existe audio crudo para finalizar."),
-                CancellationToken.None)
-            .ConfigureAwait(false);
-        if (captureFailure is not null || stopFailure is not null)
+        string? wavePath = null;
+        Exception? finalizationFailure = null;
+        try
+        {
+            wavePath = await FinalizeRawAsync(
+                    rawPathForAttempt
+                        ?? throw new InvalidOperationException("No existe audio crudo para finalizar."),
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception error)
+        {
+            finalizationFailure = error;
+        }
+
+        var (recordedFailure, recordedCategory) = SnapshotCaptureFailure();
+        if (recordedCategory is CaptureFailureCategory.DurableMaster
+            or CaptureFailureCategory.Storage)
+        {
+            throw new CaptureTerminalException(
+                recordedCategory.Value,
+                recordedFailure ?? new IOException("Falló la escritura durable del audio."),
+                wavePath);
+        }
+
+        if (finalizationFailure is not null)
+        {
+            throw new CaptureTerminalException(
+                CaptureFailureCategory.Storage,
+                finalizationFailure,
+                wavePath);
+        }
+
+        if (recordedFailure is not null || stopFailure is not null)
         {
             LastWarning = "Windows informó un problema al cerrar la fuente, pero el audio validado se conservó.";
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        return wavePath;
+        return wavePath!;
     }
 
     public async ValueTask DisposeAsync()
@@ -845,7 +876,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 var error = new IOException(
                     $"La pausa de rebind ({plan.HandoffGap.GapSeconds:F1}s) excede el límite seguro de {RebindGapSafetyBound.TotalSeconds:F0}s.");
                 generationFirstPacket.TrySetException(error);
-                FailCapture(attempt, error, CaptureFailureCategory.DurableMaster);
+                FailCapture(attempt, error, HandoffTimeoutFailureCategory);
                 return;
             }
 
@@ -1019,7 +1050,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         var publishedCategory = category;
         lock (sync)
         {
-            if (captureFailure is null)
+            if (captureFailure is null
+                || (IsDurableFailure(category) && !IsDurableFailure(captureFailureCategory)))
             {
                 captureFailure = error;
                 captureFailureCategory = category;
@@ -1045,11 +1077,20 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     {
         lock (sync)
         {
-            if (captureFailure is null)
+            if (captureFailure is null
+                || (IsDurableFailure(category) && !IsDurableFailure(captureFailureCategory)))
             {
                 captureFailure = error;
                 captureFailureCategory = category;
             }
+        }
+    }
+
+    private (Exception? Error, CaptureFailureCategory? Category) SnapshotCaptureFailure()
+    {
+        lock (sync)
+        {
+            return (captureFailure, captureFailureCategory);
         }
     }
 
@@ -1069,7 +1110,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         lock (sync)
         {
             attempt = captureAttempt;
-            if (captureFailure is null)
+            if (captureFailure is null
+                || (IsDurableFailure(category) && !IsDurableFailure(captureFailureCategory)))
             {
                 captureFailure = error;
                 captureFailureCategory = category;
@@ -1089,6 +1131,9 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         TryStopRecorder();
         return false;
     }
+
+    private static bool IsDurableFailure(CaptureFailureCategory? category) =>
+        category is CaptureFailureCategory.DurableMaster or CaptureFailureCategory.Storage;
 
     private void AddAsrPacketToSnapshot(byte[] packet)
     {
@@ -2134,6 +2179,11 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             finalizationHookForTesting = hook;
         }
     }
+
+    internal void RecordFailureForTest(
+        Exception error,
+        CaptureFailureCategory category) =>
+        RecordFailure(error, category);
 
     private void PublishSignalHealth(SessionAttemptID attempt)
     {

@@ -367,6 +367,222 @@ public sealed class WindowsAudioCaptureProductPathTests
     }
 
     [TestMethod]
+    public async Task durableMasterFailureCannotFinalizeAsSuccess()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        try
+        {
+            await StartSystemOutputAsync(capture, folder, attempt);
+            capture.RecordFailureForTest(
+                new IOException("synthetic durable master failure"),
+                CaptureFailureCategory.DurableMaster);
+
+            var failure = await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+                async () => await capture.StopAsync(CancellationToken.None));
+
+            Assert.AreEqual(CaptureFailureCategory.DurableMaster, failure.Category);
+            Assert.IsFalse(capture.IsRecording);
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "master.raw")));
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "audio-manifest.json")));
+            Assert.AreEqual(
+                Path.Combine(folder, "source.wav"),
+                failure.PreservedWavePath);
+            Assert.IsTrue(File.Exists(failure.PreservedWavePath));
+        }
+        finally
+        {
+            DeleteFolder(folder);
+        }
+    }
+
+    [TestMethod]
+    public async Task storageFinalizationFailureCannotFinalizeAsSuccess()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        try
+        {
+            await StartSystemOutputAsync(capture, folder, attempt);
+            capture.SetFinalizationHookForTest(static (_, _) =>
+                Task.FromException(new IOException("synthetic finalization failure")));
+
+            var failure = await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+                async () => await capture.StopAsync(CancellationToken.None));
+
+            Assert.AreEqual(CaptureFailureCategory.Storage, failure.Category);
+            Assert.IsFalse(capture.IsRecording);
+            Assert.IsNull(failure.PreservedWavePath);
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "master.raw")));
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "audio-manifest.json")));
+            Assert.IsFalse(File.Exists(Path.Combine(folder, "source.wav")));
+        }
+        finally
+        {
+            DeleteFolder(folder);
+        }
+    }
+
+    [TestMethod]
+    public async Task sourceFailureCanStillFinalizeValidatedPartialAudio()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        try
+        {
+            await StartSystemOutputAsync(capture, folder, attempt);
+            capture.RecordFailureForTest(
+                new IOException("synthetic source failure"),
+                CaptureFailureCategory.Source);
+
+            var wavePath = await capture.StopAsync(CancellationToken.None);
+
+            Assert.IsFalse(capture.IsRecording);
+            Assert.IsTrue(File.Exists(wavePath));
+            Assert.AreEqual(Path.Combine(folder, "source.wav"), wavePath);
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "master.raw")));
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "audio-manifest.json")));
+            Assert.IsTrue(PcmWaveFile.Validate(wavePath) > 0);
+        }
+        finally
+        {
+            DeleteFolder(folder);
+        }
+    }
+
+    [TestMethod]
+    public async Task stopFollowersObserveSameDurableFailure()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        try
+        {
+            await StartSystemOutputAsync(capture, folder, attempt);
+            capture.RecordFailureForTest(
+                new IOException("synthetic durable master failure"),
+                CaptureFailureCategory.DurableMaster);
+            var finalization = new FinalizationGate();
+            capture.SetFinalizationHookForTest(finalization.BlockAsync);
+
+            var firstStop = capture.StopAsync(CancellationToken.None);
+            await finalization.Entered.Task;
+            var secondStop = capture.StopAsync(CancellationToken.None);
+            finalization.Release.TrySetResult(true);
+
+            var firstFailure = await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+                async () => await firstStop);
+            var secondFailure = await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+                async () => await secondStop);
+
+            Assert.AreEqual(firstFailure.Category, secondFailure.Category);
+            Assert.AreEqual(firstFailure.Message, secondFailure.Message);
+            Assert.AreEqual(firstFailure.PreservedWavePath, secondFailure.PreservedWavePath);
+            Assert.AreEqual(1, finalization.InvocationCount);
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "master.raw")));
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "audio-manifest.json")));
+        }
+        finally
+        {
+            DeleteFolder(folder);
+        }
+    }
+
+    [TestMethod]
+    public async Task newAttemptDoesNotInheritDurableFailureWindows()
+    {
+        var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
+        await using var capture = new WindowsAudioCapture(factory);
+        var folder = NewFolder();
+        var secondFolder = NewFolder();
+        var attempt = NewAttempt();
+        var secondAttempt = NewAttempt();
+        try
+        {
+            await StartSystemOutputAsync(capture, folder, attempt);
+            capture.RecordFailureForTest(
+                new IOException("synthetic durable master failure"),
+                CaptureFailureCategory.DurableMaster);
+            await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+                async () => await capture.StopAsync(CancellationToken.None));
+
+            await StartSystemOutputAsync(capture, secondFolder, secondAttempt);
+            var secondWavePath = await capture.StopAsync(CancellationToken.None);
+
+            Assert.IsFalse(capture.IsRecording);
+            Assert.IsTrue(File.Exists(secondWavePath));
+            Assert.AreEqual(Path.Combine(secondFolder, "source.wav"), secondWavePath);
+        }
+        finally
+        {
+            DeleteFolder(folder);
+            DeleteFolder(secondFolder);
+        }
+    }
+
+    [TestMethod]
+    public void handoffTimeoutIsSourceFailure()
+    {
+        var timeline = new CaptureHandoffTimeline();
+        timeline.SetFormat(AudioPcmFormat.Create(
+            48_000,
+            2,
+            AudioSampleEncoding.Float32LE));
+        var attempt = NewAttempt();
+        var firstGeneration = new CaptureSourceGeneration(attempt, 1);
+        var secondGeneration = new CaptureSourceGeneration(attempt, 2);
+        timeline.BeginGeneration(firstGeneration);
+        var first = timeline.PreparePacket(
+            firstGeneration,
+            byteCount: 8,
+            arrivalTimestamp: () => 1_000,
+            maximumGap: TimeSpan.FromSeconds(30),
+            logicalFrameCount: 1);
+        timeline.CommitPacket(first);
+        timeline.MarkHandoff(secondGeneration);
+
+        var lateArrival = checked(
+            first.PacketEndTimestamp!.Value
+                + (long)(TimeSpan.FromSeconds(31).TotalSeconds
+                    * System.Diagnostics.Stopwatch.Frequency));
+        var latePlan = timeline.PreparePacket(
+            secondGeneration,
+            byteCount: 8,
+            arrivalTimestamp: () => lateArrival,
+            maximumGap: TimeSpan.FromSeconds(30),
+            logicalFrameCount: 1);
+
+        Assert.IsTrue(latePlan.HandoffGap.IsExplicitFailure);
+        Assert.AreEqual(
+            CaptureFailureCategory.Source,
+            WindowsAudioCapture.HandoffTimeoutFailureCategory);
+    }
+
+    [TestMethod]
+    public void durableFailureDoesNotRecommendSystemOutputWindows()
+    {
+        Assert.IsFalse(CaptureRecoveryPolicy.CanSuggestSystemOutput(
+            CaptureFailureCategory.DurableMaster,
+            CaptureScope.Application));
+        Assert.IsFalse(CaptureRecoveryPolicy.CanSuggestSystemOutput(
+            CaptureFailureCategory.Storage,
+            CaptureScope.Application));
+        Assert.IsTrue(CaptureRecoveryPolicy.CanSuggestSystemOutput(
+            CaptureFailureCategory.Source,
+            CaptureScope.Application));
+        Assert.IsFalse(CaptureRecoveryPolicy.CanSuggestSystemOutput(
+            CaptureFailureCategory.Source,
+            CaptureScope.SystemOutput));
+    }
+
+    [TestMethod]
     public async Task processLoopbackBuiltRecorderIsDisposedWhenCancellationWinsAfterBuild()
     {
         var recorder = new FakeWindowsAudioRecorder(new List<string>());

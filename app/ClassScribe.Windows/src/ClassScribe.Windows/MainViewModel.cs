@@ -55,6 +55,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private bool liveWasEdited;
     private bool settingLiveProgrammatically;
     private bool disposed;
+    private int finalProcessingInvocationCountForTest;
     private long attemptGeneration;
     private SessionAttemptID? activeAttempt;
     private SessionAttemptCallbackLease? captureCallbackLease;
@@ -650,8 +651,9 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
 
             if (captureStartInvoked
-                && captureScope == CaptureScope.Application
-                && audioCapture.LastStartFailureCategory == CaptureFailureCategory.Source)
+                && CaptureRecoveryPolicy.CanSuggestSystemOutput(
+                    audioCapture.LastStartFailureCategory ?? CaptureFailureCategory.Other,
+                    captureScope))
             {
                 captureRecoverySuggestion = CaptureRecoverySuggestion.SystemOutput;
                 OnPropertyChanged(nameof(ShowSystemOutputRecovery));
@@ -701,6 +703,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public Task StopAsync() => StopAsync(processAfterStop: true);
 
     public Task StopForExitAsync() => StopAsync(processAfterStop: false);
+
+    internal int FinalProcessingInvocationCountForTest =>
+        Volatile.Read(ref finalProcessingInvocationCountForTest);
+
+    internal void RecordCaptureFailureForTest(
+        Exception error,
+        CaptureFailureCategory category) =>
+        audioCapture.RecordFailureForTest(error, category);
 
     private async Task StopAsync(bool processAfterStop)
     {
@@ -817,6 +827,27 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
 
             IsRecording = false;
+            if (error is CaptureTerminalException terminal
+                && (terminal.Category is CaptureFailureCategory.DurableMaster
+                    or CaptureFailureCategory.Storage))
+            {
+                captureRecoverySuggestion = null;
+                OnPropertyChanged(nameof(ShowSystemOutputRecovery));
+                var failurePrefix = terminal.Category switch
+                {
+                    CaptureFailureCategory.DurableMaster => "La escritura del audio durable falló",
+                    CaptureFailureCategory.Storage => "El almacenamiento del audio falló",
+                    _ => "La captura de audio informó un problema",
+                };
+                WarningText = $"{failurePrefix}: {terminal.Message}";
+                StatusText = terminal.PreservedWavePath is not null
+                    ? "El audio parcial quedó guardado para reprocesar"
+                    : "La sesión quedó guardada para reintentar";
+                await PersistRecoverableLiveTextAsync(attempt).ConfigureAwait(true);
+                await MarkCurrentStateAsync(ProcessingState.Recoverable, attempt).ConfigureAwait(true);
+                return;
+            }
+
             WarningText = error.Message;
             StatusText = "La sesión quedó guardada para reintentar";
             await MarkCurrentStateAsync(ProcessingState.Failed, attempt).ConfigureAwait(true);
@@ -1293,6 +1324,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     private async Task ProcessWaveAsync(string wavePath, CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref finalProcessingInvocationCountForTest);
         if (currentMetadata is null || currentFolder is null)
         {
             throw new InvalidOperationException("No hay una sesión preparada para procesar.");
@@ -1659,6 +1691,29 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    private async Task PersistRecoverableLiveTextAsync(SessionAttemptID attempt)
+    {
+        if (!IsCurrent(attempt) || currentMetadata is null || currentFolder is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await sessionStore.SaveLiveAsync(
+                    LiveText,
+                    currentMetadata,
+                    currentFolder,
+                    "capture-recoverable",
+                    CancellationToken.None)
+                .ConfigureAwait(true);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            CrashLog.Write(error);
+        }
+    }
+
     private void PublishLiveText(string incoming)
     {
         var novel = OverlapDeduplicator.NovelText(automaticLiveText, incoming);
@@ -1790,15 +1845,25 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
             lease.TryAccept(() => RunOnUi(() => lease.TryAccept(() =>
             {
-                if (fault.Category == CaptureFailureCategory.Source
-                    && currentMetadata?.CaptureScope == CaptureScope.Application)
+                var canSuggestSystemOutput = CaptureRecoveryPolicy.CanSuggestSystemOutput(
+                    fault.Category,
+                    currentMetadata?.CaptureScope);
+                captureRecoverySuggestion = canSuggestSystemOutput
+                    ? CaptureRecoverySuggestion.SystemOutput
+                    : null;
+                OnPropertyChanged(nameof(ShowSystemOutputRecovery));
+                var faultPrefix = fault.Category switch
                 {
-                    captureRecoverySuggestion = CaptureRecoverySuggestion.SystemOutput;
-                    OnPropertyChanged(nameof(ShowSystemOutputRecovery));
-                }
-
-                WarningText = $"La fuente de audio se interrumpió: {fault.Error.Message}";
-                StatusText = "Detén la sesión para validar y recuperar el audio recibido";
+                    CaptureFailureCategory.Source => "La fuente de audio se interrumpió",
+                    CaptureFailureCategory.DurableMaster => "La escritura del audio durable falló",
+                    CaptureFailureCategory.Storage => "El almacenamiento del audio falló",
+                    _ => "La captura de audio informó un problema",
+                };
+                WarningText = $"{faultPrefix}: {fault.Error.Message}";
+                StatusText = fault.Category is CaptureFailureCategory.DurableMaster
+                    or CaptureFailureCategory.Storage
+                    ? "Detén la sesión para conservar y recuperar el audio recibido"
+                    : "Detén la sesión para validar y recuperar el audio recibido";
             })));
         };
         captureCallbackLease = lease;

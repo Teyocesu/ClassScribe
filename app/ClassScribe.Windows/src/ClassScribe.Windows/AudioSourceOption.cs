@@ -32,6 +32,15 @@ internal enum CaptureFailureCategory
 
 internal sealed record CaptureFault(Exception Error, CaptureFailureCategory Category);
 
+internal static class CaptureRecoveryPolicy
+{
+    public static bool CanSuggestSystemOutput(
+        CaptureFailureCategory category,
+        CaptureScope? scope) =>
+        category == CaptureFailureCategory.Source
+            && scope == CaptureScope.Application;
+}
+
 internal sealed record SystemOutputConsentRequest(
     Guid Id,
     SessionAttemptID Attempt,

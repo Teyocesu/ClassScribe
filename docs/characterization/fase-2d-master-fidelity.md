@@ -150,7 +150,14 @@ independientes; `MasterFrameClock` mantiene el presupuesto entre generations y
 vacío por lookahead. El tail drenado completa el presupuesto existente y no se
 vuelve a sumar a la timeline. El stop conserva el ownership single-flight
 existente, deriva `source.wav` una vez desde el master y deja el master/manifest
-disponibles para recovery si la derivación falla.
+disponibles para recovery si la derivación falla. Si la escritura authoritative
+del master o la finalización/storage falla, `StopAsync` lanza un
+`CaptureTerminalException` tipado después de drenar recursos: la derivación
+parcial puede conservarse, pero nunca convierte la sesión en success. El
+`MainViewModel` marca el intento como `Recoverable`, no ejecuta el procesamiento
+final y no ofrece `SystemOutput`. Un fallo `Source` sigue pudiendo finalizar el
+audio durable validado; el timeout explícito de handoff mayor a 30 s se clasifica
+como `Source`, no como `DurableMaster`.
 
 Para process-loopback, Windows consulta el mix del default render endpoint
 observable por ClassScribe y solicita explícitamente ese formato con
@@ -163,8 +170,16 @@ real del render endpoint.
 Se escribieron pruebas del product path para formato real del recorder,
 elección por primer PCM no vacío, cambio de formato en rebind, timeline/gap,
 single-flight, derivación, recovery, compatibilidad legacy y el presupuesto
-global de frames entre generations/formats. El compile/runtime Windows queda
-**SKIPPED — dotnet/csc unavailable**; no se instaló SDK.
+global de frames entre generations/formats. La cobertura exacta del correctivo
+incluye `durableMasterFailureCannotFinalizeAsSuccess`,
+`durableMasterFailureDoesNotRunFinalProcessing`,
+`sourceFailureCanStillFinalizeValidatedPartialAudio`,
+`handoffTimeoutIsSourceFailure`,
+`durableFailureDoesNotRecommendSystemOutputWindows`,
+`newAttemptDoesNotInheritDurableFailureWindows` y
+`stopFollowersObserveSameDurableFailure`; también se cubre la falla de
+finalización/storage. El compile/runtime Windows queda **SKIPPED —
+dotnet/csc unavailable**; no se instaló SDK.
 
 Los contratos deterministas cubren 44.1 kHz → 48 kHz con 10.000 callbacks de
 256 frames, 48 kHz → 44.1 kHz con callbacks de 127 frames, tamaños alternos
