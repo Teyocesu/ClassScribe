@@ -4,11 +4,12 @@ Fecha: 2026-08-25
 
 Baseline de implementación: `d70795b2ed74bfd5b812ba1d1782c3545c0d547e`
 
-Estado: **FIXED / PARTIAL**. La UX y el control-plane de consentimiento quedaron
-implementados en macOS y Windows; el correctivo de ownership del modal macOS y la
-revisión local macOS pasaron. La suite/runtime Windows queda **SKIPPED —
-dotnet/csc unavailable**. Esto no marca la Fase 2C.2 como APPROVED, no marca la
-Fase 2 completa ni convierte los gates físicos o de runtime en PASS.
+Estado: **APPROVED arquitectónicamente y con evidencia local disponible**. La UX
+y el control-plane de consentimiento quedaron implementados en macOS y Windows;
+el correctivo de ownership del modal macOS está **APPROVED** y la revisión local
+macOS pasó. Windows compile/runtime queda **SKIPPED — dotnet/csc unavailable**.
+La Fase 2 completa sigue abierta y ningún gate físico o de runtime se convierte
+en PASS.
 
 ## UX de fuente online
 
@@ -151,4 +152,4 @@ Siguen **PENDING/SKIPPED**, no PASS:
 
 Master source-rate/stereo frente al derivado ASR 16 kHz mono, y el formato de
 archivo largo RF64/W64 o segmentación, permanecen pendientes. La Fase 2C.2 no
-afirma release readiness completo ni inicia la Fase 2D o una fase posterior.
+afirma release readiness completo; la Fase 2D sigue **NOT STARTED**.
