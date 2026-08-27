@@ -7,6 +7,8 @@ namespace ClassScribe.Windows.Tests;
 [TestClass]
 public sealed class WindowsAudioCaptureProductPathTests
 {
+    private static readonly string[] ExpectedRebindLifecycle = ["stop", "dispose", "build"];
+
     [TestMethod]
     public async Task nullAuthorizationRejectedBeforeRawCreation()
     {
@@ -15,7 +17,7 @@ public sealed class WindowsAudioCaptureProductPathTests
         var folder = NewFolder();
         var attempt = NewAttempt();
 
-        await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
             capture.StartAsync(SystemSource(), folder, attempt, CancellationToken.None));
 
         Assert.IsFalse(File.Exists(Path.Combine(folder, "master.raw")));
@@ -91,7 +93,7 @@ public sealed class WindowsAudioCaptureProductPathTests
         Assert.IsTrue(await capture.ProbeSystemOutputForTestAsync(attempt));
 
         CollectionAssert.AreEqual(
-            new[] { "stop", "dispose", "build" },
+            ExpectedRebindLifecycle,
             factory.LifecycleEvents.TakeLast(3).ToArray());
 
         await capture.StopAsync(CancellationToken.None);
@@ -182,7 +184,7 @@ public sealed class WindowsAudioCaptureProductPathTests
         Assert.IsTrue(factory.BuildEntered.Wait(TimeSpan.FromSeconds(3)));
 
         var authorization = capture.IssueSystemOutputAuthorizationAfterExplicitUserConsent(secondAttempt);
-        await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
             capture.StartAsync(
                 SystemSource(),
                 secondFolder,
@@ -322,7 +324,7 @@ public sealed class WindowsAudioCaptureProductPathTests
         await finalization.Entered.Task;
 
         var authorization = capture.IssueSystemOutputAuthorizationAfterExplicitUserConsent(secondAttempt);
-        await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
             capture.StartAsync(
                 SystemSource(),
                 secondFolder,
@@ -380,7 +382,7 @@ public sealed class WindowsAudioCaptureProductPathTests
                 new IOException("synthetic durable master failure"),
                 CaptureFailureCategory.DurableMaster);
 
-            var failure = await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+            var failure = await Assert.ThrowsExactlyAsync<CaptureTerminalException>(
                 async () => await capture.StopAsync(CancellationToken.None));
 
             Assert.AreEqual(CaptureFailureCategory.DurableMaster, failure.Category);
@@ -411,7 +413,7 @@ public sealed class WindowsAudioCaptureProductPathTests
             capture.SetFinalizationHookForTest(static (_, _) =>
                 Task.FromException(new IOException("synthetic finalization failure")));
 
-            var failure = await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+            var failure = await Assert.ThrowsExactlyAsync<CaptureTerminalException>(
                 async () => await capture.StopAsync(CancellationToken.None));
 
             Assert.AreEqual(CaptureFailureCategory.Storage, failure.Category);
@@ -477,9 +479,9 @@ public sealed class WindowsAudioCaptureProductPathTests
             var secondStop = capture.StopAsync(CancellationToken.None);
             finalization.Release.TrySetResult(true);
 
-            var firstFailure = await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+            var firstFailure = await Assert.ThrowsExactlyAsync<CaptureTerminalException>(
                 async () => await firstStop);
-            var secondFailure = await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+            var secondFailure = await Assert.ThrowsExactlyAsync<CaptureTerminalException>(
                 async () => await secondStop);
 
             Assert.AreEqual(firstFailure.Category, secondFailure.Category);
@@ -510,7 +512,7 @@ public sealed class WindowsAudioCaptureProductPathTests
             capture.RecordFailureForTest(
                 new IOException("synthetic durable master failure"),
                 CaptureFailureCategory.DurableMaster);
-            await Assert.ThrowsExceptionAsync<CaptureTerminalException>(
+            await Assert.ThrowsExactlyAsync<CaptureTerminalException>(
                 async () => await capture.StopAsync(CancellationToken.None));
 
             await StartSystemOutputAsync(capture, secondFolder, secondAttempt);
@@ -589,7 +591,7 @@ public sealed class WindowsAudioCaptureProductPathTests
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
 
-        await Assert.ThrowsExceptionAsync<OperationCanceledException>(async () =>
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () =>
         {
             await WindowsAudioRecorderOwnership.AdoptBuiltRecorderAsync(
                 recorder,
@@ -776,7 +778,7 @@ public sealed class WindowsAudioCaptureProductPathTests
 
         public int InvocationCount => Volatile.Read(ref invocationCount);
 
-        public Task BlockAsync(string _, CancellationToken __)
+        public Task<bool> BlockAsync(string _, CancellationToken __)
         {
             Interlocked.Increment(ref invocationCount);
             Entered.TrySetResult(true);

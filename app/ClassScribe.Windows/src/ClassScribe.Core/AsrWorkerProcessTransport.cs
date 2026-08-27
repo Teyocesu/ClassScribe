@@ -108,11 +108,11 @@ public sealed class ProcessAsrWorkerTransport : IAsrWorkerTransport, IDisposable
             {
                 return child.HasExited;
             }
-            catch (InvalidOperationException)
+            catch (ObjectDisposedException)
             {
                 return true;
             }
-            catch (ObjectDisposedException)
+            catch (InvalidOperationException)
             {
                 return true;
             }
@@ -470,11 +470,11 @@ public sealed class ProcessAsrWorkerTransport : IAsrWorkerTransport, IDisposable
         {
             status = child.ExitCode;
         }
-        catch (InvalidOperationException)
+        catch (ObjectDisposedException)
         {
             // The process can be disposed by a concurrent owner after exit.
         }
-        catch (ObjectDisposedException)
+        catch (InvalidOperationException)
         {
             // The process can be disposed by a concurrent owner after exit.
         }

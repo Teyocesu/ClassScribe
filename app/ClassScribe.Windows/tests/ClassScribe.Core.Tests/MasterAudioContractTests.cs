@@ -222,7 +222,7 @@ public sealed class MasterAudioContractTests
         var previousSource = "evidence-before-derivative"u8.ToArray();
         await File.WriteAllBytesAsync(source, previousSource);
 
-        await Assert.ThrowsExceptionAsync<InvalidDataException>(() =>
+        await Assert.ThrowsExactlyAsync<InvalidDataException>(() =>
             PcmWaveFile.DeriveFromMasterAsync(master, manifest, source));
 
         CollectionAssert.AreEqual(previousSource, await File.ReadAllBytesAsync(source));

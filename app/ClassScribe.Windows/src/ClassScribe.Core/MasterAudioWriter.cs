@@ -180,10 +180,7 @@ public sealed class MasterAudioWriter
 
     public void CommitFrames(int frames)
     {
-        if (frames < 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(frames));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegative(frames);
 
         FramesWritten = checked(FramesWritten + frames);
     }

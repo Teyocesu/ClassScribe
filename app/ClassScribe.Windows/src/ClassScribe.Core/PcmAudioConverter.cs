@@ -27,7 +27,10 @@ public static class PcmAudioConverter
                 AudioSampleEncoding.Float32LE =>
                     BitConverter.Int32BitsToSingle(
                         BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(offset, sizeof(float)))),
-                _ => throw new ArgumentOutOfRangeException(),
+                _ => throw new ArgumentOutOfRangeException(
+                    nameof(format),
+                    format,
+                    "El formato PCM no es compatible."),
             };
         }
 
@@ -51,10 +54,15 @@ public static class PcmAudioConverter
         int outputSampleRate,
         int outputChannels)
     {
-        if (inputSampleRate <= 0 || inputChannels <= 0 || outputSampleRate <= 0
-            || outputChannels is < 1 or > 2)
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(inputSampleRate);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(inputChannels);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(outputSampleRate);
+        if (outputChannels is < 1 or > 2)
         {
-            throw new ArgumentOutOfRangeException();
+            throw new ArgumentOutOfRangeException(
+                nameof(outputChannels),
+                outputChannels,
+                "El número de canales de salida debe estar entre 1 y 2.");
         }
 
         var inputFrameCount = samples.Length / inputChannels;

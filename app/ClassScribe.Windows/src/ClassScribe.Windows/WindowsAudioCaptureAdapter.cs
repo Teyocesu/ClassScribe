@@ -115,7 +115,7 @@ internal sealed class NAudioWindowsAudioCaptureFactory : IWindowsAudioCaptureFac
         using var observedDevice = observedEndpoint.Device
             ?? throw new InvalidOperationException(
                 "El endpoint de salida no tiene un dispositivo WASAPI observable.");
-        using var audioClient = observedDevice.AudioClient;
+        using var audioClient = observedDevice.CreateAudioClient();
         var observedRenderMix = NAudioWindowsAudioRecorder.ToPcmFormat(audioClient.MixFormat);
         var requestedFormat = ProcessLoopbackFormatPolicy.FromObservedRenderMix(observedRenderMix);
 
@@ -165,7 +165,10 @@ internal sealed class NAudioWindowsAudioCaptureFactory : IWindowsAudioCaptureFac
             AudioSampleEncoding.Float32LE => WaveFormat.CreateIeeeFloatWaveFormat(
                 format.SampleRate,
                 format.Channels),
-            _ => throw new ArgumentOutOfRangeException(nameof(format.Encoding)),
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(format),
+                format,
+                "El formato PCM no es compatible."),
         };
     }
 }

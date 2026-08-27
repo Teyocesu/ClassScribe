@@ -157,7 +157,7 @@ public sealed class CaptureSourceGenerationTests
         var identity = StrongIdentity();
         var buildReached = false;
 
-        await Assert.ThrowsExceptionAsync<OperationCanceledException>(() =>
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
             WindowsApplicationStartup.BuildProcessLoopbackIfCurrentSourceGenerationAsync(
                 attempt,
                 generation,
@@ -180,7 +180,7 @@ public sealed class CaptureSourceGenerationTests
         var generation = new CaptureSourceGenerationGate().Begin(attempt);
         var buildReached = false;
 
-        await Assert.ThrowsExceptionAsync<OperationCanceledException>(() =>
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
             WindowsApplicationStartup.BuildProcessLoopbackIfCurrentSourceGenerationAsync(
                 attempt,
                 generation,
@@ -611,7 +611,7 @@ public sealed class CaptureSourceGenerationTests
         gate.Invalidate(attempt);
         var buildReached = false;
 
-        await Assert.ThrowsExceptionAsync<OperationCanceledException>(() =>
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
             WindowsApplicationStartup.BuildProcessLoopbackIfCurrentSourceGenerationAsync(
                 attempt,
                 generation,

@@ -7,10 +7,7 @@ public sealed class MasterFrameClock
 {
     public MasterFrameClock(int masterRate)
     {
-        if (masterRate <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(masterRate));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(masterRate);
 
         MasterRate = masterRate;
     }
@@ -27,15 +24,9 @@ public sealed class MasterFrameClock
 
     public MasterFrameBudget ReserveSourceFrames(int inputFrameCount, int inputRate)
     {
-        if (inputFrameCount < 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(inputFrameCount));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegative(inputFrameCount);
 
-        if (inputRate <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(inputRate));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(inputRate);
 
         var start = TargetSourceFrames;
         TotalInputFrames = checked(TotalInputFrames + inputFrameCount);

@@ -134,8 +134,8 @@ public sealed class SessionStore
         IReadOnlyList<SpeakerRecord> speakers,
         string folder,
         HumanCorrectionUpdate? humanCorrection = null,
-        CancellationToken cancellationToken = default,
-        DiarizationProposal? diarizationProposal = null) =>
+        DiarizationProposal? diarizationProposal = null,
+        CancellationToken cancellationToken = default) =>
         SaveProjectionAsync(
             metadata,
             all,
@@ -146,8 +146,8 @@ public sealed class SessionStore
             automaticAllText: null,
             automaticProfessorText: null,
             humanCorrection: humanCorrection,
-            cancellationToken: cancellationToken,
-            diarizationProposal: diarizationProposal);
+            diarizationProposal: diarizationProposal,
+            cancellationToken: cancellationToken);
 
     public Task SaveAutomaticProjectionAsync(
         ClassMetadata metadata,
@@ -158,8 +158,8 @@ public sealed class SessionStore
         string folder,
         string automaticAllText,
         string automaticProfessorText,
-        CancellationToken cancellationToken = default,
-        DiarizationProposal? diarizationProposal = null) =>
+        DiarizationProposal? diarizationProposal = null,
+        CancellationToken cancellationToken = default) =>
         SaveProjectionAsync(
             metadata,
             all,
@@ -170,8 +170,8 @@ public sealed class SessionStore
             automaticAllText,
             automaticProfessorText,
             humanCorrection: null,
-            cancellationToken: cancellationToken,
-            diarizationProposal: diarizationProposal);
+            diarizationProposal: diarizationProposal,
+            cancellationToken: cancellationToken);
 
     private async Task SaveProjectionAsync(
         ClassMetadata metadata,
@@ -183,8 +183,8 @@ public sealed class SessionStore
         string? automaticAllText,
         string? automaticProfessorText,
         HumanCorrectionUpdate? humanCorrection,
-        CancellationToken cancellationToken,
-        DiarizationProposal? diarizationProposal)
+        DiarizationProposal? diarizationProposal,
+        CancellationToken cancellationToken)
     {
         folder = EnsureSessionFolder(folder);
         var overlayPath = Path.Combine(folder, "human-correction-overlay.json");

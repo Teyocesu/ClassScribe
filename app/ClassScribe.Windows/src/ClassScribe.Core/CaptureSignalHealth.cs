@@ -219,7 +219,7 @@ public sealed class CaptureSignalHealthTracker
             }
 
             var elapsedSinceStart = Math.Max(0, currentTime - startedAtMonotonic);
-            var elapsedSinceLastCallback = lastCallbackAtMonotonic is { } callbackTime
+            double? elapsedSinceLastCallback = lastCallbackAtMonotonic is { } callbackTime
                 ? Math.Max(0, currentTime - callbackTime)
                 : null;
             var state = callbackCount == 0

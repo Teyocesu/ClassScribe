@@ -62,7 +62,7 @@ public sealed class TranscriptLogicTests
     }
 
     [TestMethod]
-    public void MetadataUsesTheMacCompatibleSpanishEnumValues()
+    public void MetadataEmitsStableTokensAndReadsLegacySpanishAliases()
     {
         var metadata = new ClassMetadata
         {
@@ -73,10 +73,13 @@ public sealed class TranscriptLogicTests
         };
 
         var json = JsonSerializer.Serialize(metadata, JsonOptions);
-        StringAssert.Contains(json, "Clase online");
-        StringAssert.Contains(json, "Transcripción final lista");
+        using var document = JsonDocument.Parse(json);
+        Assert.AreEqual("online", document.RootElement.GetProperty("mode").GetString());
+        Assert.AreEqual("complete", document.RootElement.GetProperty("state").GetString());
 
-        var decoded = JsonSerializer.Deserialize<ClassMetadata>(json, JsonOptions);
+        var decoded = JsonSerializer.Deserialize<ClassMetadata>(
+            "{\"mode\":\"Clase online\",\"state\":\"Transcripción final lista\",\"language\":\"fr\"}",
+            JsonOptions);
         Assert.IsNotNull(decoded);
         Assert.AreEqual(CaptureMode.Online, decoded.Mode);
         Assert.AreEqual(ProcessingState.Complete, decoded.State);

@@ -5,6 +5,8 @@ namespace ClassScribe.Core.Tests;
 [TestClass]
 public sealed class ApplicationIdentityTests
 {
+    private static readonly int[] AmbiguousCandidateProcessIds = [202, 303];
+
     [TestMethod]
     public void sameIdentitySameRootResolves()
     {
@@ -64,7 +66,7 @@ public sealed class ApplicationIdentityTests
 
         Assert.AreEqual(ApplicationResolutionState.Ambiguous, result.State);
         Assert.IsNull(result.ResolvedProcessId);
-        CollectionAssert.AreEqual(new[] { 202, 303 }, result.CandidateProcessIds.ToArray());
+        CollectionAssert.AreEqual(AmbiguousCandidateProcessIds, result.CandidateProcessIds.ToArray());
     }
 
     [TestMethod]
@@ -158,7 +160,7 @@ public sealed class ApplicationIdentityTests
         var current = SessionAttemptID.Create(stale.SessionID, 2);
         var buildReached = false;
 
-        await Assert.ThrowsExceptionAsync<OperationCanceledException>(() =>
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
             WindowsApplicationStartup.BuildProcessLoopbackIfCurrentAttemptAsync(
                 stale,
                 attempt => attempt == current,

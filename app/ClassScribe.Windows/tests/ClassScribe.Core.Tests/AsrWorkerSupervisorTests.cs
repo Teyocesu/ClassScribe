@@ -144,8 +144,9 @@ public sealed class AsrWorkerSupervisorTests
         var terminal = await context.Supervisor.WaitForTerminalAsync();
         Assert.AreEqual(AsrWorkerTerminalReason.IncompatibleProtocol, terminal.Reason);
         Assert.AreEqual(AsrWorkerSupervisorState.UnavailableForSession, context.Supervisor.State);
+        Assert.IsTrue(context.Worker.IsTerminated);
         CollectionAssert.AreEqual(
-            new[] { AsrMessageType.Hello, AsrMessageType.Shutdown },
+            new[] { AsrMessageType.Hello },
             context.Worker.SentMessages.Select(message => message.MessageType).ToArray());
     }
 
@@ -346,7 +347,7 @@ public sealed class AsrWorkerSupervisorTests
     [TestMethod]
     public void MalformedTransportFrameRejected()
     {
-        Assert.ThrowsException<JsonException>(() => AsrWorkerEnvelope.Decode(new byte[] { 123 }));
+        Assert.ThrowsExactly<JsonException>(() => AsrWorkerEnvelope.Decode(new byte[] { 123 }));
     }
 
     private static TestContext Create(

@@ -19,10 +19,7 @@ public sealed class CaptureHandoffTimeline
 
     public CaptureHandoffTimeline(int bytesPerSecond)
     {
-        if (bytesPerSecond <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(bytesPerSecond));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(bytesPerSecond);
 
         configuredBytesPerSecond = bytesPerSecond;
         configuredBytesPerFrame = 2;
@@ -103,10 +100,7 @@ public sealed class CaptureHandoffTimeline
         int? logicalFrameCount = null)
     {
         ArgumentNullException.ThrowIfNull(generation);
-        if (byteCount < 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(byteCount));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegative(byteCount);
 
         if (logicalFrameCount is < 0)
         {
@@ -137,7 +131,7 @@ public sealed class CaptureHandoffTimeline
                 return CapturePacketWritePlan.Rejected(generation, byteCount);
             }
             var needsArrivalTimestamp = lastPacketEndTimestamp is null || handoff is not null;
-            var arrival = needsArrivalTimestamp
+            long? arrival = needsArrivalTimestamp
                 ? arrivalTimestamp?.Invoke()
                     ?? throw new InvalidOperationException(
                         "El primer PCM aceptado necesita su timestamp de llegada.")
@@ -151,7 +145,7 @@ public sealed class CaptureHandoffTimeline
                     maximumGap: maximumGap,
                     bytesPerFrame: bytesPerFrame);
             var baseTimestamp = arrival ?? lastPacketEndTimestamp;
-            var packetEndTimestamp = baseTimestamp is null
+            long? packetEndTimestamp = baseTimestamp is null
                 ? null
                 : checked(baseTimestamp.Value + (
                     logicalFrameCount is null

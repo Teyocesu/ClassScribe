@@ -975,8 +975,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         var remaining = silenceBytes - (silenceBytes % durableBytesPerFrame);
         var durableFramesQueued = 0;
         var asrFramesQueued = 0;
-        var totalDurableFrames = masterFormat is { } format
-            ? remaining / format.BytesPerFrame
+        var totalDurableFrames = masterFormat is { } initialFormat
+            ? remaining / initialFormat.BytesPerFrame
             : 0;
         while (remaining > 0)
         {
@@ -997,12 +997,12 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 return false;
             }
 
-            if (masterFormat is { } format)
+            if (masterFormat is { } chunkFormat)
             {
-                var chunkDurableFrames = chunkBytes / format.BytesPerFrame;
+                var chunkDurableFrames = chunkBytes / chunkFormat.BytesPerFrame;
                 var targetAsrFrames = (int)Math.Round(
                     (durableFramesQueued + chunkDurableFrames)
-                        * (double)PcmWaveFile.SampleRate / format.SampleRate,
+                        * (double)PcmWaveFile.SampleRate / chunkFormat.SampleRate,
                     MidpointRounding.AwayFromZero);
                 var chunkAsrFrames = targetAsrFrames - asrFramesQueued;
                 if (chunkAsrFrames > 0)
@@ -1020,12 +1020,12 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             remaining -= chunkBytes;
         }
 
-        if (masterFormat is { } format && totalDurableFrames > 0)
+        if (masterFormat is { } finalFormat && totalDurableFrames > 0)
         {
             var expectedAsrFrames = Math.Max(
                 1,
                 (int)Math.Round(
-                    totalDurableFrames * (double)PcmWaveFile.SampleRate / format.SampleRate,
+                    totalDurableFrames * (double)PcmWaveFile.SampleRate / finalFormat.SampleRate,
                     MidpointRounding.AwayFromZero));
             if (expectedAsrFrames > asrFramesQueued)
             {
@@ -1529,8 +1529,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             selectedRootPID,
             attempt,
             snapshot.State,
-            cancellationToken,
-            probeToken);
+            probeToken,
+            cancellationToken);
         lock (sync)
         {
             if (activeProbeToken == probeToken
@@ -1580,8 +1580,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         var probeTask = ProbeSystemOutputAsync(
             activeEndpointID!,
             attempt,
-            cancellationToken,
-            probeToken);
+            probeToken,
+            cancellationToken);
         lock (sync)
         {
             if (activeProbeToken == probeToken
@@ -1595,8 +1595,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private async Task ProbeSystemOutputAsync(
         string activeEndpointID,
         SessionAttemptID attempt,
-        CancellationToken cancellationToken,
-        Guid probeToken)
+        Guid probeToken,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -1646,8 +1646,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         int rootPID,
         SessionAttemptID attempt,
         CaptureSignalState signalState,
-        CancellationToken cancellationToken,
-        Guid probeToken)
+        Guid probeToken,
+        CancellationToken cancellationToken)
     {
         try
         {

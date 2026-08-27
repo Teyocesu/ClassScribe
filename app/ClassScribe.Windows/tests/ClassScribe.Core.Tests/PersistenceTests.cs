@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace ClassScribe.Core.Tests;
@@ -5,6 +7,7 @@ namespace ClassScribe.Core.Tests;
 [TestClass]
 public sealed class PersistenceTests
 {
+    private static readonly JsonSerializerOptions WebJsonOptions = new(JsonSerializerDefaults.Web);
     private string temporaryRoot = null!;
 
     [TestInitialize]
@@ -113,7 +116,7 @@ public sealed class PersistenceTests
         var summary = new SessionStore(temporaryRoot).ScanSessions().Single();
 
         Assert.IsTrue(summary.IsRecoverable);
-        StringAssert.Contains("truncada", summary.RecoveryReason!);
+        StringAssert.Contains(summary.RecoveryReason!, "truncada");
         CollectionAssert.AreEqual(corruptMetadata, await File.ReadAllBytesAsync(metadataPath));
         Assert.AreEqual("texto parcial conservado", await File.ReadAllTextAsync(summary.PreferredTextPath!));
     }
@@ -136,11 +139,21 @@ public sealed class PersistenceTests
         Directory.CreateDirectory(sessionsRoot);
         Directory.CreateDirectory(outside);
         var linkedSession = Path.Combine(sessionsRoot, "linked-session");
-        Directory.CreateSymbolicLink(linkedSession, outside);
+        await CreateDirectoryLinkAsync(linkedSession, outside);
         var store = new SessionStore(sessionsRoot);
 
-        await Assert.ThrowsExactlyAsync<UnauthorizedAccessException>(
-            () => store.SaveMetadataAsync(new ClassMetadata { Subject = "Privada" }, linkedSession));
+        try
+        {
+            await Assert.ThrowsExactlyAsync<UnauthorizedAccessException>(
+                () => store.SaveMetadataAsync(new ClassMetadata { Subject = "Privada" }, linkedSession));
+        }
+        finally
+        {
+            if (Directory.Exists(linkedSession))
+            {
+                Directory.Delete(linkedSession);
+            }
+        }
     }
 
     [TestMethod]
@@ -226,7 +239,8 @@ public sealed class PersistenceTests
         var folder = store.CreateFolder("Fuentes", DateTimeOffset.UtcNow);
         var raw = Path.Combine(folder, "source.raw");
         await File.WriteAllBytesAsync(raw, new byte[PcmWaveFile.SampleRate * 2]);
-        var wave = await PcmWaveFile.WrapRawAsync(raw, Path.Combine(folder, "source.wav"));
+        var wave = Path.Combine(folder, "source.wav");
+        await PcmWaveFile.WrapRawAsync(raw, wave);
         var sourceBefore = await File.ReadAllBytesAsync(wave);
         var attempt = SessionAttemptID.Create(Guid.NewGuid(), 1);
         var original = new TranscriptSegment
@@ -284,21 +298,21 @@ public sealed class PersistenceTests
             },
             diarizationProposal: proposal);
 
-        var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
         var artifact = JsonSerializer.Deserialize<ASRTranscriptArtifact>(
-            await File.ReadAllTextAsync(Path.Combine(folder, reference.RelativePath)), jsonOptions);
+            await File.ReadAllTextAsync(Path.Combine(folder, reference.RelativePath)), WebJsonOptions);
         var overlay = JsonSerializer.Deserialize<HumanCorrectionOverlay>(
-            await File.ReadAllTextAsync(Path.Combine(folder, "human-correction-overlay.json")), jsonOptions);
+            await File.ReadAllTextAsync(Path.Combine(folder, "human-correction-overlay.json")), WebJsonOptions);
         var persistedMetadata = JsonSerializer.Deserialize<ClassMetadata>(
-            await File.ReadAllTextAsync(Path.Combine(folder, "metadata.json")), jsonOptions);
+            await File.ReadAllTextAsync(Path.Combine(folder, "metadata.json")), WebJsonOptions);
         Assert.AreEqual("Persona desconocida", artifact!.Segments.Single().SpeakerID);
         Assert.AreEqual("corrección humana", overlay!.EditedAllText);
         Assert.AreEqual(reference.RunID, persistedMetadata!.AsrOriginalReference!.RunID);
         Assert.IsTrue(persistedMetadata.DiarizationProposalReferences.Any(item => item.ProposalID == proposal.ProposalID));
         Assert.AreEqual("human-correction-overlay.json", persistedMetadata.HumanCorrectionOverlayReference!.RelativePath);
         CollectionAssert.AreEqual(sourceBefore, await File.ReadAllBytesAsync(wave));
-        StringAssert.Contains("\"schemaVersion\": 2", await File.ReadAllTextAsync(Path.Combine(folder, "metadata.json")));
-        StringAssert.Contains("\"sessionPhase\": \"complete\"", await File.ReadAllTextAsync(Path.Combine(folder, "metadata.json")));
+        var persistedMetadataJson = await File.ReadAllTextAsync(Path.Combine(folder, "metadata.json"));
+        StringAssert.Contains(persistedMetadataJson, "\"schemaVersion\": 2");
+        StringAssert.Contains(persistedMetadataJson, "\"sessionPhase\": \"complete\"");
     }
 
     [TestMethod]
@@ -348,9 +362,10 @@ public sealed class PersistenceTests
         Assert.AreEqual(humanProfessor, await File.ReadAllTextAsync(Path.Combine(folder, "professor.txt")));
         var persistedSegments = JsonSerializer.Deserialize<List<TranscriptSegment>>(
             await File.ReadAllTextAsync(Path.Combine(folder, "all-speakers.json")),
-            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            WebJsonOptions);
         Assert.AreEqual("Persona 2", persistedSegments!.Single().SpeakerID);
-        StringAssert.Contains("resultado automático nuevo", await File.ReadAllTextAsync(Path.Combine(folder, "all-speakers.json")));
+        var persistedSegmentsJson = await File.ReadAllTextAsync(Path.Combine(folder, "all-speakers.json"));
+        StringAssert.Contains(persistedSegmentsJson, "resultado automático nuevo");
 
         var freshFolder = store.CreateFolder("Automático sin overlay", DateTimeOffset.UtcNow);
         await store.SaveAutomaticProjectionAsync(
@@ -363,6 +378,75 @@ public sealed class PersistenceTests
             automaticAllText: "automático sin overlay",
             automaticProfessorText: "profesor sin overlay");
         Assert.IsFalse(File.Exists(Path.Combine(freshFolder, "human-correction-overlay.json")));
+    }
+
+    private static async Task CreateDirectoryLinkAsync(string link, string target)
+    {
+        try
+        {
+            Directory.CreateSymbolicLink(link, target);
+        }
+        catch (IOException symbolicLinkError) when (OperatingSystem.IsWindows())
+        {
+            await CreateJunctionOrMarkSetupInconclusiveAsync(link, target, symbolicLinkError);
+        }
+        catch (UnauthorizedAccessException symbolicLinkError) when (OperatingSystem.IsWindows())
+        {
+            await CreateJunctionOrMarkSetupInconclusiveAsync(link, target, symbolicLinkError);
+        }
+
+        var attributes = File.GetAttributes(link);
+        Assert.IsTrue(
+            (attributes & FileAttributes.ReparsePoint) != 0,
+            "El enlace de directorio debe ser un reparse point.");
+    }
+
+    private static async Task CreateJunctionOrMarkSetupInconclusiveAsync(
+        string link,
+        string target,
+        Exception symbolicLinkError)
+    {
+        try
+        {
+            using var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                },
+            };
+            process.StartInfo.ArgumentList.Add("/c");
+            process.StartInfo.ArgumentList.Add("mklink");
+            process.StartInfo.ArgumentList.Add("/J");
+            process.StartInfo.ArgumentList.Add(link);
+            process.StartInfo.ArgumentList.Add(target);
+
+            if (!process.Start())
+            {
+                throw new InvalidOperationException("cmd.exe no pudo iniciarse.");
+            }
+
+            var standardOutput = process.StandardOutput.ReadToEndAsync();
+            var standardError = process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            var output = await standardOutput;
+            var errorOutput = await standardError;
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    $"mklink /J terminó con código {process.ExitCode}. stdout: {output}; stderr: {errorOutput}");
+            }
+        }
+        catch (Exception junctionError)
+        {
+            Assert.Inconclusive(
+                $"No se pudo crear el enlace simbólico ni el junction local. "
+                + $"Symlink: {symbolicLinkError}; junction: {junctionError}");
+        }
     }
 
     [TestMethod]

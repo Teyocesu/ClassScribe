@@ -114,6 +114,8 @@ public sealed class MasterFrameClockTests
                 AudioPcmFormat.Create(48_000, 1, AudioSampleEncoding.Float32LE),
                 firstGeneration);
             writer.CommitFrames(first.FrameCount);
+            var firstTail = writer.FlushPendingPacket();
+            writer.CommitFrames(firstTail.FrameCount);
 
             var inputFormat = AudioPcmFormat.Create(44_100, 1, AudioSampleEncoding.PcmS16LE);
             var second = writer.PreparePacket(
@@ -124,12 +126,15 @@ public sealed class MasterFrameClockTests
             writer.CommitFrames(second.FrameCount);
             var tail = writer.FlushPendingPacket();
             writer.CommitFrames(tail.FrameCount);
-            var framesAfterFirstDrain = writer.FramesWritten;
+            var framesAfterSecondDrain = writer.FramesWritten;
             var secondTail = writer.FlushPendingPacket();
             writer.CommitFrames(secondTail.FrameCount);
 
             Assert.AreEqual(0, secondTail.FrameCount);
-            Assert.AreEqual(framesAfterFirstDrain, writer.FramesWritten);
+            Assert.AreEqual(framesAfterSecondDrain, writer.FramesWritten);
+            Assert.AreEqual(
+                first.FrameCount + firstTail.FrameCount + second.FrameCount + tail.FrameCount,
+                writer.FramesWritten);
             Assert.AreEqual(writer.FrameClock!.TargetSourceFrames, writer.FramesWritten);
         }
         finally

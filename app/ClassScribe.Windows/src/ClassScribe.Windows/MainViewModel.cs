@@ -719,8 +719,13 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        var operation = BeginOperation();
         var attempt = activeAttempt;
+        if (attempt is null)
+        {
+            return;
+        }
+
+        var operation = BeginOperation();
         IsBusy = true;
         IsPaused = false;
         WarningText = string.Empty;
@@ -1191,6 +1196,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private async Task RunElapsedTimerAsync(CancellationToken cancellationToken)
     {
         var attempt = activeAttempt;
+        if (attempt is null)
+        {
+            return;
+        }
+
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
         {

@@ -19,10 +19,15 @@ public sealed class StreamingMasterResampler
         int outputRate,
         int outputChannels)
     {
-        if (inputRate <= 0 || inputChannels <= 0 || outputRate <= 0
-            || outputChannels is < 1 or > 2)
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(inputRate);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(inputChannels);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(outputRate);
+        if (outputChannels is < 1 or > 2)
         {
-            throw new ArgumentOutOfRangeException();
+            throw new ArgumentOutOfRangeException(
+                nameof(outputChannels),
+                outputChannels,
+                "El número de canales de salida debe estar entre 1 y 2.");
         }
 
         InputRate = inputRate;
