@@ -129,7 +129,7 @@
                      ToolTip="Nombres propios, siglas y términos separados por comas" />
 
             <TextBlock Style="{StaticResource SectionLabel}" Text="Nivel de audio" />
-            <ProgressBar Value="{Binding AudioLevel}" Maximum="1" Height="10" Margin="4,3,4,8"
+            <ProgressBar Value="{Binding AudioLevel, Mode=OneWay}" Maximum="1" Height="10" Margin="4,3,4,8"
                          Foreground="{StaticResource AccentBrush}" />
 
             <UniformGrid Columns="2" Margin="0,4,0,0">
@@ -144,7 +144,7 @@
                       Click="Cancel_Click" />
             </UniformGrid>
 
-            <ProgressBar Value="{Binding ModelProgress}" Maximum="1" Height="5" Margin="4,12,4,4"
+            <ProgressBar Value="{Binding ModelProgress, Mode=OneWay}" Maximum="1" Height="5" Margin="4,12,4,4"
                          Foreground="{StaticResource AccentBrush}" />
 
             <Border Background="#FFF3DA" BorderBrush="#F1D18C" BorderThickness="1"

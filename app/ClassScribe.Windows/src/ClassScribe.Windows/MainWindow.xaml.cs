@@ -12,6 +12,7 @@ public partial class MainWindow : Window, IAsyncDisposable
     private readonly MainViewModel viewModel;
     private bool initialized;
     private bool closeReady;
+    private bool closeInProgress;
 
     public MainWindow()
     {
@@ -154,40 +155,56 @@ public partial class MainWindow : Window, IAsyncDisposable
         }
 
         e.Cancel = true;
-        if (viewModel.IsRecording)
+        if (closeInProgress)
         {
-            var answer = MessageBox.Show(
-                this,
-                "Hay una grabación activa. ¿Quieres detenerla, guardar el audio y salir?",
-                "ClassScribe",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning);
-            if (answer != MessageBoxResult.Yes)
-            {
-                return;
-            }
-
-            await viewModel.StopForExitAsync().ConfigureAwait(true);
-        }
-        else if (viewModel.IsBusy)
-        {
-            var answer = MessageBox.Show(
-                this,
-                "Hay un procesamiento en curso. ¿Quieres cancelarlo de forma segura y salir?",
-                "ClassScribe",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning);
-            if (answer != MessageBoxResult.Yes)
-            {
-                return;
-            }
-
-            viewModel.CancelCurrentOperation();
+            return;
         }
 
-        await DisposeAsync().ConfigureAwait(true);
-        closeReady = true;
-        Close();
+        closeInProgress = true;
+        try
+        {
+            if (viewModel.IsRecording)
+            {
+                var answer = MessageBox.Show(
+                    this,
+                    "Hay una grabación activa. ¿Quieres detenerla, guardar el audio y salir?",
+                    "ClassScribe",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+                if (answer != MessageBoxResult.Yes)
+                {
+                    return;
+                }
+
+                await viewModel.StopForExitAsync().ConfigureAwait(true);
+            }
+            else if (viewModel.IsBusy)
+            {
+                var answer = MessageBox.Show(
+                    this,
+                    "Hay un procesamiento en curso. ¿Quieres cancelarlo de forma segura y salir?",
+                    "ClassScribe",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+                if (answer != MessageBoxResult.Yes)
+                {
+                    return;
+                }
+
+                viewModel.CancelCurrentOperation();
+            }
+
+            await DisposeAsync().ConfigureAwait(true);
+            closeReady = true;
+            await Dispatcher.InvokeAsync(Close);
+        }
+        finally
+        {
+            if (!closeReady)
+            {
+                closeInProgress = false;
+            }
+        }
     }
 
     public async ValueTask DisposeAsync()

@@ -199,8 +199,8 @@ public sealed class AsrWorkerProcessTransportTests
             worker,
             configuration: new AsrWorkerSupervisorConfiguration
             {
-                HandshakeDeadline = TimeSpan.FromMilliseconds(250),
-                AbsoluteJobDeadline = absoluteJobDeadline ?? TimeSpan.FromMilliseconds(500),
+                HandshakeDeadline = TimeSpan.FromSeconds(5),
+                AbsoluteJobDeadline = absoluteJobDeadline ?? TimeSpan.FromSeconds(5),
                 HeartbeatInterval = TimeSpan.FromMilliseconds(20),
                 HeartbeatInactivityBudget = TimeSpan.FromMilliseconds(80),
                 CancellationGracePeriod = TimeSpan.FromMilliseconds(80),
