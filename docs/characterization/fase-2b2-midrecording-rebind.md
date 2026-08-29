@@ -1,6 +1,6 @@
 # Caracterización de Fase 2B.2 — rebind de source durante una grabación
 
-Estado: **PHASE 2B.2 FIXED / PARTIAL — blockers finales de revisión corregidos**.
+Estado: **PHASE 2B.2 PASS en Windows W1B; macOS físico permanece PENDING**.
 
 La implementación cubre el rebind de la encarnación nativa de una aplicación
 durante una misma sesión. El intento de sesión, el audio durable, el timeline
@@ -96,6 +96,14 @@ El silencio se escribe en chunks acotados. El presupuesto de 30 s aplica al
 gap total: si se supera, produce un fault explícito y detiene la captura; no se
 devuelve `0` fingiendo éxito.
 
+Si la identidad seleccionada queda `Missing`, `Ambiguous` o
+`UnsupportedWeakIdentity`, la observación de source loss se mantiene ligada al
+intento y a la generación, con reloj monotónico y el mismo límite seguro de
+30 s. No se elige un sibling por nombre o PID. Una resolución actual o un
+replacement verificado resetea la observación; una pérdida persistente publica
+`CaptureFailureCategory.Source` exactamente una vez, sin autoswitch a
+`systemOutput`.
+
 El seam de writer se usa desde `WindowsAudioCapture` y cubre también el
 segundo gate de callback antes de encolar el paquete durable. No requiere
 WASAPI físico para probar la transición de generación.
@@ -136,15 +144,19 @@ writer boundary usado por `WindowsAudioCapture`
 - `./scripts/pre-push.sh --with-tests`: **PASS — 221 tests macOS**.
 - `git diff --check` sobre archivos intencionales: **PASS**.
 - Build release de ClassScribe: **PASS**.
+- Windows W0/W1A/W1B: **PASS** — SDK canónico 10.0.302, restore locked,
+  build 0 warnings/0 errors, 194/194 tests, publish, PE/native y worker smoke.
+- Windows W1A/W1B físicos: **PASS** — application loopback/rebind, system
+  output/endpoint change, Stop/finalización, source loss persistente, CTA y
+  consentimiento nuevo.
 - Fuentes AudioTapLib: compiladas dentro del build/test target de ClassScribe.
 - Suite independiente de `tools/audiotap`: **SKIPPED / BLOCKED — el CLT local
   no expone el módulo XCTest**; no se modificó el toolchain del sistema.
-- Windows runtime/tests físicos: **SKIPPED — `dotnet`/`csc` no disponibles**.
-- Gate físico de reemplazo PID/helper durante una clase real: **PENDING**; no
-  se presenta como PASS sin una aplicación reproducible que pueda reemplazar
+- Gate físico macOS de reemplazo PID/helper durante una clase real: **PENDING**;
+  no se presenta como PASS sin una aplicación reproducible que pueda reemplazar
   root/helpers y conservar AudioObjectIDs observables.
 
 La evidencia demuestra la frontera de ownership, el policy de detección, la
 continuidad durable y los races deterministas mediante seams de producto. No
-certifica todavía el lifecycle físico Windows ni el reemplazo PID físico
+certifica todavía el lifecycle físico de CATap global ni el reemplazo PID físico
 macOS; esos gates siguen pendientes y no se presentan como PASS.

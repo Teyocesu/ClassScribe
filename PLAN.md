@@ -2,9 +2,9 @@
 
 Fecha: 2026-08-26
 
-Baseline canónico del release checkpoint #1: `bad506533e683eabe66870bd88f21ff59f43f3eb` en `v0.8.0-development`.
+Baseline canónico del release checkpoint #1: `9d80826f598b77dfd0646853501e6e5eafac0af6` en `v0.8.0-development`.
 
-Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente**; Fase 1C **ARCHITECTURE APPROVED**; Fase 2A **FIXED / PARTIAL**; Fase 2B.1 **COMPLETE / PARTIAL**; Fase 2B.2 **FIXED / PARTIAL**; Fase 2C.1 y Fase 2C.2 **APPROVED arquitectónicamente y con evidencia local disponible**; Fase 2D **APPROVED arquitectónicamente y con toda la evidencia local disponible**. Runtime/compile Windows y los gates físicos de macOS, Windows y hardware permanecen pendientes o skipped según la evidencia indicada abajo. Fase 2E queda **DIFERIDA / NOT STARTED**.
+Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente**; Fase 1C **ARCHITECTURE APPROVED**; Fase 2A **FIXED / PARTIAL**; Fase 2B.1 **COMPLETE / PARTIAL**; Fase 2B.2 **PASS en Windows**; Fase 2C.1 y Fase 2C.2 **PASS en Windows**; Fase 2D **PASS en Windows para el contrato validado**. Windows W0/W1A/W1B tienen evidencia de runtime y física **PASS**. Permanecen pendientes los gates físicos de macOS, TCC, hardware/device-change y los acceptance gates compartidos indicados abajo. Fase 2E queda **DIFERIDA / NOT STARTED**.
 SPEC canónica: [`docs/specs/v0.8.0.md`](docs/specs/v0.8.0.md)
 
 Este documento es mutable: ordena trabajo pequeño y verificable. No redefine requisitos. Cada fase se valida localmente con el patrón `focused → subsystem`; los gates con TCC, hardware, llamada real o Windows físico están definidos en la SPEC. La frontera estable y la política de release están fijadas por el bloque `RELEASE CHECKPOINT v0.8.0`.
@@ -23,15 +23,15 @@ Salida: SPEC, PLAN y `AGENTS.md`. No se modificó código de producto.
 
 ## Fase 1 — Estado, schema y supervisión
 
-Estado: **APPROVED** en arquitectura y gates locales disponibles. Los gates físicos de release permanecen pendientes.
+Estado: **APPROVED** en arquitectura y gates locales disponibles. Los gates físicos de release macOS/TCC/hardware permanecen pendientes.
 
 Objetivo: crear las fronteras que permiten implementar features sin estados falsos ni datos destructivos.
 
 - [x] Introducir IDs de intento/generation y ejes `CapturePhase`, `AsrPhase`, `SessionPhase` sin strings localizadas persistidas.
 - [x] Definir schema v2 aditivo y golden fixtures de sesiones macOS/Windows v0.7.
 - [x] Separar transcript ASR original, propuestas de diarización y overlay de correcciones.
-- [x] Prototipar protocolo versionado y supervisor del worker ASR en ambas plataformas (serialización y terminalización exactly-once; arquitectura aprobada, runtime Windows pendiente).
-- [x] Probar cancel, crash, heartbeat, deadline y callback tardío con worker falso y transporte process-backed macOS; macOS runtime **PASS**, Windows runtime **PENDING / SKIPPED — dotnet unavailable**.
+- [x] Prototipar protocolo versionado y supervisor del worker ASR en ambas plataformas (serialización y terminalización exactly-once; arquitectura aprobada, runtime Windows validado en W0).
+- [x] Probar cancel, crash, heartbeat, deadline y callback tardío con worker falso y transporte process-backed macOS; macOS runtime **PASS**, Windows runtime W0 **PASS**.
 - [ ] Caracterizar físicamente si setup/teardown de captura requiere aislamiento de proceso.
 
 Exit gate: cancelación determinista por fase, una sesión legacy abre sin reescritura y un worker colgado no bloquea stop ni el intento siguiente.
@@ -40,10 +40,9 @@ Progreso aprobado arquitectónicamente de Fase 1B: se añadieron envelopes versi
 supervisores con una frontera serializada por plataforma, transporte process-backed y fake
 workers deterministas para macOS y Windows. El helper real macOS cubre éxito, crash, malformed
 frame, EOF, heartbeat/deadline, cancelación ignorada y A→B con muerte del proceso. El typecheck
-focalizado y el runtime process-backed macOS pasan; SwiftPM no puede cargar el manifest local y
-`dotnet` no está instalado, por lo que el runtime Windows queda explícitamente **PENDING / SKIPPED**. El
-lifecycle Windows de setup/exit quedó protegido contra la carrera de inicialización, con tests
-deterministas de exit-wins, terminate-wins y setup normal.
+focalizado y el runtime process-backed macOS pasan; el runtime Windows process-backed quedó
+validado con el SDK canónico en W0. El lifecycle Windows de setup/exit quedó protegido contra la
+carrera de inicialización, con tests deterministas de exit-wins, terminate-wins y setup normal.
 
 Progreso aprobado de arquitectura de Fase 1C: la ruta real macOS de aplicación mediante CATap/AudioTapLib
 se ejecutó con audio sintético local a través del nuevo `CaptureNativeExecutor`; setup, primer frame,
@@ -54,35 +53,36 @@ El subsystem físico CATap macOS es **PASS**. La fault injection determinista mo
 plane siguen respondiendo mientras una llamada no cooperativa ocupa el owner, pero B necesariamente
 espera su retorno; process isolation queda **INCONCLUSIVE / evidence-gated** y no es requerida por la
 evidencia actual. El micrófono queda physical gate pending — `SKIPPED — TCC` porque el host local está
-en `.notDetermined`; Windows queda physical/runtime gate pending — `SKIPPED — PHYSICAL WINDOWS / dotnet unavailable`
-porque `dotnet` no está instalado. El detalle reproducible existente está en
+en `.notDetermined`; los gates Windows de runtime, application loopback, system output,
+rebind y endpoint change quedaron validados en W0/W1A/W1B. Hardware/device-change continúa
+pendiente. El detalle reproducible existente está en
 [`docs/characterization/fase-1c-capture.md`](docs/characterization/fase-1c-capture.md).
 
 ## Fase 2 — Captura confiable y audio del equipo
 
-Estado: **FASE 2D APPROVED arquitectónicamente y con toda la evidencia local disponible**: master durable source-rate/stereo separado del derivado ASR 16 kHz mono, con resampling streaming stateful, handoff drenado sin interpolar a través del gap, fallo durable terminal observable y política explícita de formato process-loopback. El runtime/compile Windows (**SKIPPED — dotnet/csc unavailable**), los gates físicos Windows, el gate físico CATap global macOS, TCC y hardware/device-change permanecen pendientes; estos estados no invalidan la aprobación arquitectónica/local ni equivalen a release readiness. Fase 2C.1 y Fase 2C.2 permanecen **APPROVED arquitectónicamente y con evidencia local disponible**; Fase 2A permanece **FIXED / PARTIAL**, Fase 2B.1 permanece **COMPLETE / PARTIAL** y Fase 2B.2 permanece **FIXED / PARTIAL**. Fase 2E queda **DIFERIDA / NOT STARTED**.
+Estado: **FASE 2D PASS en Windows para el contrato validado**: master durable source-rate/stereo separado del derivado ASR 16 kHz mono, con resampling streaming stateful, handoff drenado sin interpolar a través del gap, fallo durable terminal observable y política explícita de formato process-loopback. Windows W0/W1A/W1B validaron restore/build/test, publish, runtime, captura física, endpoint y recovery. Permanecen pendientes el gate físico CATap global macOS, TCC, hardware/device-change y los acceptance gates compartidos; estos estados no equivalen todavía a release readiness. Fase 2C.1 y Fase 2C.2 quedan **PASS en Windows**; Fase 2A permanece **FIXED / PARTIAL**, Fase 2B.1 permanece **COMPLETE / PARTIAL** y Fase 2B.2 queda **PASS en Windows**. Fase 2E queda **DIFERIDA / NOT STARTED**.
 
 Objetivo: diferenciar transporte/señal y agregar global con consentimiento explícito y master fiel.
 
 - [x] Fase 2A: clasificar `awaitingCallbacks`/`noCallbacks`/`silent`/`audible` con reloj monotónico inyectable y fixtures deterministas; voz/VAD queda diferida a Fase 3.
 - [x] Fase 2A: integrar salud de callbacks en la ruta activa macOS y en la llegada de paquetes WASAPI de Windows, conservando ownership por `SessionAttemptID`.
 - [x] Fase 2A: conservar callbacks silenciosos y callbacks vacíos como evidencia de transporte vivo; un stall es distinto de silencio y ASR permanece en un eje separado.
-- [ ] Fase 2A: ejecutar runtime/tests Windows; **SKIPPED — dotnet unavailable**.
+- [x] Fase 2A: ejecutar runtime/tests Windows; **PASS** en W0/W1A/W1B. `NoCallbacks`/silencio no sustituyen la liveness de identidad; la pérdida persistente tiene frontera `Source` separada.
 - [x] Fase 2B.1: separar identidad lógica de encarnación PID y reconciliar aplicación/topología durante startup; validar AudioObjectIDs justo antes del handoff CATap y revalidar el root Windows antes de `BuildAsync`.
 - [x] Fase 2B.2 **FIXED / PARTIAL**: macOS rebind durante grabación con confirmación → stop/drain de la generación vieja → avance de generación → salud fresca → build/start, recuperación post-stop explícita y seams de lifecycle; el gate físico PID lifecycle permanece pendiente.
-- [x] Fase 2B.2 **FIXED / PARTIAL**: Windows rebind durante grabación con drenaje de callbacks antes del cambio, timeline durable anclado al primer PCM no vacío inicial o post-handoff, gap total máximo de 30 s y reconstrucción por root reemplazado; runtime físico **SKIPPED — dotnet/csc unavailable**.
-- [x] Fase 2C.1 **APPROVED arquitectónicamente / gates locales disponibles**: infraestructura CATap global y WASAPI render loopback con exclusión/self, autorización efímera por intento, generaciones, ownership durable, lifecycle serializado, Stop single-flight real hasta `FinalizeRaw`, cleanup post-`BuildAsync` y failure terminal observable; Windows compile/runtime y gates físicos pendientes.
-- [x] Fase 2C.2 **APPROVED arquitectónicamente / evidencia local disponible**: elección online aplicación/audio del equipo, modal de privacidad por intento, capability efímero ligado al intento y CTA `Capturar audio del equipo`; correctivo de ownership de presentación macOS **APPROVED**, separado del pending domain request; sin transición automática ni hot-switch. macOS local PASS; Windows tests/static review PASS y compile/runtime SKIPPED — dotnet/csc unavailable; gates Windows/físicos pendientes.
-- [x] Fase 2D **APPROVED arquitectónicamente y con toda la evidencia local disponible**: separar master source-rate/stereo durable (`master.raw` + manifest) del derivado ASR 16 kHz mono (`source.wav`); mantener un `MasterFrameClock` por `SessionAttemptID` con remainder global entre generations/formats, resetear sólo el estado de interpolación, evitar silencio sintético por lookahead y drenar/flushear cada converter exactamente una vez; transportar fallos terminales tipados (`source`/`durableMaster`) con recovery suggestion sólo para pérdida de una aplicación; en Windows, `DurableMaster`/`Storage` domina `StopAsync` como fallo recoverable aunque `source.wav` sea derivable, sin `ProcessWaveAsync`, y el timeout de handoff >30 s queda como `Source`; conservar la política explícita observable de formato process-loopback Windows. Runtime/compile Windows (**SKIPPED — dotnet/csc unavailable**), gates físicos Windows, CATap global físico macOS, TCC y hardware/device-change permanecen pendientes y no se presentan como PASS.
+- [x] Fase 2B.2 **PASS en Windows**: rebind durante grabación con drenaje de callbacks antes del cambio, timeline durable anclado al primer PCM no vacío inicial o post-handoff, gap total máximo de 30 s y reconstrucción por root reemplazado. Missing, Ambiguous y weak identity permanecen unresolved; no se selecciona sibling inseguro. La pérdida persistente supera el budget y publica `Source` exactamente una vez; el rebind verificado dentro del budget conserva la sesión.
+- [x] Fase 2C.1 **PASS en Windows**: infraestructura CATap global y WASAPI render loopback con exclusión/self, autorización efímera por intento, generaciones, ownership durable, lifecycle serializado, Stop single-flight real hasta `FinalizeRaw`, cleanup post-`BuildAsync` y failure terminal observable; W0/W1A/W1B cubren compile/runtime, system output, endpoint change y shutdown.
+- [x] Fase 2C.2 **PASS en Windows**: elección online aplicación/audio del equipo, modal de privacidad por intento, capability efímero ligado al intento y CTA `Capturar audio del equipo`; correctivo de ownership de presentación macOS **APPROVED**, separado del pending domain request; sin transición automática ni hot-switch. W1A/W1B validan cancel/accept, CTA y consentimiento nuevo.
+- [x] Fase 2D **PASS en Windows para el contrato validado**: separar master source-rate/stereo durable (`master.raw` + manifest) del derivado ASR 16 kHz mono (`source.wav`); mantener un `MasterFrameClock` por `SessionAttemptID` con remainder global entre generations/formats, resetear sólo el estado de interpolación, evitar silencio sintético por lookahead y drenar/flushear cada converter exactamente una vez; transportar fallos terminales tipados (`source`/`durableMaster`) con recovery suggestion sólo para pérdida de una aplicación; en Windows, `DurableMaster`/`Storage` domina `StopAsync` como fallo recoverable aunque `source.wav` sea derivable, sin `ProcessWaveAsync`, y el timeout de handoff >30 s queda como `Source`; conservar la política explícita observable de formato process-loopback Windows. W0/W1A/W1B validan formato, persistencia, Stop, recovery y estabilidad post-teardown. La fault injection física destructiva de durable/storage no se ejecutó.
 - [ ] Fase 2E **DIFERIDA / NOT STARTED**: `master.raw` no está limitado por RIFF; `source.wav` sigue siendo WAV. No elegir RF64, W64 o segmentación sin fixture y evidencia de que el contrato actual bloquea una duración razonable; la truncación silenciosa está prohibida.
 
 Exit gate: los tests prueban que global es inalcanzable sin consentimiento; fixtures/gates físicos demuestran señal, PID lifecycle, master fidelity y recuperación.
 
-Caracterización de Fase 2A: [`docs/characterization/fase-2a-signal-health.md`](docs/characterization/fase-2a-signal-health.md). Caracterización de Fase 2B.1: [`docs/characterization/fase-2b1-application-identity.md`](docs/characterization/fase-2b1-application-identity.md). Caracterización de Fase 2B.2: [`docs/characterization/fase-2b2-midrecording-rebind.md`](docs/characterization/fase-2b2-midrecording-rebind.md). Caracterización de Fase 2C.1: [`docs/characterization/fase-2c1-system-output-backends.md`](docs/characterization/fase-2c1-system-output-backends.md). Caracterización de Fase 2C.2: [`docs/characterization/fase-2c2-system-output-consent.md`](docs/characterization/fase-2c2-system-output-consent.md). Caracterización de Fase 2D: [`docs/characterization/fase-2d-master-fidelity.md`](docs/characterization/fase-2d-master-fidelity.md). Los hallazgos de revisión de 2A permanecen corregidos; el rebind 2B.2, los gates de arquitectura 2C.1/2C.2 y el correctivo 2D de streaming master/ASR, fallo durable y formato process-loopback están implementados con evidencia local disponible. Windows runtime (**SKIPPED — dotnet/csc unavailable**) y los gates físicos de TCC, señal global, cambio de endpoint, reemplazo PID/helper y fidelidad física master permanecen explícitamente pendientes.
+Caracterización de Fase 2A: [`docs/characterization/fase-2a-signal-health.md`](docs/characterization/fase-2a-signal-health.md). Caracterización de Fase 2B.1: [`docs/characterization/fase-2b1-application-identity.md`](docs/characterization/fase-2b1-application-identity.md). Caracterización de Fase 2B.2: [`docs/characterization/fase-2b2-midrecording-rebind.md`](docs/characterization/fase-2b2-midrecording-rebind.md). Caracterización de Fase 2C.1: [`docs/characterization/fase-2c1-system-output-backends.md`](docs/characterization/fase-2c1-system-output-backends.md). Caracterización de Fase 2C.2: [`docs/characterization/fase-2c2-system-output-consent.md`](docs/characterization/fase-2c2-system-output-consent.md). Caracterización de Fase 2D: [`docs/characterization/fase-2d-master-fidelity.md`](docs/characterization/fase-2d-master-fidelity.md). Los hallazgos de revisión de 2A permanecen corregidos; el rebind 2B.2, los gates de arquitectura 2C.1/2C.2 y el correctivo 2D de streaming master/ASR, fallo durable y formato process-loopback están implementados con evidencia local disponible. Windows W0/W1A/W1B están **PASS**; los pendientes restantes son macOS/TCC/hardware y los acceptance gates compartidos de legacy, clase larga y no truncación silenciosa.
 
 ## RELEASE CHECKPOINT v0.8.0
 
-Estado: **RELEASE CHECKPOINT REBASELINED** sobre `bad506533e683eabe66870bd88f21ff59f43f3eb` en `v0.8.0-development`.
+Estado: **RELEASE CHECKPOINT REBASELINED** sobre `9d80826f598b77dfd0646853501e6e5eafac0af6` en `v0.8.0-development`.
 
 ### Frontera funcional estable
 
@@ -104,6 +104,12 @@ readiness. No forman parte del requisito estable nuevo VAD/aceptación ASR,
 circuit breaker, prewarm o backlog de Fase 3; el overhaul completo de speakers
 de Fase 4; ni la localización completa de Fase 5.
 
+### Gates Windows ejecutados
+
+- Windows W0: **PASS** — SDK canónico .NET 10.0.302, restore locked, build 0 warnings/0 errors, 194/194 tests, self-contained publish, PE/native y worker smoke.
+- Windows W1A: **PASS** — application loopback, system output, consentimiento, micrófono, artefactos durable, estabilidad post-Stop y startup/shutdown reales.
+- Windows W1B: **PASS** — rebind físico, continuidad de sesión/master, cambio de endpoint, finalización, source-liveness persistente, CTA y consentimiento nuevo sin autoswitch.
+
 ### Gates faltantes antes de RC/estable
 
 macOS requiere build/tests locales, TCC de audio/micrófono, CATap real de
@@ -113,19 +119,24 @@ del master, `source.wav` válido, Stop/recovery y ausencia de callbacks. El
 baseline local tiene build/tests **PASS**; TCC y los gates físicos permanecen
 **PENDING**.
 
-Windows requiere `dotnet restore/build/test`, lanzamiento real, application
-loopback, reemplazo/rebind de root/helper, system output/render endpoint,
-consentimiento, endpoint change, master/manifest/`source.wav`, durable
-write/recovery, Stop single-flight y rechazo de start durante finalización.
-`dotnet`/`csc` no están disponibles: compile/runtime queda **SKIPPED** y los
-gates físicos quedan **PENDING**.
+Windows W0/W1A/W1B ya están **PASS**: restore/build/test, lanzamiento real,
+application loopback, reemplazo/rebind de root/helper, system output/render
+endpoint, consentimiento, endpoint change, master/manifest/`source.wav`,
+durable write/recovery, Stop single-flight y rechazo de start durante
+finalización. No se presenta ningún gate Windows de esta frontera como pendiente.
 
 Ambas plataformas requieren abrir/reprocesar legacy, demostrar que un fallo de
 aplicación nunca autoswitcha a system output, que un fallo durable/storage
 nunca sugiere system output, que system output siempre exige consentimiento
 nuevo, que no hay truncación silenciosa y que un fixture de clase larga
-representativa cabe en el contrato WAV actual. Lo no ejecutado queda
-**PENDING/SKIPPED**, nunca PASS por inferencia.
+representativa cabe en el contrato WAV actual. Esos acceptance gates compartidos
+y los gates físicos macOS/TCC/hardware siguen **PENDING/SKIPPED**, nunca PASS por
+inferencia.
+
+### Nota de packaging
+
+`VERSION` todavía contiene `0.7.0`. Antes de cortar RC, la identidad de package/release
+debe reconciliarse con v0.8.0; no forma parte de este gate y no se modifica aquí.
 
 ### Política de release
 
@@ -206,10 +217,10 @@ que exige el checkpoint, sin convertir pendientes en PASS.
 - [ ] macOS: build/tests, TCC, CATap app/global con self-exclusion, identidad/rebind,
       consentimiento system output, output-device change, master/source.wav,
       Stop/recovery y ausencia de callbacks.
-- [ ] Windows: restore/build/test, lanzamiento, application loopback,
+- [x] Windows W0/W1A/W1B: restore/build/test, lanzamiento, application loopback,
       root/helper replacement/rebind, render endpoint/consent, endpoint change,
       master/manifest/source.wav, durable recovery, Stop single-flight y start
-      rejection durante finalización.
+      rejection durante finalización — **PASS**.
 - [ ] Ambas: legacy open/reprocess, no autoswitch por fallo de aplicación,
       no suggestion por fallo durable/storage, consentimiento nuevo para
       system output, no silent truncation y fixture de clase larga dentro del

@@ -4,12 +4,12 @@ Fecha: 2026-08-25
 
 Baseline de implementación: `d70795b2ed74bfd5b812ba1d1782c3545c0d547e`
 
-Estado: **APPROVED arquitectónicamente y con evidencia local disponible**. La UX
-y el control-plane de consentimiento quedaron implementados en macOS y Windows;
-el correctivo de ownership del modal macOS está **APPROVED** y la revisión local
-macOS pasó. Windows compile/runtime queda **SKIPPED — dotnet/csc unavailable**.
-La Fase 2 completa sigue abierta y ningún gate físico o de runtime se convierte
-en PASS.
+Estado: **PASS en Windows W0/W1A/W1B; APPROVED arquitectónicamente en macOS**.
+La UX y el control-plane de consentimiento quedaron implementados en macOS y
+Windows; el correctivo de ownership del modal macOS está **APPROVED** y la
+revisión local macOS pasó. Los gates físicos macOS/TCC/hardware siguen
+pendientes. La Fase 2 completa sigue abierta y ningún gate no ejecutado se
+convierte en PASS.
 
 ## UX de fuente online
 
@@ -137,15 +137,14 @@ Windows:
   consentimiento;
 - static review de `MainWindow`, `MainViewModel` y `WindowsAudioCapture` —
   **PASS**;
-- compile/runtime Windows — **SKIPPED — dotnet/csc unavailable**; no se
-  instaló ningún SDK.
+- W0/W1A/W1B compile/runtime y físico — **PASS**; 194/194 tests, publish,
+  endpoint change, rebind, source loss persistente, Stop/finalización y
+  consentimiento nuevo.
 
 ## Gates heredados y trabajo diferido
 
 Siguen **PENDING/SKIPPED**, no PASS:
 
-- Windows compile/runtime físico;
-- Windows physical gate;
 - macOS CATap global physical gate;
 - TCC;
 - hardware/device-change physical gates.

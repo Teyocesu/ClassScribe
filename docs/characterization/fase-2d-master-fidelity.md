@@ -2,15 +2,15 @@
 
 Fecha: 2026-08-26
 
-Estado: **APPROVED arquitectónicamente y con toda la evidencia local disponible**.
-La separación entre el master durable de application/systemOutput y el derivado
-ASR 16 kHz mono está implementada en el target macOS activo, en el paquete
-AudioTap y en el product path Windows. Esta corrección añade resampling master
-streaming stateful, handoff determinista y propagación terminal de fallos
-durables; Windows usa una política explícita de formato observable para
-process-loopback. Hay build de producto macOS y contratos deterministas
-disponibles. XCTest standalone no está disponible en este host y `dotnet`/`csc`
-tampoco. Los gates runtime/physical que requieren esos entornos o audio real
+Estado: **PASS en Windows W0/W1A/W1B para el contrato validado; APPROVED
+arquitectónicamente en macOS**. La separación entre el master durable de
+application/systemOutput y el derivado ASR 16 kHz mono está implementada en el
+target macOS activo, en el paquete AudioTap y en el product path Windows. Esta
+corrección añade resampling master streaming stateful, handoff determinista y
+propagación terminal de fallos durables; Windows usa una política explícita de
+formato observable para process-loopback. Hay build de producto macOS y
+contratos deterministas disponibles. XCTest standalone no está disponible en
+este host; los gates físicos macOS/TCC/hardware y el contrato de clase larga
 permanecen **SKIPPED/PENDING**, no PASS.
 
 La aprobación de 2D es arquitectónica/local y no afirma multiplatform release
@@ -82,8 +82,8 @@ Los paths se validan como relativos, permanecen dentro de la carpeta de la
 sesión y se restringen a los nombres contractuales. No se guarda audio en
 JSON. El manifest se escribe atómicamente antes del primer byte del master;
 los permisos del archivo son owner-only en macOS (`0600`). Windows usa la
-carpeta privada de sesión bajo `LocalApplicationData` y su ACL heredada; la
-confirmación en un runtime Windows queda pendiente.
+carpeta privada de sesión bajo `LocalApplicationData` y su ACL heredada; W0/W1A/W1B
+confirmaron el runtime, la persistencia y la recuperación del contrato probado.
 
 ## macOS — master y ASR live
 
@@ -178,8 +178,9 @@ incluye `durableMasterFailureCannotFinalizeAsSuccess`,
 `durableFailureDoesNotRecommendSystemOutputWindows`,
 `newAttemptDoesNotInheritDurableFailureWindows` y
 `stopFollowersObserveSameDurableFailure`; también se cubre la falla de
-finalización/storage. El compile/runtime Windows queda **SKIPPED —
-dotnet/csc unavailable**; no se instaló SDK.
+finalización/storage. W0/W1A/W1B validaron Windows con el SDK canónico 10.0.302:
+194/194 tests, build sin warnings/errores, publish, PE/native, worker smoke y
+gates físicos de captura/rebind/endpoint **PASS**.
 
 Los contratos deterministas cubren 44.1 kHz → 48 kHz con 10.000 callbacks de
 256 frames, 48 kHz → 44.1 kHz con callbacks de 127 frames, tamaños alternos
@@ -226,23 +227,20 @@ Resultados reproducibles de este checkout:
 | `./scripts/pre-push.sh --with-tests` | **PASS**; bundle macOS, compilación de tests y 251 tests pasaron |
 | `swift build --package-path tools/audiotap -c release -j 2` con el `.toolchain` local y `-strict-concurrency=complete` | **PASS** |
 | `swift test --package-path tools/audiotap -j 2` con el `.toolchain` local, `-resource-dir` y `-strict-concurrency=complete` | **SKIPPED — XCTest unavailable**; Command Line Tools devuelve `no such module 'XCTest'` |
-| Product path Windows y contratos equivalentes | código y tests escritos; revisión estática disponible; runtime/compile **SKIPPED — dotnet/csc unavailable** |
+| Product path Windows y contratos equivalentes | **PASS**; 194/194 tests, runtime físico W1A/W1B, rebind, endpoint, persistencia y recovery |
 | `git diff --check` | **PASS** |
 
 La suite standalone de AudioTap no se presenta como PASS porque el host no
 expone XCTest utilizable. La suite de producto macOS sí pasó mediante
-`pre-push`, incluyendo el test product-path de fallo durable; tampoco se
-presenta la suite Windows como compilada o ejecutada. No se inventan conteos de
-tests.
+`pre-push`, incluyendo el test product-path de fallo durable. La suite Windows
+quedó compilada y ejecutada dentro de W0/W1A/W1B con 194/194 tests PASS.
 
 ## Gates físicos y trabajo diferido
 
 No se ejecutó un gate de fidelidad física CATap con output audible real,
 exclusión de ClassScribe, cambio de dispositivo y teardown; queda **PENDING**.
-El gate TCC queda **PENDING**. Los gates físicos de Windows y cambio de
-hardware/device quedan **PENDING**; el compile/runtime Windows queda
-**SKIPPED — dotnet/csc unavailable**. Las pruebas sintéticas y los builds
-locales no convierten esos estados en PASS.
+El gate TCC y el cambio de hardware/device macOS quedan **PENDING**. Las
+pruebas sintéticas y los builds locales no convierten esos estados en PASS.
 
 Fase 2E queda diferida y no se inicia en este checkpoint. La decisión
 provisional es que `master.raw` no impone un límite RIFF y `source.wav` sigue

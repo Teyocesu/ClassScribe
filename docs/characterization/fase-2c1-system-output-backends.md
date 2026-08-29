@@ -4,8 +4,8 @@ Fecha: 2026-08-25
 
 Baseline correctivo final: `v0.8.0-development` = `524319e579e954fc374b07c95ab917f1bd53fe3c`
 Estado final: revisión independiente **APPROVED**; arquitectura/backend/lifecycle
-local **APPROVED**; Windows compile/runtime **SKIPPED — dotnet/csc unavailable**;
-gates físicos **PENDING**. Esto no implica release readiness completo; la UX de
+local **APPROVED**; Windows W0/W1A/W1B runtime y gates físicos **PASS**;
+macOS CATap global/TCC y hardware/device-change permanecen **PENDING**. Esto no implica release readiness completo; la UX de
 Fase 2C.2 se documenta separadamente en
 [`fase-2c2-system-output-consent.md`](fase-2c2-system-output-consent.md).
 
@@ -155,6 +155,13 @@ Se añadieron pruebas deterministas para:
 - serialización real del owner macOS, revalidación de self-exclusions en un
   restart y rechazo de traducciones sin objeto válido.
 
+La validación Windows posterior a W1B fue: 194/194 tests, 0 failed, 0 skipped,
+build sin warnings/errores, publish, PE/native y worker smoke **PASS**.
+
+System output físico Windows: default Multimedia render endpoint y WASAPI
+loopback reales; endpoint A → B conservó la misma sesión/master, sin nueva
+autorización durante el rebind, con Stop y shutdown **PASS**.
+
 `git diff --check` pasa. La última corrida del gate reproducible
 `./scripts/pre-push.sh --with-tests` compiló el producto macOS y ejecutó 227
 tests, incluidos los nuevos tests de lifecycle/self-exclusion, con resultado
@@ -172,15 +179,16 @@ manifest ni se instaló otra toolchain.
 La suite Windows de product path vive en
 `app/ClassScribe.Windows/tests/ClassScribe.Windows.Tests` y usa una fábrica
 inyectable sobre el mismo `WindowsAudioCapture`; no usa una máquina de estados
-paralela. El compile/runtime no se ejecutó porque `dotnet`/`csc` no están
-disponibles. No se instala SDK ni se presenta el runtime como aprobado.
+paralela. W0 ejecutó restore/build/tests con el SDK canónico 10.0.302 y W1A/W1B
+validaron el runtime físico, system output, endpoint change, rebind, Stop y
+shutdown. El resultado Windows fue **PASS**.
 
 ## Gates pendientes y fuera de alcance
 
 El gate físico macOS para CATap global — output audible real, exclusión de
 ClassScribe, cambio de default output y teardown sin callbacks posteriores — no
-se ejecutó en esta sesión. Tampoco se ejecutó el gate TCC ni el gate físico
-Windows. Estos estados son `SKIPPED/PENDING`, no PASS.
+se ejecutó en esta sesión. Tampoco se ejecutó el gate TCC ni el gate físico de
+hardware/device-change. Estos estados son `SKIPPED/PENDING`, no PASS.
 
 La UI de consentimiento explícito y el CTA de Fase 2C.2 están descritos en la
 caracterización separada. La fidelidad master source-rate/stereo frente al derivado ASR 16 kHz mono,
