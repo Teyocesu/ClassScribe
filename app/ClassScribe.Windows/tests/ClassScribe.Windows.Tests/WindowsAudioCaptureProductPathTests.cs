@@ -201,6 +201,152 @@ public sealed class WindowsAudioCaptureProductPathTests
     }
 
     [TestMethod]
+    public async Task persistentMissingApplicationPublishesOneSourceFaultAndStopsRecorder()
+    {
+        var identity = ApplicationIdentity();
+        var candidates = new List<WindowsProcessIncarnation>
+        {
+            new(101, identity),
+        };
+        var clock = new FakeMonotonicClock();
+        var factory = new FakeWindowsAudioCaptureFactory
+        {
+            ProcessRecorderFactory = _ => new FakeWindowsAudioRecorder(new List<string>()),
+        };
+        await using var capture = new WindowsAudioCapture(
+            factory,
+            clock,
+            () => candidates.ToArray());
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        var source = ApplicationSource(identity, 101);
+        var faults = new List<CaptureFault>();
+        capture.CaptureFaulted += (_, fault) => faults.Add(fault);
+
+        try
+        {
+            await capture.StartAsync(source, folder, attempt, CancellationToken.None);
+            candidates.Clear();
+
+            await capture.ProbeApplicationForTestAsync(attempt);
+            clock.NowSeconds = 29.9;
+            await capture.ProbeApplicationForTestAsync(attempt);
+            Assert.AreEqual(0, faults.Count);
+            Assert.AreEqual(0, factory.Recorders[0].StopCount);
+
+            clock.NowSeconds = 30;
+            await capture.ProbeApplicationForTestAsync(attempt);
+
+            Assert.AreEqual(1, faults.Count);
+            Assert.AreEqual(CaptureFailureCategory.Source, faults[0].Category);
+            Assert.IsTrue(
+                faults[0].Error.Message.Contains("límite seguro", StringComparison.OrdinalIgnoreCase));
+            Assert.IsTrue(SpinWait.SpinUntil(
+                () => factory.Recorders[0].StopCount == 1,
+                TimeSpan.FromSeconds(3)));
+
+            clock.NowSeconds = 60;
+            await capture.ProbeApplicationForTestAsync(attempt);
+            Assert.AreEqual(1, faults.Count);
+
+            var wavePath = await capture.StopAsync(CancellationToken.None);
+            Assert.IsTrue(File.Exists(wavePath));
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "master.raw")));
+            Assert.IsTrue(File.Exists(Path.Combine(folder, "audio-manifest.json")));
+            Assert.IsTrue(PcmWaveFile.Validate(wavePath) > 0);
+        }
+        finally
+        {
+            DeleteFolder(folder);
+        }
+    }
+
+    [TestMethod]
+    public async Task applicationNoCallbacksDoesNotPublishSourceBeforeIdentityBudget()
+    {
+        var identity = ApplicationIdentity();
+        var candidates = new List<WindowsProcessIncarnation>
+        {
+            new(101, identity),
+        };
+        var clock = new FakeMonotonicClock();
+        var factory = new FakeWindowsAudioCaptureFactory
+        {
+            ProcessRecorderFactory = _ => new FakeWindowsAudioRecorder(new List<string>()),
+        };
+        await using var capture = new WindowsAudioCapture(
+            factory,
+            clock,
+            () => candidates.ToArray());
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        var faults = new List<CaptureFault>();
+        capture.CaptureFaulted += (_, fault) => faults.Add(fault);
+
+        try
+        {
+            await capture.StartAsync(ApplicationSource(identity, 101), folder, attempt, CancellationToken.None);
+            clock.NowSeconds = CaptureSignalThresholds.Windows.InitialCallbackBudgetSeconds + 6;
+
+            var snapshot = capture.EvaluateSignalHealth(attempt);
+
+            Assert.AreEqual(CaptureSignalState.NoCallbacks, snapshot?.State);
+            Assert.AreEqual(0, faults.Count);
+            await capture.StopAsync(CancellationToken.None);
+        }
+        finally
+        {
+            DeleteFolder(folder);
+        }
+    }
+
+    [TestMethod]
+    public async Task applicationReplacementWithinBudgetUsesExistingRebindPath()
+    {
+        var identity = ApplicationIdentity();
+        var candidates = new List<WindowsProcessIncarnation>
+        {
+            new(101, identity),
+        };
+        var clock = new FakeMonotonicClock();
+        var factory = new FakeWindowsAudioCaptureFactory
+        {
+            ProcessRecorderFactory = _ => new FakeWindowsAudioRecorder(new List<string>()),
+        };
+        await using var capture = new WindowsAudioCapture(
+            factory,
+            clock,
+            () => candidates.ToArray());
+        var folder = NewFolder();
+        var attempt = NewAttempt();
+        var source = ApplicationSource(identity, 101);
+        var faults = new List<CaptureFault>();
+        capture.CaptureFaulted += (_, fault) => faults.Add(fault);
+
+        try
+        {
+            await capture.StartAsync(source, folder, attempt, CancellationToken.None);
+            candidates.Clear();
+            candidates.Add(new WindowsProcessIncarnation(202, identity));
+            clock.NowSeconds = 5.5;
+
+            await capture.ProbeApplicationForTestAsync(attempt);
+
+            CollectionAssert.AreEqual(new uint[] { 101, 202 }, factory.ProcessBuiltRootPIDs.ToArray());
+            Assert.AreEqual(2, factory.Recorders.Count);
+            Assert.AreEqual(0, faults.Count);
+
+            var wavePath = await capture.StopAsync(CancellationToken.None);
+            Assert.IsTrue(File.Exists(wavePath));
+            Assert.IsTrue(new FileInfo(wavePath).Length > 44);
+        }
+        finally
+        {
+            DeleteFolder(folder);
+        }
+    }
+
+    [TestMethod]
     public async Task failedEndpointRebindStillAllowsStopAndRecovery()
     {
         var factory = new FakeWindowsAudioCaptureFactory { CurrentEndpointID = "render-a" };
@@ -632,6 +778,20 @@ public sealed class WindowsAudioCaptureProductPathTests
         "system-output",
         "System output");
 
+    private static AudioSourceOption ApplicationSource(
+        WindowsApplicationIdentity identity,
+        int processId) => new(
+            AudioSourceKind.Process,
+            identity.StableKey,
+            "Class application",
+            processId,
+            identity);
+
+    private static WindowsApplicationIdentity ApplicationIdentity() =>
+        WindowsApplicationIdentity.FromObservation(
+            @"C:\Apps\Class\Class.exe",
+            "Class");
+
     private static SessionAttemptID NewAttempt() => SessionAttemptID.Create(Guid.NewGuid(), 1);
 
     private static string NewFolder()
@@ -666,9 +826,13 @@ public sealed class WindowsAudioCaptureProductPathTests
 
         public List<FakeWindowsAudioRecorder> Recorders { get; } = [];
 
+        public List<uint> ProcessBuiltRootPIDs { get; } = [];
+
         public List<string> BuiltEndpointIDs { get; } = [];
 
         public List<string> LifecycleEvents { get; } = [];
+
+        public Func<uint, FakeWindowsAudioRecorder>? ProcessRecorderFactory { get; set; }
 
         public int SystemBuildCount
         {
@@ -688,8 +852,15 @@ public sealed class WindowsAudioCaptureProductPathTests
 
         public Task<IWindowsAudioRecorder> BuildProcessLoopbackRecorderAsync(
             uint rootProcessId,
-            CancellationToken cancellationToken) =>
-            throw new NotSupportedException();
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ProcessBuiltRootPIDs.Add(rootProcessId);
+            var recorder = ProcessRecorderFactory?.Invoke(rootProcessId)
+                ?? throw new NotSupportedException();
+            Recorders.Add(recorder);
+            return Task.FromResult<IWindowsAudioRecorder>(recorder);
+        }
 
         public IWindowsAudioRecorder BuildSystemOutputRecorder(WindowsRenderEndpoint endpoint)
         {
@@ -744,6 +915,8 @@ public sealed class WindowsAudioCaptureProductPathTests
 
         public int StartCount { get; private set; }
 
+        public int StopCount { get; private set; }
+
         private int disposeCount;
 
         public int DisposeCount => Volatile.Read(ref disposeCount);
@@ -756,6 +929,7 @@ public sealed class WindowsAudioCaptureProductPathTests
 
         public void StopRecording()
         {
+            StopCount++;
             lifecycleEvents.Add("stop");
             RecordingStopped?.Invoke(null);
         }
@@ -766,6 +940,11 @@ public sealed class WindowsAudioCaptureProductPathTests
             lifecycleEvents.Add("dispose");
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class FakeMonotonicClock : IMonotonicClock
+    {
+        public double NowSeconds { get; set; }
     }
 
     private sealed class FinalizationGate

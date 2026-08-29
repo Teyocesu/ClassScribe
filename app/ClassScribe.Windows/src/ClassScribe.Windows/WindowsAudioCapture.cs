@@ -23,6 +23,9 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private readonly CaptureRebindCoordinator rebindCoordinator = new();
     private readonly SystemOutputCaptureAuthorizationAuthority systemOutputAuthorizationAuthority = new();
     private readonly IWindowsAudioCaptureFactory captureFactory;
+    private readonly Func<IReadOnlyList<WindowsProcessIncarnation>> processIncarnationEnumerator;
+    private readonly ApplicationSourceLivenessTracker applicationSourceLiveness;
+    private readonly CaptureSignalHealthTracker signalHealthTracker;
     private IWindowsAudioRecorder? recorder;
     private MMDevice? selectedDevice;
     private string? activeRenderEndpointID;
@@ -59,8 +62,6 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private Func<string, CancellationToken, Task>? finalizationHookForTesting;
     private bool sessionAdmissionOpen;
     private bool stopRequested;
-    private readonly CaptureSignalHealthTracker signalHealthTracker =
-        new(CaptureSignalThresholds.Windows);
 
     internal static CaptureFailureCategory HandoffTimeoutFailureCategory =>
         CaptureFailureCategory.Source;
@@ -71,9 +72,16 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
 
     public event Action<SessionAttemptID, CaptureFault>? CaptureFaulted;
 
-    internal WindowsAudioCapture(IWindowsAudioCaptureFactory? captureFactory = null)
+    internal WindowsAudioCapture(
+        IWindowsAudioCaptureFactory? captureFactory = null,
+        IMonotonicClock? monotonicClock = null,
+        Func<IReadOnlyList<WindowsProcessIncarnation>>? processIncarnationEnumerator = null)
     {
         this.captureFactory = captureFactory ?? new NAudioWindowsAudioCaptureFactory();
+        var clock = monotonicClock ?? new StopwatchMonotonicClock();
+        this.processIncarnationEnumerator = processIncarnationEnumerator ?? EnumerateProcessIncarnations;
+        applicationSourceLiveness = new(RebindGapSafetyBound, clock);
+        signalHealthTracker = new(CaptureSignalThresholds.Windows, clock);
     }
 
     public string? LastWarning { get; private set; }
@@ -160,7 +168,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             .ToArray();
     }
 
-    private static IReadOnlyList<WindowsProcessIncarnation> EnumerateProcessIncarnations()
+    private static List<WindowsProcessIncarnation> EnumerateProcessIncarnations()
     {
         var ownProcessId = Environment.ProcessId;
         var snapshots = new List<WindowsProcessIncarnation>();
@@ -291,7 +299,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 var resolvedRootPID = await WindowsApplicationStartup.ResolveBeforeBuildAsync(
                     source.Identity,
                     source.ProcessId,
-                    EnumerateProcessIncarnations,
+                    processIncarnationEnumerator,
                     cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
                 var builtRecorder = await WindowsApplicationStartup.BuildProcessLoopbackIfCurrentSourceGenerationAsync(
@@ -412,6 +420,13 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         noCallbackReportedAttempt = null;
         captureCancellation = new CancellationTokenSource();
         var sourceGeneration = sourceGenerationGate.Begin(attempt);
+        if (source.Kind == AudioSourceKind.Process && source.Identity is not null)
+        {
+            applicationSourceLiveness.Begin(
+                attempt,
+                sourceGeneration,
+                source.Identity.StableKey);
+        }
         // Startup latency is not durable audio. The timeline anchors only
         // when the first non-empty PCM callback reaches the writer boundary.
         packetTimeline.BeginGeneration(sourceGeneration);
@@ -1427,6 +1442,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             packetTimeline.Reset();
             if (finishedAttempt is not null)
             {
+                applicationSourceLiveness.Invalidate(finishedAttempt);
                 signalHealthTracker.Invalidate(finishedAttempt);
                 LevelChanged?.Invoke(finishedAttempt, 0);
             }
@@ -1480,12 +1496,11 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         return wavePath;
     }
 
-    private void ScheduleApplicationProbe(
-        SessionAttemptID attempt,
-        CaptureSignalHealthSnapshot snapshot)
+    private void ScheduleApplicationProbe(SessionAttemptID attempt)
     {
         AudioSourceOption? source;
         int? rootPID;
+        CaptureSourceGeneration? sourceGeneration;
         CancellationToken cancellationToken;
         lock (sync)
         {
@@ -1497,10 +1512,12 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 || source is null
                 || source.Kind != AudioSourceKind.Process
                 || source.Identity is null
-                || rootPID is null)
+                || rootPID is null
+                || activeSourceGeneration is null)
             {
                 return;
             }
+            sourceGeneration = activeSourceGeneration;
         }
 
         var now = Stopwatch.GetTimestamp();
@@ -1527,8 +1544,8 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         var probeTask = ProbeApplicationAsync(
             selectedSource,
             selectedRootPID,
+            sourceGeneration!,
             attempt,
-            snapshot.State,
             probeToken,
             cancellationToken);
         lock (sync)
@@ -1644,40 +1661,69 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     private async Task ProbeApplicationAsync(
         AudioSourceOption source,
         int rootPID,
+        CaptureSourceGeneration sourceGeneration,
         SessionAttemptID attempt,
-        CaptureSignalState signalState,
         Guid probeToken,
         CancellationToken cancellationToken)
     {
+        var identity = source.Identity;
+        if (identity is null)
+        {
+            return;
+        }
+
         try
         {
-            if (source.Identity is null)
-            {
-                return;
-            }
             var resolution = await WindowsApplicationStartup.ResolveBeforeBuildAsync(
-                source.Identity,
+                identity,
                 rootPID,
-                EnumerateProcessIncarnations,
+                processIncarnationEnumerator,
                 cancellationToken)
                 .WaitAsync(TimeSpan.FromSeconds(1), cancellationToken)
                 .ConfigureAwait(false);
-            if (!IsCurrentAttempt(attempt))
+            if (!IsCurrentSourceGeneration(attempt, sourceGeneration))
             {
                 return;
             }
 
-            if (source.Identity.Strength == ApplicationIdentityStrength.Strong
-                && resolution != rootPID)
+            if (resolution == rootPID)
+            {
+                _ = applicationSourceLiveness.ObserveResolvedCurrentRoot(
+                    attempt,
+                    sourceGeneration,
+                    identity.StableKey);
+                return;
+            }
+
+            if (identity.Strength == ApplicationIdentityStrength.Strong
+                && applicationSourceLiveness.CanContinue(
+                    attempt,
+                    sourceGeneration,
+                    identity.StableKey))
             {
                 await RebindApplicationAsync(source, attempt, resolution, cancellationToken)
                     .ConfigureAwait(false);
             }
         }
-        catch (WindowsApplicationResolutionException)
+        catch (WindowsApplicationResolutionException error)
         {
-            // Missing/ambiguous/weak evidence never gets converted into a
-            // sibling PID. The current durable stream remains available.
+            if (!IsCurrentSourceGeneration(attempt, sourceGeneration))
+            {
+                return;
+            }
+
+            var observation = applicationSourceLiveness.ObserveUnresolved(
+                attempt,
+                sourceGeneration,
+                identity.StableKey,
+                error.Resolution.State);
+            if (observation.ShouldPublishSourceFailure)
+            {
+                var sourceLossError = new IOException(
+                    $"La aplicación seleccionada dejó de estar disponible y no apareció un reemplazo verificable dentro del límite seguro de {RebindGapSafetyBound.TotalSeconds:F0}s. Estado de resolución: {error.Resolution.State}.",
+                    error);
+                FailCapture(attempt, sourceLossError, CaptureFailureCategory.Source);
+            }
         }
         catch (TimeoutException)
         {
@@ -1917,6 +1963,10 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             {
                 activeSourceGeneration = nextGeneration;
             }
+            _ = applicationSourceLiveness.AdvanceGeneration(
+                attempt,
+                nextGeneration,
+                source.Identity.StableKey);
 
             // The first accepted non-empty PCM callback records the arrival
             // timestamp. This keeps resolve/build/start/first-callback delay
@@ -1928,7 +1978,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             var refreshedRootPID = await WindowsApplicationStartup.ResolveBeforeBuildAsync(
                 source.Identity,
                 resolvedRootPID,
-                EnumerateProcessIncarnations,
+                processIncarnationEnumerator,
                 cancellationToken)
                 .WaitAsync(TimeSpan.FromSeconds(3), cancellationToken)
                 .ConfigureAwait(false);
@@ -1974,6 +2024,10 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
                 activeRootProcessId = refreshedRootPID;
                 activeSource = source;
             }
+            _ = applicationSourceLiveness.ObserveVerifiedReplacement(
+                attempt,
+                nextGeneration,
+                source.Identity.StableKey);
             rebindFailureCount = 0;
             return true;
         }
@@ -2085,7 +2139,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             }
             if (isProcessSource)
             {
-                ScheduleApplicationProbe(attempt, snapshot);
+                ScheduleApplicationProbe(attempt);
             }
             else if (isSystemOutputSource)
             {
@@ -2093,6 +2147,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
             }
             if (snapshot.State == CaptureSignalState.NoCallbacks
                 && snapshot.ElapsedSinceStart >= CaptureSignalThresholds.Windows.InitialCallbackBudgetSeconds + 6
+                && !isProcessSource
                 && noCallbackReportedAttempt != attempt)
             {
                 noCallbackReportedAttempt = attempt;
@@ -2149,6 +2204,38 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
         }
 
         return await RebindSystemOutputAsync(attempt, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal Task ProbeApplicationForTestAsync(
+        SessionAttemptID attempt,
+        CancellationToken cancellationToken = default)
+    {
+        AudioSourceOption? source;
+        int? rootPID;
+        CaptureSourceGeneration? sourceGeneration;
+        lock (sync)
+        {
+            source = activeSource;
+            rootPID = activeRootProcessId;
+            sourceGeneration = activeSourceGeneration;
+        }
+
+        if (source?.Kind != AudioSourceKind.Process
+            || source.Identity is null
+            || rootPID is null
+            || sourceGeneration is null
+            || !IsCurrentSourceGeneration(attempt, sourceGeneration))
+        {
+            return Task.CompletedTask;
+        }
+
+        return ProbeApplicationAsync(
+            source,
+            rootPID.Value,
+            sourceGeneration,
+            attempt,
+            Guid.NewGuid(),
+            cancellationToken);
     }
 
     internal string? ActiveRenderEndpointIDForTest
