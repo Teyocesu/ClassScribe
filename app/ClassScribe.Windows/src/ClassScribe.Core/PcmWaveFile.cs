@@ -76,6 +76,55 @@ public static class PcmWaveFile
         return stream;
     }
 
+    public static async Task<byte[]> ReadPcmTailAsync(
+        string path,
+        double startSeconds,
+        CancellationToken cancellationToken = default)
+    {
+        if (!double.IsFinite(startSeconds) || startSeconds < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(startSeconds));
+        }
+
+        Validate(path);
+        await using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            128 * 1_024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        stream.Position = 12;
+        var chunkHeader = new byte[8];
+        while (stream.Position + chunkHeader.Length <= stream.Length)
+        {
+            await stream.ReadExactlyAsync(chunkHeader, cancellationToken).ConfigureAwait(false);
+            var chunkLength = BinaryPrimitives.ReadUInt32LittleEndian(chunkHeader.AsSpan(4));
+            if (chunkHeader.AsSpan(0, 4).SequenceEqual("data"u8))
+            {
+                var bytesPerSecond = SampleRate * Channels * (BitsPerSample / 8);
+                var requestedOffset = Math.Min(
+                    chunkLength,
+                    checked((long)Math.Floor(startSeconds * bytesPerSecond)));
+                requestedOffset -= requestedOffset % (Channels * (BitsPerSample / 8));
+                var remaining = checked((int)(chunkLength - requestedOffset));
+                if (remaining == 0)
+                {
+                    return [];
+                }
+
+                stream.Position += requestedOffset;
+                var pcm = new byte[remaining];
+                await stream.ReadExactlyAsync(pcm, cancellationToken).ConfigureAwait(false);
+                return pcm;
+            }
+
+            stream.Position += chunkLength + (chunkLength & 1);
+        }
+
+        throw new InvalidDataException("El WAV no contiene un bloque de audio.");
+    }
+
     public static double Validate(string path)
     {
         ValidateRegularFile(path);

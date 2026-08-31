@@ -8,6 +8,41 @@ namespace ClassScribe.Windows.Tests;
 public sealed class MainViewModelSystemOutputConsentTests
 {
     [TestMethod]
+    public async Task preparesTranscriptionBeforeStartingCapture()
+    {
+        var root = NewRoot();
+        var factory = new ConsentWindowsAudioCaptureFactory();
+        var capture = new WindowsAudioCapture(factory);
+        var preparationCalls = 0;
+        var model = new MainViewModel(
+            new SessionStore(root),
+            capture,
+            () => true,
+            prepareTranscription: (_, _) =>
+            {
+                preparationCalls++;
+                Assert.AreEqual(0, factory.SystemBuildCount);
+                return Task.CompletedTask;
+            });
+        model.Subject = "Álgebra";
+        SelectSystemOutput(model);
+        try
+        {
+            await model.StartAsync();
+
+            Assert.AreEqual(1, preparationCalls);
+            Assert.AreEqual(1, factory.SystemBuildCount);
+            Assert.IsTrue(model.IsRecording);
+            await model.StopForExitAsync();
+        }
+        finally
+        {
+            await model.DisposeAsync();
+            DeleteFolder(root);
+        }
+    }
+
+    [TestMethod]
     public async Task selectingSystemOutputDoesNotAuthorizeOrStart()
     {
         var promptCalls = 0;
@@ -258,7 +293,11 @@ public sealed class MainViewModelSystemOutputConsentTests
         var root = NewRoot();
         var factory = new ConsentWindowsAudioCaptureFactory();
         var capture = new WindowsAudioCapture(factory);
-        var model = new MainViewModel(new SessionStore(root), capture, prompt);
+        var model = new MainViewModel(
+            new SessionStore(root),
+            capture,
+            prompt,
+            prepareTranscription: static (_, _) => Task.CompletedTask);
         model.Subject = "Álgebra";
         return (model, factory, root);
     }

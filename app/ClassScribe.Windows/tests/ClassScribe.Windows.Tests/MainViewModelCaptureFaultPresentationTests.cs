@@ -129,7 +129,11 @@ public sealed class MainViewModelCaptureFaultPresentationTests
             factory,
             clock,
             () => [new WindowsProcessIncarnation(42_001, identity)]);
-        var model = new MainViewModel(new SessionStore(root), capture, () => true)
+        var model = new MainViewModel(
+            new SessionStore(root),
+            capture,
+            () => true,
+            prepareTranscription: static (_, _) => Task.CompletedTask)
         {
             Subject = "Presentación de fallos",
             SelectedSource = new AudioSourceOption(

@@ -14,10 +14,10 @@ internal sealed record DiarizationModels(string SegmentationPath, string Embeddi
 internal sealed class LocalModelProvisioner : IDisposable
 {
     private const string WhisperUrl =
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin";
-    private const long WhisperSize = 574_041_195;
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin";
+    private const long WhisperSize = 190_085_487;
     private const string WhisperSha256 =
-        "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2";
+        "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb";
 
     private const string SegmentationUrl =
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/"
@@ -67,7 +67,7 @@ internal sealed class LocalModelProvisioner : IDisposable
             EnsureSafeModelRoot();
             return await EnsureFileAsync(
                     new Uri(WhisperUrl),
-                    Path.Combine(Root, "whisper", "ggml-large-v3-turbo-q5_0.bin"),
+                    Path.Combine(Root, "whisper", "ggml-small-q5_1.bin"),
                     "modelo de transcripción",
                     WhisperSize,
                     WhisperSha256,

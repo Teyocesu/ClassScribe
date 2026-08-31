@@ -9,10 +9,27 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
     private readonly SemaphoreSlim processingGate = new(1, 1);
     private WhisperFactory? factory;
     private string? loadedModelPath;
+    private bool isWarmedUp;
 
     public WhisperTranscriber(LocalModelProvisioner models)
     {
         this.models = models;
+    }
+
+    public async Task PrepareAsync(
+        IProgress<ModelDownloadProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        await processingGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await EnsureFactoryAsync(progress, cancellationToken).ConfigureAwait(false);
+            await WarmUpAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            processingGate.Release();
+        }
     }
 
     public async Task<IReadOnlyList<TranscriptSegment>> TranscribeFileAsync(
@@ -54,6 +71,7 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
             factory?.Dispose();
             factory = null;
             loadedModelPath = null;
+            isWarmedUp = false;
         }
         finally
         {
@@ -73,18 +91,11 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         await processingGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var modelPath = await models.EnsureWhisperAsync(progress, cancellationToken).ConfigureAwait(false);
-            if (factory is null || !string.Equals(loadedModelPath, modelPath, StringComparison.Ordinal))
-            {
-                factory?.Dispose();
-                factory = WhisperFactory.FromPath(modelPath, new WhisperFactoryOptions
-                {
-                    UseGpu = false,
-                });
-                loadedModelPath = modelPath;
-            }
+            await EnsureFactoryAsync(progress, cancellationToken).ConfigureAwait(false);
 
-            var builder = factory.CreateBuilder()
+            var activeFactory = factory
+                ?? throw new InvalidOperationException("El modelo de transcripción no quedó preparado.");
+            var builder = activeFactory.CreateBuilder()
                 .WithLanguage(languageCode)
                 .WithProbabilities();
             if (!string.IsNullOrWhiteSpace(vocabulary))
@@ -118,5 +129,49 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         {
             processingGate.Release();
         }
+    }
+
+    private async Task EnsureFactoryAsync(
+        IProgress<ModelDownloadProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        if (factory is not null)
+        {
+            return;
+        }
+
+        var modelPath = await models.EnsureWhisperAsync(progress, cancellationToken).ConfigureAwait(false);
+        var preparedFactory = await Task.Run(
+                () => WhisperFactory.FromPath(modelPath, new WhisperFactoryOptions
+                {
+                    // Whisper.net probes any deployed accelerated runtime first and
+                    // automatically falls back to the packaged CPU runtime.
+                    UseGpu = true,
+                }),
+                cancellationToken)
+            .ConfigureAwait(false);
+        factory = preparedFactory;
+        loadedModelPath = modelPath;
+    }
+
+    private async Task WarmUpAsync(CancellationToken cancellationToken)
+    {
+        if (isWarmedUp)
+        {
+            return;
+        }
+
+        var activeFactory = factory
+            ?? throw new InvalidOperationException("El modelo de transcripción no quedó preparado.");
+        await using var processor = activeFactory.CreateBuilder()
+            .WithLanguage("es")
+            .Build();
+        using var silence = PcmWaveFile.CreateWaveStream(new byte[PcmWaveFile.SampleRate * 2]);
+        await foreach (var _ in processor.ProcessAsync(silence, cancellationToken).ConfigureAwait(false))
+        {
+            // Discard the result: this moves native first-inference setup before capture.
+        }
+
+        isWarmedUp = true;
     }
 }
