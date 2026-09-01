@@ -250,6 +250,9 @@ public static class TranscriptActions
         .Select(static candidate => candidate?.Trim())
         .FirstOrDefault(static candidate => !string.IsNullOrWhiteSpace(candidate)) ?? string.Empty;
 
+    public static string FullTranscript(string? allText, string? liveText) =>
+        BestAvailable(allText, liveText);
+
     public static string ChatEnvelope(
         string subject,
         DateTimeOffset date,

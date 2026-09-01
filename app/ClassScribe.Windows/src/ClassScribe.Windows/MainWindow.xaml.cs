@@ -103,8 +103,7 @@ public partial class MainWindow : Window, IAsyncDisposable
                 return;
             }
 
-            var bestText = TranscriptActions.BestAvailable(
-                viewModel.ProfessorText,
+            var bestText = TranscriptActions.FullTranscript(
                 viewModel.AllText,
                 viewModel.LiveText);
             var exported = dialog.FilterIndex == 2

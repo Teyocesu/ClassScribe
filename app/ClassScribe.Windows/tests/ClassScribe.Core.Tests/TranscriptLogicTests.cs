@@ -42,6 +42,17 @@ public sealed class TranscriptLogicTests
     }
 
     [TestMethod]
+    public void FullTranscriptPrefersAllTextAndFallsBackToLiveText()
+    {
+        Assert.AreEqual(
+            "transcripción completa",
+            TranscriptActions.FullTranscript("transcripción completa", "texto live"));
+        Assert.AreEqual(
+            "texto live",
+            TranscriptActions.FullTranscript("  ", "texto live"));
+    }
+
+    [TestMethod]
     public void SpeakerAssignmentMarksOverlapForReview()
     {
         var transcript = new[]

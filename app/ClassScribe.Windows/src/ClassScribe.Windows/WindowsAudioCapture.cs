@@ -16,7 +16,7 @@ internal sealed class WindowsAudioCapture : IAsyncDisposable
     // longer handoff is an explicit capture fault, never a silently shortened
     // recording.
     private static readonly TimeSpan RebindGapSafetyBound = TimeSpan.FromSeconds(30);
-    private const int SnapshotCapacity = AsrBytesPerSecond * 45;
+    private const int SnapshotCapacity = AsrBytesPerSecond * 75;
     private readonly object sync = new();
     private readonly Queue<byte[]> recentPackets = new();
     private readonly CaptureSourceGenerationGate sourceGenerationGate = new();

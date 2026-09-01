@@ -97,6 +97,7 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
                 ?? throw new InvalidOperationException("El modelo de transcripción no quedó preparado.");
             var builder = activeFactory.CreateBuilder()
                 .WithLanguage(languageCode)
+                .WithThreads(Math.Clamp(Environment.ProcessorCount, 1, 16))
                 .WithProbabilities();
             if (!string.IsNullOrWhiteSpace(vocabulary))
             {
@@ -144,9 +145,9 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         var preparedFactory = await Task.Run(
                 () => WhisperFactory.FromPath(modelPath, new WhisperFactoryOptions
                 {
-                    // Whisper.net probes any deployed accelerated runtime first and
-                    // automatically falls back to the packaged CPU runtime.
-                    UseGpu = true,
+                    // Whisper.net's packaged CPU backend is self-contained. Its
+                    // CUDA backends require a separate CUDA runtime installation.
+                    UseGpu = false,
                 }),
                 cancellationToken)
             .ConfigureAwait(false);
@@ -165,6 +166,7 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
             ?? throw new InvalidOperationException("El modelo de transcripción no quedó preparado.");
         await using var processor = activeFactory.CreateBuilder()
             .WithLanguage("es")
+            .WithThreads(Math.Clamp(Environment.ProcessorCount, 1, 16))
             .Build();
         using var silence = PcmWaveFile.CreateWaveStream(new byte[PcmWaveFile.SampleRate * 2]);
         await foreach (var _ in processor.ProcessAsync(silence, cancellationToken).ConfigureAwait(false))

@@ -9,6 +9,7 @@ namespace ClassScribe.Windows;
 internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 {
     private const long MaximumReadableDocumentBytes = 64 * 1_024 * 1_024;
+    private const double QualityCheckpointSeconds = 60;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
@@ -20,7 +21,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private readonly Func<bool> systemOutputConsentPrompt;
     private readonly WhisperTranscriber transcriber;
     private readonly List<TranscriptSegment> segments = [];
-    private readonly List<TranscriptSegment> liveSegments = [];
+    private readonly List<TranscriptSegment> qualitySegments = [];
     private readonly Func<IProgress<ModelDownloadProgress>?, CancellationToken, Task> prepareTranscription;
     private CancellationTokenSource? liveCancellation;
     private CancellationTokenSource? timerCancellation;
@@ -56,13 +57,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private bool isBusy;
     private bool isPaused;
     private bool liveWasEdited;
-    private bool liveCoverageHasGap;
+    private bool qualityCoverageHasGap;
     private bool isStopping;
     private bool settingLiveProgrammatically;
     private bool disposed;
     private int finalProcessingInvocationCountForTest;
     private long attemptGeneration;
     private double liveTranscribedThroughSeconds;
+    private double qualityTranscribedThroughSeconds;
     private SessionAttemptID? activeAttempt;
     private SessionAttemptCallbackLease? captureCallbackLease;
     private Action<SessionAttemptID, double>? captureLevelHandler;
@@ -542,14 +544,15 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(ShowSystemOutputRecovery));
         ModelProgress = 0;
         segments.Clear();
-        liveSegments.Clear();
+        qualitySegments.Clear();
         Speakers.Clear();
         ReviewRows.Clear();
         SelectedProfessor = null;
         automaticLiveText = string.Empty;
         liveWasEdited = false;
-        liveCoverageHasGap = false;
+        qualityCoverageHasGap = false;
         liveTranscribedThroughSeconds = 0;
+        qualityTranscribedThroughSeconds = 0;
         SetLiveProgrammatically(string.Empty);
         AllText = string.Empty;
         ProfessorText = string.Empty;
@@ -827,9 +830,9 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             {
                 await ProcessWaveAsync(
                         wavePath,
-                        liveSegments.ToArray(),
-                        liveTranscribedThroughSeconds,
-                        liveCoverageHasGap,
+                        qualitySegments.ToArray(),
+                        qualityTranscribedThroughSeconds,
+                        qualityCoverageHasGap,
                         processingCancellation.Token)
                     .ConfigureAwait(true);
                 if (!IsCurrent(attempt))
@@ -1170,14 +1173,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     }
 
     public string ChatEnvelope() => currentMetadata is null
-        ? AllText
+        ? TranscriptActions.FullTranscript(AllText, LiveText)
         : TranscriptActions.ChatEnvelope(
             currentMetadata.Subject,
             currentMetadata.StartedAt,
             currentMetadata.Duration,
             currentMetadata.Mode,
             currentMetadata.Source,
-            TranscriptActions.BestAvailable(ProfessorText, AllText, LiveText));
+            TranscriptActions.FullTranscript(AllText, LiveText));
 
     public string? CurrentFolder => currentFolder;
 
@@ -1286,6 +1289,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 try
                 {
                     var duration = audioCapture.DurationSeconds;
+                    await RunQualityCheckpointAsync(duration, attempt, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!IsCurrent(attempt))
+                    {
+                        break;
+                    }
+
+                    duration = audioCapture.DurationSeconds;
                     var pendingDuration = Math.Max(0, duration - liveTranscribedThroughSeconds);
                     var pcm = audioCapture.Snapshot(TimeSpan.FromSeconds(pendingDuration));
                     if (pcm.Length >= PcmWaveFile.SampleRate * 2)
@@ -1295,7 +1306,6 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                         var offset = liveTranscribedThroughSeconds;
                         if (missingDuration > 1)
                         {
-                            liveCoverageHasGap = true;
                             offset = Math.Max(0, duration - pcmDuration);
                         }
 
@@ -1314,7 +1324,6 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                             break;
                         }
 
-                        liveSegments.AddRange(provisional);
                         liveTranscribedThroughSeconds = offset + pcmDuration;
                         var incoming = string.Join(' ', provisional.Select(static segment => segment.Text));
                         if (incoming.Length > 0)
@@ -1386,14 +1395,52 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    private async Task RunQualityCheckpointAsync(
+        double duration,
+        SessionAttemptID? attempt,
+        CancellationToken cancellationToken)
+    {
+        var pendingDuration = Math.Max(0, duration - qualityTranscribedThroughSeconds);
+        if (qualityCoverageHasGap || pendingDuration < QualityCheckpointSeconds)
+        {
+            return;
+        }
+
+        var pcm = audioCapture.Snapshot(TimeSpan.FromSeconds(pendingDuration));
+        var pcmDuration = pcm.Length / 32_000d;
+        var missingDuration = Math.Max(0, pendingDuration - pcmDuration);
+        if (pcm.Length < PcmWaveFile.SampleRate * 2 || missingDuration > 1)
+        {
+            qualityCoverageHasGap = true;
+            return;
+        }
+
+        var offset = qualityTranscribedThroughSeconds;
+        var checkpoint = await transcriber.TranscribePcmAsync(
+                pcm,
+                currentMetadata?.TechnicalVocabulary ?? string.Empty,
+                NormalizeLanguage(currentMetadata?.Language),
+                offset,
+                progress: null,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!IsCurrent(attempt))
+        {
+            return;
+        }
+
+        qualitySegments.AddRange(checkpoint);
+        qualityTranscribedThroughSeconds = offset + pcmDuration;
+    }
+
     private Task ProcessWaveAsync(string wavePath, CancellationToken cancellationToken) =>
-        ProcessWaveAsync(wavePath, [], 0, liveCoverageHasGap: true, cancellationToken);
+        ProcessWaveAsync(wavePath, [], 0, qualityCoverageHasGap: true, cancellationToken);
 
     private async Task ProcessWaveAsync(
         string wavePath,
-        TranscriptSegment[] reusableLiveSegments,
+        TranscriptSegment[] reusableQualitySegments,
         double transcribedThroughSeconds,
-        bool liveCoverageHasGap,
+        bool qualityCoverageHasGap,
         CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref finalProcessingInvocationCountForTest);
@@ -1422,44 +1469,64 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        StatusText = "Preparando transcripción final…";
+        StatusText = "Preparando transcripción final e identificando hablantes…";
         ModelProgress = 0;
         var progress = new Progress<ModelDownloadProgress>(
             value => UpdateModelProgress(value, attempt));
+        using var diarizationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        var diarizationTask = PrepareDiarizationAsync(
+            wavePath,
+            progress,
+            diarizationCancellation.Token);
         IReadOnlyList<TranscriptSegment> finalSegments;
-        if (reusableLiveSegments.Length > 0 && !liveCoverageHasGap)
+        try
         {
-            const double tailOverlapSeconds = 1.5;
-            var duration = PcmWaveFile.Validate(wavePath);
-            var tailStart = Math.Max(0, Math.Min(duration, transcribedThroughSeconds) - tailOverlapSeconds);
-            var tailPcm = await PcmWaveFile.ReadPcmTailAsync(wavePath, tailStart, cancellationToken)
-                .ConfigureAwait(true);
-            var tailSegments = tailPcm.Length == 0
-                ? []
-                : await transcriber.TranscribePcmAsync(
-                        tailPcm,
+            if (reusableQualitySegments.Length > 0 && !qualityCoverageHasGap)
+            {
+                const double tailOverlapSeconds = 1.5;
+                var duration = PcmWaveFile.Validate(wavePath);
+                var tailStart = Math.Max(
+                    0,
+                    Math.Min(duration, transcribedThroughSeconds) - tailOverlapSeconds);
+                var tailPcm = await PcmWaveFile.ReadPcmTailAsync(
+                        wavePath,
+                        tailStart,
+                        cancellationToken)
+                    .ConfigureAwait(true);
+                var tailSegments = tailPcm.Length == 0
+                    ? []
+                    : await transcriber.TranscribePcmAsync(
+                            tailPcm,
+                            currentMetadata.TechnicalVocabulary,
+                            NormalizeLanguage(currentMetadata.Language),
+                            tailStart,
+                            progress,
+                            cancellationToken)
+                        .ConfigureAwait(true);
+                finalSegments = reusableQualitySegments
+                    .Where(segment => segment.End <= tailStart)
+                    .Concat(tailSegments)
+                    .OrderBy(static segment => segment.Start)
+                    .Select(static segment => segment with { Provisional = false })
+                    .ToArray();
+            }
+            else
+            {
+                finalSegments = await transcriber.TranscribeFileAsync(
+                        wavePath,
                         currentMetadata.TechnicalVocabulary,
                         NormalizeLanguage(currentMetadata.Language),
-                        tailStart,
                         progress,
                         cancellationToken)
                     .ConfigureAwait(true);
-            finalSegments = reusableLiveSegments
-                .Where(segment => segment.End <= tailStart)
-                .Concat(tailSegments)
-                .OrderBy(static segment => segment.Start)
-                .Select(static segment => segment with { Provisional = false })
-                .ToArray();
+            }
         }
-        else
+        catch
         {
-            finalSegments = await transcriber.TranscribeFileAsync(
-                    wavePath,
-                    currentMetadata.TechnicalVocabulary,
-                    NormalizeLanguage(currentMetadata.Language),
-                    progress,
-                    cancellationToken)
-                .ConfigureAwait(true);
+            diarizationCancellation.Cancel();
+            await ObserveFailureAsync(diarizationTask).ConfigureAwait(true);
+            throw;
         }
         if (!IsCurrent(attempt))
         {
@@ -1502,7 +1569,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         currentMetadata = currentMetadata with { AsrOriginalReference = asrOriginalReference };
 
-        // Commit the complete transcript before invoking any native diarization code.
+        // Commit the complete transcript before consuming the isolated diarization result.
         await sessionStore.SaveAutomaticProjectionAsync(
                 currentMetadata,
                 segments,
@@ -1527,19 +1594,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         string? diarizationWarning = null;
         try
         {
-            StatusText = "Preparando e identificando hablantes…";
-            var diarizationModels = await modelProvisioner.EnsureDiarizationAsync(progress, cancellationToken)
-                .ConfigureAwait(true);
-            if (!IsCurrent(attempt))
-            {
-                return;
-            }
-
-            var spans = await DiarizationWorker.RunIsolatedAsync(
-                    wavePath,
-                    diarizationModels,
-                cancellationToken)
-                .ConfigureAwait(true);
+            StatusText = "Finalizando identificación de hablantes…";
+            var spans = await diarizationTask.ConfigureAwait(true);
             if (!IsCurrent(attempt))
             {
                 return;
@@ -2197,6 +2253,29 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
             return false;
+        }
+    }
+
+    private async Task<IReadOnlyList<DiarizationSpan>> PrepareDiarizationAsync(
+        string wavePath,
+        IProgress<ModelDownloadProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        var models = await modelProvisioner.EnsureDiarizationAsync(progress, cancellationToken)
+            .ConfigureAwait(false);
+        return await DiarizationWorker.RunIsolatedAsync(wavePath, models, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private static async Task ObserveFailureAsync(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Preserve the primary transcription failure after cancelling the worker.
         }
     }
 
