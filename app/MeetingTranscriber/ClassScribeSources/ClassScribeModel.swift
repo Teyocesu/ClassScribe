@@ -45,6 +45,7 @@ struct CaptureStartRequest {
 }
 
 typealias CaptureStartOverride = @MainActor (CaptureStartRequest) async throws -> URL
+typealias AsrPreflightOverride = @Sendable () async throws -> Void
 
 struct SystemOutputConsentRequest: Identifiable, Equatable {
     let id: UUID
@@ -137,9 +138,11 @@ final class ClassScribeModel {
     var calibrationSecondsRemaining = 0
     private(set) var isStopping = false
     private(set) var isRetrying = false
+    private(set) var isStarting = false
 
     let capture: CaptureController
     private let parakeet: ParakeetService
+    private let asrPreflight: AsrPreflightOverride
     private let store: SessionStore
     private let finalProcessor: any FinalProcessingProviding
     private let retryAudioPreparer: RetryAudioPreparer
@@ -149,6 +152,7 @@ final class ClassScribeModel {
     private var startedAt: Date?
     private var elapsedTimer: Timer?
     private var liveTask: Task<Void, Never>?
+    private var startTask: Task<Void, Never>?
     private var finalTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
@@ -174,9 +178,11 @@ final class ClassScribeModel {
         retryAudioPreparer: @escaping RetryAudioPreparer = prepareRetryAudio,
         liveTaskStopGrace: TimeInterval = 3,
         captureStartOverride: CaptureStartOverride? = nil,
+        asrPreflight: AsrPreflightOverride? = nil,
     ) {
         let parakeet = injectedParakeet ?? ParakeetService()
         self.parakeet = parakeet
+        self.asrPreflight = asrPreflight ?? { try await parakeet.loadIfNeeded() }
         self.store = store
         finalProcessor = injectedFinalProcessor ?? FinalProcessor(parakeet: parakeet)
         self.retryAudioPreparer = retryAudioPreparer
@@ -203,6 +209,7 @@ final class ClassScribeModel {
         guard !capture.isBusy,
               !isStopping,
               !isRetrying,
+              !isStarting,
               finalTask == nil,
               pendingSystemOutputConsent == nil,
               !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -220,7 +227,11 @@ final class ClassScribeModel {
     }
 
     var isSessionBusy: Bool {
-        capture.isBusy || isStopping || isProcessing || pendingSystemOutputConsent != nil
+        capture.isBusy || isStopping || isStarting || isProcessing || pendingSystemOutputConsent != nil
+    }
+
+    var isPreparingTranscription: Bool {
+        isStarting && asrPhase == .preparingLoad
     }
 
     var selectedApplication: RunningApplication? {
@@ -297,32 +308,17 @@ final class ClassScribeModel {
     }
 
     var bestAvailableText: String {
-        // An explicit live edit is user-owned even when it is empty. Falling
-        // back to ASR here would make Copy/Export resurrect text they deleted.
-        if !finalReplacedLive, let editedLiveText {
-            return editedLiveText
-        }
-        if finalReplacedLive, selectedTab == .liveEdit {
-            return editedLiveText ?? liveVisibleText
-        }
-        let selectedText: String? = if !finalReplacedLive {
-            liveVisibleText
+        // Generic actions always resolve the complete final transcript. The
+        // selected tab only controls the view; it must never make Copy or
+        // Export silently switch to ProfessorText. An explicit empty edit is
+        // user-owned and therefore remains empty instead of reviving ASR text.
+        let finalText: String? = if editedAllText != nil || !allSegments.isEmpty {
+            editedAllText ?? TranscriptExporter.plainText(allSegments)
         } else {
-            switch selectedTab {
-            case .liveEdit:
-                editedLiveText ?? liveVisibleText
-            case .professor:
-                displayedText
-            case .everyone, .review:
-                editedAllText ?? TranscriptExporter.plainText(allSegments)
-            }
+            nil
         }
-        return TranscriptActions.bestAvailable(
-            preferredEdit: selectedText,
-            professorEdit: editedProfessorText,
-            professor: TranscriptExporter.plainText(professorSegments),
-            everyoneEdit: editedAllText,
-            everyone: TranscriptExporter.plainText(allSegments),
+        return TranscriptActions.fullTranscript(
+            finalText: finalText,
             liveEdit: editedLiveText,
             live: liveVisibleText,
         )
@@ -354,18 +350,11 @@ final class ClassScribeModel {
     }
 
     var selectedExportSegments: [TranscriptSegment] {
-        selectedTab == .professor && !professorSegments.isEmpty ? professorSegments : allSegments
+        allSegments
     }
 
     var selectedExportHasFreeformEdit: Bool {
-        switch selectedTab {
-        case .liveEdit:
-            true
-        case .professor where !professorSegments.isEmpty:
-            editedProfessorText != nil
-        case .professor, .everyone, .review:
-            editedAllText != nil
-        }
+        editedAllText != nil
     }
 
     var availableTranscriptTabs: [TranscriptTab] {
@@ -404,7 +393,7 @@ final class ClassScribeModel {
             return
         }
 
-        await performStart(
+        await launchStart(
             sessionID: sessionID,
             attemptID: attemptID,
             systemOutputAuthorization: nil,
@@ -413,7 +402,7 @@ final class ClassScribeModel {
 
     func confirmSystemOutputConsent(_ request: SystemOutputConsentRequest) async {
         guard let authorization = consumeSystemOutputConsent(request) else { return }
-        await performStart(
+        await launchStart(
             sessionID: request.attempt.sessionID,
             attemptID: request.attempt,
             systemOutputAuthorization: authorization,
@@ -494,12 +483,14 @@ final class ClassScribeModel {
         var startedSession: ClassSessionContext?
         var captureStartInvoked = false
         var captureStartCompleted = false
+        var asrPreflightFailed = false
         defer {
             if !captureStartCompleted, systemOutputAuthorization != nil {
                 capture.invalidateSystemOutputAuthorization(for: attemptID)
             }
         }
         do {
+            try Task.checkCancellation()
             let folder = try store.createFolder(subject: subjectSnapshot, date: now)
             classFolder = folder
             startedAt = now
@@ -519,8 +510,21 @@ final class ClassScribeModel {
             )
             startedSession = session
             activeSession = session
-            state = .startingCapture
+            state = .loadingModel
             sessionPhase = .starting
+            capturePhase = .connecting
+            asrPhase = .preparingLoad
+            statusDetail = "Preparando transcripción antes de grabar…"
+            try checkpointLive("session-created", session: session)
+            try store.saveMetadata(metadata(session: session), folder: folder)
+
+            asrPreflightFailed = true
+            try await asrPreflight()
+            asrPreflightFailed = false
+            try Task.checkCancellation()
+            guard isCurrent(session) else { throw CancellationError() }
+
+            state = .startingCapture
             capturePhase = .connecting
             asrPhase = .idle
             statusDetail = switch captureScopeSnapshot {
@@ -531,8 +535,7 @@ final class ClassScribeModel {
             case .systemOutput:
                 "Iniciando la captura de todo el audio que sale por tu equipo."
             }
-            try checkpointLive("session-created", session: session)
-            try store.saveMetadata(metadata(session: session, state: .startingCapture), folder: folder)
+            try store.saveMetadata(metadata(session: session), folder: folder)
             captureStartInvoked = true
             _ = try await startCapture(
                 CaptureStartRequest(
@@ -546,7 +549,10 @@ final class ClassScribeModel {
                 ),
             )
             captureStartCompleted = true
-            guard isCurrent(session) else { return }
+            guard !Task.isCancelled, isCurrent(session) else {
+                if capture.isCapturing { _ = try? await capture.stop() }
+                throw CancellationError()
+            }
             state = .recording
             sessionPhase = .recording
             capturePhase = .recording
@@ -584,10 +590,34 @@ final class ClassScribeModel {
             sessionPhase = .failed
             capturePhase = .failedTerminal
             asrPhase = .failedRecoverable
-            errorMessage = error.localizedDescription
-            statusDetail = error.localizedDescription
+            let message = asrPreflightFailed
+                ? "No se pudo preparar la transcripción antes de grabar: \(error.localizedDescription)"
+                : error.localizedDescription
+            errorMessage = message
+            statusDetail = message
             persistCurrentState(checkpoint: "start-failed")
         }
+    }
+
+    private func launchStart(
+        sessionID: UUID,
+        attemptID: SessionAttemptID,
+        systemOutputAuthorization: SystemOutputCaptureAuthorization?,
+    ) async {
+        guard !isStarting else { return }
+        isStarting = true
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performStart(
+                sessionID: sessionID,
+                attemptID: attemptID,
+                systemOutputAuthorization: systemOutputAuthorization,
+            )
+        }
+        startTask = task
+        await task.value
+        startTask = nil
+        isStarting = false
     }
 
     private func startCapture(_ request: CaptureStartRequest) async throws -> URL {
@@ -722,19 +752,30 @@ final class ClassScribeModel {
             cancelSystemOutputConsent(request)
             return
         }
-        guard capture.isStarting, let session = activeSession, isCurrent(session) else { return }
+        guard isStarting else { return }
+        let session = activeSession.flatMap { isCurrent($0) ? $0 : nil }
         generationGate.invalidate()
-        capture.cancelStart(for: session.attemptID)
-        state = .cancelled
-        sessionPhase = .cancelled
-        // Startup is cancelled in the control plane immediately. Keep the
-        // capture axis in stopping until stale native setup has returned and
-        // its cleanup has completed.
-        capturePhase = .stopping
-        asrPhase = .idle
-        errorMessage = nil
-        statusDetail = "Inicio cancelado; se espera la limpieza nativa antes del próximo intento."
-        persistCurrentState(checkpoint: "capture-start-cancelled", session: session)
+        startTask?.cancel()
+        if let session {
+            capture.cancelStart(for: session.attemptID)
+            state = .cancelled
+            sessionPhase = .cancelled
+            // Startup is cancelled in the control plane immediately. Keep the
+            // capture axis in stopping until stale native setup has returned
+            // and its cleanup has completed.
+            capturePhase = .stopping
+            asrPhase = .idle
+            errorMessage = nil
+            statusDetail = "Inicio cancelado; se espera la limpieza nativa antes del próximo intento."
+            persistCurrentState(checkpoint: "capture-start-cancelled", session: session)
+        } else {
+            state = .cancelled
+            sessionPhase = .cancelled
+            capturePhase = .idle
+            asrPhase = .idle
+            errorMessage = nil
+            statusDetail = "Inicio cancelado antes de crear la sesión."
+        }
     }
 
     private func finishCancelledStartCleanup(_ session: ClassSessionContext) {

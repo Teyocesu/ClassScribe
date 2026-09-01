@@ -484,6 +484,23 @@ enum TranscriptExporter {
 }
 
 enum TranscriptActions {
+    /// Resolves a generic Copy/Export action without consulting the selected
+    /// transcript tab. A present final value wins, followed by a live edit and
+    /// then live ASR. A non-nil empty edit is intentional deletion.
+    static func fullTranscript(
+        finalText: String?,
+        liveEdit: String?,
+        live: String,
+    ) -> String {
+        if let finalText {
+            return readable(finalText)
+        }
+        if let liveEdit {
+            return readable(liveEdit)
+        }
+        return readable(live)
+    }
+
     static func bestAvailable(
         preferredEdit: String?,
         professorEdit: String?,
@@ -529,6 +546,10 @@ enum TranscriptActions {
 
     private static func resolved(edit: String?, base: String) -> String? {
         edit ?? base
+    }
+
+    private static func readable(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

@@ -193,7 +193,7 @@ func explicitFlushMakesTheLiveEditRecoverable() throws {
 
 @MainActor
 @Test
-func emptyLiveEditSurvivesRestartAndNeverFallsBackToFinalText() throws {
+func emptyLiveEditStaysInLiveViewWhileGenericActionsUseFinalText() throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("classscribe-empty-live-edit-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
@@ -243,8 +243,8 @@ func emptyLiveEditSurvivesRestartAndNeverFallsBackToFinalText() throws {
     model.openHistory(summary)
     #expect(model.selectedTab == .liveEdit)
     #expect(model.displayedText == "")
-    #expect(model.bestAvailableText == "")
-    #expect(!model.hasCopyableTranscript)
+    #expect(model.bestAvailableText == "[00:00] Persona 1: texto automático final")
+    #expect(model.hasCopyableTranscript)
     #expect(model.currentReadableTextURL?.lastPathComponent == "live-transcript.txt")
 
     model.selectedTab = .professor

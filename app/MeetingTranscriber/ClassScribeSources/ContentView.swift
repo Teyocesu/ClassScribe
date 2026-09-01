@@ -325,7 +325,7 @@ struct ContentView: View {
     private var primaryControlState: CapturePrimaryControlState {
         .resolve(
             isStopping: model.isStopping,
-            isStarting: model.capture.isStarting,
+            isStarting: model.isStarting,
             isRecording: model.isRecording,
             isPaused: model.isTranscriptionPaused,
             isProcessing: model.isProcessing,
@@ -350,7 +350,11 @@ struct ContentView: View {
                 progressLabel("Guardando…")
             case .starting:
                 HStack(spacing: 8) {
-                    progressLabel("Conectando al audio…")
+                    progressLabel(
+                        model.isPreparingTranscription
+                            ? "Preparando transcripción…"
+                            : "Conectando al audio…",
+                    )
                     Button("Cancelar", role: .cancel) {
                         model.cancelStart()
                     }

@@ -275,6 +275,7 @@ private func makeConsentModel(
     let model = ClassScribeModel(
         store: store,
         captureStartOverride: captureStart,
+        asrPreflight: {},
     )
     return ConsentModelFixture(model: model, store: store, root: root)
 }

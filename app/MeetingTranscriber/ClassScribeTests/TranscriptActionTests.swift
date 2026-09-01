@@ -3,7 +3,31 @@ import Foundation
 import Testing
 
 @Test
-func copyUsesBestAvailableTranscriptInPriorityOrder() {
+func genericActionsPreferFullFinalTranscriptAndUseLiveAsFallback() {
+    #expect(TranscriptActions.fullTranscript(
+        finalText: "transcripción completa",
+        liveEdit: "edición viva",
+        live: "vivo",
+    ) == "transcripción completa")
+    #expect(TranscriptActions.fullTranscript(
+        finalText: nil,
+        liveEdit: "edición viva",
+        live: "vivo",
+    ) == "edición viva")
+    #expect(TranscriptActions.fullTranscript(
+        finalText: nil,
+        liveEdit: nil,
+        live: "vivo",
+    ) == "vivo")
+    #expect(TranscriptActions.fullTranscript(
+        finalText: "  ",
+        liveEdit: "edición viva",
+        live: "vivo",
+    ) == "")
+}
+
+@Test
+func legacyBestAvailableTranscriptStillResolvesItsExplicitCandidates() {
     let edited = TranscriptActions.bestAvailable(
         preferredEdit: "edición visible",
         professorEdit: nil,
@@ -125,7 +149,7 @@ func filenamesSupportUnicodeAndSafeLength() {
 
 @MainActor
 @Test
-func selectedTabControlsCopyAndExportSource() throws {
+func genericActionsIgnoreProfessorTabButProfessorViewRemainsFiltered() throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("classscribe-selection-tests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
@@ -145,8 +169,10 @@ func selectedTabControlsCopyAndExportSource() throws {
 
     model.selectedTab = .professor
     #expect(model.bestAvailableText.contains("explicación"))
-    #expect(!model.bestAvailableText.contains("pregunta"))
-    #expect(model.selectedExportSegments.map(\.speakerID) == ["Persona 1"])
+    #expect(model.bestAvailableText.contains("pregunta"))
+    #expect(model.displayedText.contains("explicación"))
+    #expect(!model.displayedText.contains("pregunta"))
+    #expect(model.selectedExportSegments.map(\.speakerID) == ["Persona 1", "Persona 2"])
 
     model.professorSpeakerID = nil
     model.editedAllText = "texto completo corregido"
@@ -161,7 +187,7 @@ func selectedTabControlsCopyAndExportSource() throws {
     model.editedLiveText = "explicación corregida durante la clase"
     #expect(model.availableTranscriptTabs.contains(.liveEdit))
     model.selectedTab = .liveEdit
-    #expect(model.bestAvailableText == "explicación corregida durante la clase")
+    #expect(model.bestAvailableText == "texto completo corregido")
     #expect(model.selectedExportHasFreeformEdit)
     #expect(model.selectedExportSegments.count == 2)
 }
