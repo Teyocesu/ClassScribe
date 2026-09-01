@@ -296,6 +296,17 @@ actor ParakeetService {
                                 with: newWord,
                                 options: [.caseInsensitive]
                             )
+                            if var wordTimings = segments[index].wordTimings {
+                                for timingIndex in wordTimings.indices {
+                                    wordTimings[timingIndex].text = wordTimings[timingIndex].text
+                                        .replacingOccurrences(
+                                            of: replacement.originalWord,
+                                            with: newWord,
+                                            options: [.caseInsensitive]
+                                        )
+                                }
+                                segments[index].wordTimings = wordTimings
+                            }
                         }
                     }
                 }
@@ -371,17 +382,20 @@ actor ParakeetService {
 
         func flush() {
             guard let first = current.first, let last = current.last else { return }
-            let text = current.map(\.word).joined(separator: " ")
-                .replacingOccurrences(of: " ,", with: ",")
-                .replacingOccurrences(of: " .", with: ".")
-                .replacingOccurrences(of: " ?", with: "?")
-                .replacingOccurrences(of: " !", with: "!")
+            let wordTimings = current.map {
+                TranscriptWordTiming(
+                    text: $0.word,
+                    start: $0.startTime,
+                    end: $0.endTime,
+                )
+            }
             output.append(TranscriptSegment(
                 start: first.startTime,
                 end: max(last.endTime, first.startTime + 0.2),
-                text: text,
+                text: TranscriptWordTiming.renderedText(wordTimings),
                 speakerID: "Persona desconocida",
-                confidence: Double(result.confidence)
+                confidence: Double(result.confidence),
+                wordTimings: wordTimings,
             ))
             current.removeAll(keepingCapacity: true)
         }

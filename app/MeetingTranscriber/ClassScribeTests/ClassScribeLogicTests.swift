@@ -46,6 +46,54 @@ func lowConfidenceReview() {
     #expect(result.segments[0].overlappingVoices)
 }
 
+@Test("Un segmento ASR usa timings reales para respetar fronteras de hablante")
+func wordTimedSpeakerBoundariesSplitWithoutChangingText() {
+    let id = UUID(uuidString: "01234567-89AB-CDEF-8123-456789ABCDEF")!
+    let original = TranscriptSegment(
+        id: id,
+        start: 0,
+        end: 12,
+        text: "Hola, buenos días. Hola. ¿Cómo te llamas? Paulo.",
+        speakerID: "Persona desconocida",
+        confidence: 0.92,
+        wordTimings: [
+            TranscriptWordTiming(text: "Hola,", start: 0.1, end: 0.8),
+            TranscriptWordTiming(text: "buenos", start: 0.9, end: 1.5),
+            TranscriptWordTiming(text: "días.", start: 1.6, end: 2.8),
+            TranscriptWordTiming(text: "Hola.", start: 3.2, end: 4.0),
+            TranscriptWordTiming(text: "¿Cómo", start: 6.1, end: 6.7),
+            TranscriptWordTiming(text: "te", start: 6.8, end: 7.2),
+            TranscriptWordTiming(text: "llamas?", start: 7.3, end: 8.5),
+            TranscriptWordTiming(text: "Paulo.", start: 9.2, end: 10.0),
+        ],
+    )
+    let spans = [
+        DiarizationSpan(start: 0, end: 3, speakerID: "Persona 1", quality: 1),
+        DiarizationSpan(start: 3, end: 6, speakerID: "Persona 2", quality: 1),
+        DiarizationSpan(start: 6, end: 9, speakerID: "Persona 1", quality: 1),
+        DiarizationSpan(start: 9, end: 12, speakerID: "Persona 2", quality: 1),
+    ]
+
+    let first = SpeakerAssignment.assign(transcript: [original], diarization: spans)
+    let retry = SpeakerAssignment.assign(transcript: [original], diarization: spans)
+
+    #expect(first.segments.map(\.speakerID) == ["Persona 1", "Persona 2", "Persona 1", "Persona 2"])
+    #expect(first.segments.map(\.text).joined(separator: " ") == original.text)
+    #expect(first.segments.map(\.id) == retry.segments.map(\.id))
+    #expect(first.segments.first?.id == id)
+    let paragraphs = TranscriptExporter.plainText(first.segments).components(separatedBy: "\n\n")
+    #expect(paragraphs.count == 4)
+    #expect(paragraphs.map { $0.contains("Persona 1") } == [true, false, true, false])
+}
+
+@Test("Sesiones históricas sin timings de palabra siguen decodificando")
+func legacyTranscriptSegmentWithoutWordTimingsStillDecodes() throws {
+    let data = Data(#"{"id":"01234567-89AB-CDEF-8123-456789ABCDEF","start":0,"end":1,"text":"Hola.","speakerID":"Persona 1","confidence":1,"provisional":false,"overlappingVoices":false}"#.utf8)
+    let segment = try JSONDecoder().decode(TranscriptSegment.self, from: data)
+    #expect(segment.text == "Hola.")
+    #expect(segment.wordTimings == nil)
+}
+
 @Test("TXT, Markdown y SRT contienen la transcripción")
 func exports() {
     let segments = [TranscriptSegment(start: 1.2, end: 3.4, text: "Hola, clase.", speakerID: "Persona 1", confidence: 1)]

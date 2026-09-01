@@ -347,38 +347,155 @@ enum SpeakerAssignment {
         diarization: [DiarizationSpan],
         confidenceThreshold: Double = 0.55,
     ) -> (segments: [TranscriptSegment], review: [ReviewItem]) {
+        var assigned: [TranscriptSegment] = []
         var review: [ReviewItem] = []
-        let assigned = transcript.map { original -> TranscriptSegment in
-            var segment = original
-            let duration = max(0.05, segment.end - segment.start)
-            let overlaps = diarization.compactMap { span -> (DiarizationSpan, Double)? in
-                let amount = max(0, min(segment.end, span.end) - max(segment.start, span.start))
-                return amount > 0 ? (span, amount) : nil
-            }
-            let bySpeaker = Dictionary(grouping: overlaps, by: { $0.0.speakerID })
-                .mapValues { $0.reduce(0) { $0 + $1.1 } }
-            if let best = bySpeaker.max(by: { $0.value < $1.value }) {
-                segment.speakerID = best.key
-                segment.confidence = min(1, best.value / duration)
-            } else if let nearest = diarization.min(by: {
-                gap(from: segment, to: $0) < gap(from: segment, to: $1)
-            }) {
-                segment.speakerID = nearest.speakerID
-                segment.confidence = 0.25
-            } else {
-                segment.speakerID = "Persona desconocida"
-                segment.confidence = 0
-            }
-            segment.overlappingVoices = bySpeaker.count > 1
-            if segment.confidence < confidenceThreshold || segment.overlappingVoices {
+        for original in transcript {
+            let projected = splitAtSpeakerBoundaries(original, diarization: diarization)
+                ?? [assignWhole(original, diarization: diarization)]
+            assigned.append(contentsOf: projected)
+            for segment in projected where segment.confidence < confidenceThreshold || segment.overlappingVoices {
                 let reason = segment.overlappingVoices
                     ? "Voces superpuestas; confirmar manualmente"
                     : "Confianza de hablante baja (\(Int(segment.confidence * 100)) %)"
                 review.append(ReviewItem(segment: segment, reason: reason))
             }
-            return segment
         }
         return (assigned, review)
+    }
+
+    private struct Evidence {
+        var speakerID: String
+        var confidence: Double
+        var overlappingVoices: Bool
+    }
+
+    private struct WordProjection {
+        var timing: TranscriptWordTiming
+        var evidence: Evidence
+    }
+
+    /// Splits only when the exact word sequence used to create the ASR segment
+    /// is still available. Historical sessions and any text whose timing
+    /// metadata no longer reproduces it keep the conservative whole-segment
+    /// behavior instead of receiving invented timestamps.
+    private static func splitAtSpeakerBoundaries(
+        _ original: TranscriptSegment,
+        diarization: [DiarizationSpan],
+    ) -> [TranscriptSegment]? {
+        guard let timings = original.wordTimings,
+              timings.count > 1,
+              TranscriptWordTiming.renderedText(timings) == original.text
+        else { return nil }
+
+        var words = timings.map {
+            WordProjection(
+                timing: $0,
+                evidence: evidence(start: $0.start, end: $0.end, diarization: diarization),
+            )
+        }
+        // Keep a standalone punctuation token with an adjacent spoken word so
+        // a diarization boundary cannot manufacture a punctuation-only turn.
+        for index in words.indices where isStandalonePunctuation(words[index].timing.text) {
+            if index > words.startIndex {
+                words[index].evidence = words[index - 1].evidence
+            } else if index + 1 < words.endIndex {
+                words[index].evidence = words[index + 1].evidence
+            }
+        }
+
+        var groups: [[WordProjection]] = []
+        for word in words {
+            if let lastSpeaker = groups.last?.last?.evidence.speakerID,
+               lastSpeaker == word.evidence.speakerID {
+                groups[groups.count - 1].append(word)
+            } else {
+                groups.append([word])
+            }
+        }
+        guard groups.count > 1 else { return nil }
+
+        return groups.enumerated().map { groupIndex, group in
+            let groupTimings = group.map(\.timing)
+            let duration = group.reduce(0.0) { partial, word in
+                partial + max(0.05, word.timing.end - word.timing.start)
+            }
+            let confidence = group.reduce(0.0) { partial, word in
+                let wordDuration = max(0.05, word.timing.end - word.timing.start)
+                return partial + word.evidence.confidence * wordDuration
+            } / max(0.05, duration)
+            return TranscriptSegment(
+                id: splitID(original.id, index: groupIndex),
+                start: groupTimings[0].start,
+                end: max(groupTimings[groupTimings.count - 1].end, groupTimings[0].start + 0.2),
+                text: TranscriptWordTiming.renderedText(groupTimings),
+                speakerID: group[0].evidence.speakerID,
+                confidence: min(1, confidence),
+                provisional: original.provisional,
+                overlappingVoices: group.contains(where: \.evidence.overlappingVoices),
+                wordTimings: groupTimings,
+            )
+        }
+    }
+
+    private static func assignWhole(
+        _ original: TranscriptSegment,
+        diarization: [DiarizationSpan],
+    ) -> TranscriptSegment {
+        var segment = original
+        let value = evidence(start: segment.start, end: segment.end, diarization: diarization)
+        segment.speakerID = value.speakerID
+        segment.confidence = value.confidence
+        segment.overlappingVoices = value.overlappingVoices
+        return segment
+    }
+
+    private static func evidence(
+        start: TimeInterval,
+        end: TimeInterval,
+        diarization: [DiarizationSpan],
+    ) -> Evidence {
+        let duration = max(0.05, end - start)
+        var bySpeaker: [String: TimeInterval] = [:]
+        for span in diarization {
+            let amount = max(0, min(end, span.end) - max(start, span.start))
+            if amount > 0 { bySpeaker[span.speakerID, default: 0] += amount }
+        }
+        if let best = bySpeaker.sorted(by: {
+            if $0.value == $1.value { return $0.key < $1.key }
+            return $0.value > $1.value
+        }).first {
+            return Evidence(
+                speakerID: best.key,
+                confidence: min(1, best.value / duration),
+                overlappingVoices: bySpeaker.count > 1,
+            )
+        }
+        if let nearest = diarization.sorted(by: {
+            let leftGap = gap(start: start, end: end, to: $0)
+            let rightGap = gap(start: start, end: end, to: $1)
+            if leftGap != rightGap { return leftGap < rightGap }
+            if $0.start != $1.start { return $0.start < $1.start }
+            return $0.speakerID < $1.speakerID
+        }).first {
+            return Evidence(speakerID: nearest.speakerID, confidence: 0.25, overlappingVoices: false)
+        }
+        return Evidence(speakerID: "Persona desconocida", confidence: 0, overlappingVoices: false)
+    }
+
+    private static func isStandalonePunctuation(_ text: String) -> Bool {
+        !text.isEmpty && text.unicodeScalars.allSatisfy(CharacterSet.punctuationCharacters.contains)
+    }
+
+    /// The original ID remains attached to the first fragment. Later IDs are
+    /// stable derivations, so retrying the same ASR run does not churn review
+    /// or manual-assignment identity.
+    private static func splitID(_ original: UUID, index: Int) -> UUID {
+        guard index > 0 else { return original }
+        var pieces = original.uuidString.split(separator: "-").map(String.init)
+        guard pieces.count == 5, let tail = UInt64(pieces[4], radix: 16) else { return original }
+        let mixed = (tail &+ (UInt64(index) &* 0x9E37_79B9_7F4A_7C15)) & 0x0000_FFFF_FFFF_FFFF
+        pieces[4] = String(format: "%012llX", mixed)
+        return UUID(uuidString: pieces.joined(separator: "-")) ?? original
     }
 
     static func provisionalProfessor(speakers: [SpeakerRecord]) -> String? {
@@ -414,12 +531,12 @@ enum SpeakerAssignment {
         return dot / (a2.squareRoot() * b2.squareRoot())
     }
 
-    private static func gap(from segment: TranscriptSegment, to span: DiarizationSpan) -> Double {
-        if segment.end < span.start {
-            return span.start - segment.end
+    private static func gap(start: TimeInterval, end: TimeInterval, to span: DiarizationSpan) -> Double {
+        if end < span.start {
+            return span.start - end
         }
-        if segment.start > span.end {
-            return segment.start - span.end
+        if start > span.end {
+            return start - span.end
         }
         return 0
     }

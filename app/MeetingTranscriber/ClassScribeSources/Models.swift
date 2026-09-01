@@ -140,6 +140,22 @@ struct MicrophoneOption: Identifiable, Hashable {
     let name: String
 }
 
+/// Word-level timing already produced by Parakeet. It is optional on the
+/// persisted segment so sessions written before this field remain readable.
+struct TranscriptWordTiming: Codable, Equatable {
+    var text: String
+    var start: TimeInterval
+    var end: TimeInterval
+
+    static func renderedText(_ words: [TranscriptWordTiming]) -> String {
+        words.map(\.text).joined(separator: " ")
+            .replacingOccurrences(of: " ,", with: ",")
+            .replacingOccurrences(of: " .", with: ".")
+            .replacingOccurrences(of: " ?", with: "?")
+            .replacingOccurrences(of: " !", with: "!")
+    }
+}
+
 struct TranscriptSegment: Identifiable, Codable, Equatable {
     var id = UUID()
     var start: TimeInterval
@@ -149,6 +165,7 @@ struct TranscriptSegment: Identifiable, Codable, Equatable {
     var confidence: Double
     var provisional: Bool = false
     var overlappingVoices: Bool = false
+    var wordTimings: [TranscriptWordTiming]? = nil
 
     var formattedTimestamp: String { Timecode.display(start) }
 }
