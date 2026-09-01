@@ -63,34 +63,36 @@ private enum ClassScribeDiarizer {
                 throw WorkerError.invalidFilename
             }
 
-            // The physical crash occurred in the first full FBANK batch. A
-            // single-item batch avoids that native batch path; process
-            // isolation remains the hard safety boundary if Core ML aborts.
-            var configuration = OfflineDiarizerConfig(embeddingBatchSize: 1)
-            configuration.exposeChunkEmbeddings = false
-            let manager = OfflineDiarizerManager(config: configuration)
-            let modelConfiguration = MLModelConfiguration()
-            modelConfiguration.computeUnits = .cpuOnly
-            try await manager.prepareModels(configuration: modelConfiguration)
-            let result = try await manager.process(audioURL)
-            guard result.segments.allSatisfy({
-                $0.startTimeSeconds.isFinite && $0.endTimeSeconds.isFinite && $0.qualityScore.isFinite
-                    && $0.startTimeSeconds >= 0 && $0.endTimeSeconds >= $0.startTimeSeconds
-            }), result.speakerDatabase?.values.allSatisfy({ values in
-                !values.isEmpty && values.allSatisfy(\.isFinite)
-            }) ?? true else { throw WorkerError.incompatibleProtocol }
+            var result = try await diarize(audioURL: audioURL)
+            if DiarizationRecoveryPolicy.needsRecovery(result.spans) {
+                // FluidAudio 0.15.5 can auto-detect several clusters but still
+                // assign two local speakers in one segmentation chunk to the
+                // same centroid.  Probe with the upstream-recommended 0.7
+                // threshold, then force the probe's *dynamic* count through
+                // the library's deterministic K-Means re-clustering path.
+                // A genuine one-speaker result never reaches this branch.
+                if let probe = try? await diarize(
+                    audioURL: audioURL,
+                    clusteringThreshold: DiarizationRecoveryPolicy.probeClusteringThreshold,
+                ), let inferredCount = DiarizationRecoveryPolicy.inferredSpeakerCount(
+                    baseline: result.spans,
+                    probe: probe.spans,
+                ), let recovered = try? await diarize(
+                    audioURL: audioURL,
+                    exactSpeakerCount: inferredCount,
+                ), DiarizationRecoveryPolicy.shouldUseRecovery(
+                    baseline: result.spans,
+                    candidate: recovered.spans,
+                    inferredSpeakerCount: inferredCount,
+                ) {
+                    result = recovered
+                }
+            }
 
             let response = DiarizationWorkerResponse(
                 jobID: request.jobID,
-                spans: result.segments.map {
-                    DiarizationWorkerSpan(
-                        start: Double($0.startTimeSeconds),
-                        end: Double($0.endTimeSeconds),
-                        speakerID: $0.speakerId,
-                        quality: Double($0.qualityScore),
-                    )
-                },
-                embeddings: result.speakerDatabase ?? [:],
+                spans: result.spans,
+                embeddings: result.embeddings,
             )
             try writePrivateAtomically(JSONEncoder().encode(response), to: outputURL)
             Darwin.exit(EXIT_SUCCESS)
@@ -112,6 +114,53 @@ private enum ClassScribeDiarizer {
             fputs("ClassScribeDiarizer no pudo completar el trabajo.\n", stderr)
             Darwin.exit(EX_SOFTWARE)
         }
+    }
+
+    private struct WorkerDiarization {
+        var spans: [DiarizationWorkerSpan]
+        var embeddings: [String: [Float]]
+    }
+
+    private static func diarize(
+        audioURL: URL,
+        clusteringThreshold: Double? = nil,
+        exactSpeakerCount: Int? = nil,
+    ) async throws -> WorkerDiarization {
+        // The physical crash occurred in the first full FBANK batch. A
+        // single-item batch avoids that native batch path; process isolation
+        // remains the hard safety boundary if Core ML aborts.
+        var configuration = OfflineDiarizerConfig(embeddingBatchSize: 1)
+        configuration.exposeChunkEmbeddings = false
+        if let clusteringThreshold {
+            configuration.clustering.threshold = clusteringThreshold
+        }
+        if let exactSpeakerCount, exactSpeakerCount > 0 {
+            configuration.clustering.numSpeakers = exactSpeakerCount
+        }
+
+        let manager = OfflineDiarizerManager(config: configuration)
+        let modelConfiguration = MLModelConfiguration()
+        modelConfiguration.computeUnits = .cpuOnly
+        try await manager.prepareModels(configuration: modelConfiguration)
+        let result = try await manager.process(audioURL)
+        guard result.segments.allSatisfy({
+            $0.startTimeSeconds.isFinite && $0.endTimeSeconds.isFinite && $0.qualityScore.isFinite
+                && $0.startTimeSeconds >= 0 && $0.endTimeSeconds >= $0.startTimeSeconds
+        }), result.speakerDatabase?.values.allSatisfy({ values in
+            !values.isEmpty && values.allSatisfy(\.isFinite)
+        }) ?? true else { throw WorkerError.incompatibleProtocol }
+
+        return WorkerDiarization(
+            spans: result.segments.map {
+                DiarizationWorkerSpan(
+                    start: Double($0.startTimeSeconds),
+                    end: Double($0.endTimeSeconds),
+                    speakerID: $0.speakerId,
+                    quality: Double($0.qualityScore),
+                )
+            },
+            embeddings: result.speakerDatabase ?? [:],
+        )
     }
 
     private static func validatedBasename(_ value: String, prefix: String? = nil) throws -> String {

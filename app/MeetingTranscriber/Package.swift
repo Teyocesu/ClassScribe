@@ -42,6 +42,7 @@ let package = Package(
             name: "ClassScribeTests",
             dependencies: [
                 "ClassScribe",
+                "ClassScribeProcessingIPC",
                 .product(name: "AudioTapLib", package: "audiotap"),
             ],
             path: "ClassScribeTests"
