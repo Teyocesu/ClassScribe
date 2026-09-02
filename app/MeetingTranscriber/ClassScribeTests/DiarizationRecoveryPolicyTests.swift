@@ -2,14 +2,60 @@ import ClassScribeProcessingIPC
 import Foundation
 import Testing
 
-@Test("Una sesión monohablante nunca activa la recuperación")
-func singleSpeakerNeverTriggersRecovery() {
-    let spans = [
-        span(0, 20, "S1"),
-        span(25, 50, "S1"),
+@Test("Un monólogo corto no se prueba y uno largo no inventa speakers")
+func singleSpeakerProbeDoesNotInventSpeakers() {
+    let shortMonologue = [span(0, 20, "S1")]
+    let longMonologue = [
+        span(0, 40, "S1"),
+        span(42, 82, "S1"),
+    ]
+    let singleSpeakerProbe = [
+        span(0, 38, "S1"),
+        span(42, 80, "S1"),
     ]
 
-    #expect(!DiarizationRecoveryPolicy.needsRecovery(spans))
+    #expect(!DiarizationRecoveryPolicy.needsRecovery(shortMonologue))
+    #expect(DiarizationRecoveryPolicy.needsRecovery(longMonologue))
+    #expect(DiarizationRecoveryPolicy.inferredSpeakerCount(
+        baseline: longMonologue,
+        probe: singleSpeakerProbe,
+    ) == nil)
+}
+
+@Test("Un baseline único acepta evidencia multihablante fuerte y distribuida")
+func singleSpeakerCollapseAcceptsStrongProbe() throws {
+    let baseline = [span(0, 100, "S1")]
+    let probe = [
+        span(0, 20, "S1"), span(20, 40, "S2"),
+        span(40, 60, "S3"), span(60, 80, "S1"),
+        span(80, 100, "S4"),
+    ]
+
+    let inferred = DiarizationRecoveryPolicy.inferredSpeakerCount(
+        baseline: baseline,
+        probe: probe,
+    )
+    #expect(inferred == 4)
+    #expect(DiarizationRecoveryPolicy.shouldUseRecovery(
+        baseline: baseline,
+        candidate: probe,
+        inferredSpeakerCount: try #require(inferred),
+    ))
+}
+
+@Test("Fragmentación débil y tardía no recupera un baseline único")
+func singleSpeakerCollapseRejectsWeakProbe() {
+    let baseline = [span(0, 100, "S1")]
+    let weakProbe = [
+        span(0, 90, "S1"), span(90, 92, "S2"),
+        span(92, 94, "S3"), span(94, 96, "S2"),
+        span(96, 100, "S1"),
+    ]
+
+    #expect(DiarizationRecoveryPolicy.inferredSpeakerCount(
+        baseline: baseline,
+        probe: weakProbe,
+    ) == nil)
 }
 
 @Test("Una partición multihablante colapsada activa la recuperación")

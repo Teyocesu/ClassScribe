@@ -70,7 +70,9 @@ private enum ClassScribeDiarizer {
                 // same centroid.  Probe with the upstream-recommended 0.7
                 // threshold, then force the probe's *dynamic* count through
                 // the library's deterministic K-Means re-clustering path.
-                // A genuine one-speaker result never reaches this branch.
+                // A long one-speaker baseline may reach this diagnostic probe,
+                // but the policy accepts it only when the auto-counted result
+                // shows strong, temporally distributed evidence of more voices.
                 if let probe = try? await diarize(
                     audioURL: audioURL,
                     clusteringThreshold: DiarizationRecoveryPolicy.probeClusteringThreshold,
