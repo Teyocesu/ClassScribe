@@ -647,15 +647,26 @@ enum TranscriptActions {
         mode: CaptureMode,
         source: String,
         transcript: String,
+        interfaceLanguage: ResolvedInterfaceLanguage = .spanish,
     ) -> String {
-        """
-        Materia: \(subject)
-        Fecha: \(date.formatted(date: .long, time: .shortened))
-        Duración: \(Timecode.display(duration))
-        Modo: \(mode.rawValue)
-        Fuente: \(source)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: interfaceLanguage.localeIdentifier)
+        formatter.dateStyle = .long
+        formatter.timeStyle = .short
+        let modeText = switch mode {
+        case .online:
+            ClassScribeLocalization.text(.modeOnlineMetadata, language: interfaceLanguage)
+        case .inPerson:
+            ClassScribeLocalization.text(.modeInPersonMetadata, language: interfaceLanguage)
+        }
+        return """
+        \(ClassScribeLocalization.text(.exportSubject, language: interfaceLanguage)): \(subject)
+        \(ClassScribeLocalization.text(.exportDate, language: interfaceLanguage)): \(formatter.string(from: date))
+        \(ClassScribeLocalization.text(.exportDuration, language: interfaceLanguage)): \(Timecode.display(duration))
+        \(ClassScribeLocalization.text(.exportMode, language: interfaceLanguage)): \(modeText)
+        \(ClassScribeLocalization.text(.exportSource, language: interfaceLanguage)): \(source)
 
-        Transcripción:
+        \(ClassScribeLocalization.text(.exportTranscript, language: interfaceLanguage)):
 
         \(transcript)
         """

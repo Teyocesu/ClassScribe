@@ -42,11 +42,20 @@ enum CaptureStartGuidance: Equatable {
         case .ready:
             nil
         case .subjectRequired:
-            "Escribe el nombre de la materia."
+            ClassScribeLocalization.text(.guidanceSubject, language: .spanish)
         case .sourceRequired(.online):
-            "Elige la aplicación donde está la clase."
+            ClassScribeLocalization.text(.guidanceApplication, language: .spanish)
         case .sourceRequired(.inPerson):
-            "Elige el micrófono que quieres usar."
+            ClassScribeLocalization.text(.guidanceMicrophone, language: .spanish)
+        }
+    }
+
+    var localizationKey: LocalizationKey? {
+        switch self {
+        case .ready: nil
+        case .subjectRequired: .guidanceSubject
+        case .sourceRequired(.online): .guidanceApplication
+        case .sourceRequired(.inPerson): .guidanceMicrophone
         }
     }
 }
@@ -55,6 +64,8 @@ struct LiveTranscriptFollowPresentation: Equatable {
     var message: String
     var actionTitle: String?
     var systemImage: String
+    var messageKey: LocalizationKey
+    var actionKey: LocalizationKey?
 
     static func resolve(
         isFollowing: Bool,
@@ -63,24 +74,31 @@ struct LiveTranscriptFollowPresentation: Equatable {
     ) -> LiveTranscriptFollowPresentation {
         if isFollowing {
             return LiveTranscriptFollowPresentation(
-                message: "Siguiendo la transcripción automáticamente.",
+                message: ClassScribeLocalization.text(.liveFollowing, language: .spanish),
                 actionTitle: nil,
                 systemImage: "arrow.down.to.line.compact",
+                messageKey: .liveFollowing,
+                actionKey: nil,
             )
         }
         if hasUnseenText {
             return LiveTranscriptFollowPresentation(
-                message: "Hay texto nuevo; tu cursor y tu posición no se movieron.",
-                actionTitle: "Ver texto nuevo",
+                message: ClassScribeLocalization.text(.liveNewText, language: .spanish),
+                actionTitle: ClassScribeLocalization.text(.liveNewTextAction, language: .spanish),
                 systemImage: "text.badge.plus",
+                messageKey: .liveNewText,
+                actionKey: .liveNewTextAction,
             )
         }
         return LiveTranscriptFollowPresentation(
-            message: isEditing
-                ? "Edición activa: tu cursor y tu posición quedan fijos."
-                : "Seguimiento pausado para que puedas revisar el texto.",
-            actionTitle: "Seguir en vivo",
+            message: ClassScribeLocalization.text(
+                isEditing ? .liveEditing : .livePaused,
+                language: .spanish,
+            ),
+            actionTitle: ClassScribeLocalization.text(.liveFollowAction, language: .spanish),
             systemImage: isEditing ? "character.cursor.ibeam" : "pause.circle",
+            messageKey: isEditing ? .liveEditing : .livePaused,
+            actionKey: .liveFollowAction,
         )
     }
 }
@@ -112,19 +130,15 @@ struct ContentView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .environment(\.locale, model.interfaceLocale)
         .alert(item: $systemOutputConsentPresentation.presentedRequest) { request in
             Alert(
-                title: Text("Capturar audio del equipo"),
-                message: Text(
-                    "ClassScribe capturará todo el audio que salga por el dispositivo de salida del equipo. "
-                        + "Esto puede incluir otras aplicaciones, notificaciones y sonidos del sistema.\n\n"
-                        + "El audio se procesa y guarda localmente en tu dispositivo.\n\n"
-                        + "¿Quieres continuar?",
-                ),
-                primaryButton: .default(Text("Capturar audio del equipo")) {
+                title: Text(model.localized(.consentTitle)),
+                message: Text(model.localized(.consentBody)),
+                primaryButton: .default(Text(model.localized(.consentConfirm))) {
                     Task { await model.confirmSystemOutputConsent(request) }
                 },
-                secondaryButton: .cancel(Text("Cancelar")) {
+                secondaryButton: .cancel(Text(model.localized(.consentCancel))) {
                     model.cancelSystemOutputConsent(request)
                 },
             )
@@ -158,15 +172,28 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("ClassScribe")
                     .font(.title2.bold())
-                Text("Graba y transcribe tus clases en esta Mac")
+                Text(model.localized(.headerSubtitle))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .help(BuildIdentity.provenanceLabel)
             Spacer()
-            Label("Procesamiento local", systemImage: "lock.shield")
+            Label(model.localized(.headerLocalProcessing), systemImage: "lock.shield")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(model.localized(.appLanguageLabel))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Picker(model.localized(.appLanguageLabel), selection: $model.interfaceLanguage) {
+                    ForEach(InterfaceLanguage.allCases) { language in
+                        Text(model.localizedInterfaceLanguageName(language)).tag(language)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .accessibilityLabel(model.localized(.appLanguageLabel))
+            }
         }
         .padding(.horizontal, 18)
         .padding(.top, 14)
@@ -175,27 +202,27 @@ struct ContentView: View {
 
     private var captureConfiguration: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Configura la clase")
+            Text(model.localized(.configTitle))
                 .font(.headline)
 
             HStack(alignment: .bottom, spacing: 12) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Materia")
+                    Text(model.localized(.subjectLabel))
                         .font(.caption.bold())
                         .foregroundStyle(.secondary)
-                    TextField("Ej.: Análisis matemático", text: $model.subject)
+                    TextField(model.localized(.subjectPlaceholder), text: $model.subject)
                         .textFieldStyle(.roundedBorder)
                         .disabled(model.isSessionBusy)
                 }
                 .frame(minWidth: 210, idealWidth: 250)
 
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Tipo de clase")
+                    Text(model.localized(.classTypeLabel))
                         .font(.caption.bold())
                         .foregroundStyle(.secondary)
-                    Picker("Tipo de clase", selection: $model.mode) {
+                    Picker(model.localized(.classTypeLabel), selection: $model.mode) {
                         ForEach(CaptureMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
+                            Text(model.localizedCaptureModeName(mode)).tag(mode)
                         }
                     }
                     .labelsHidden()
@@ -205,12 +232,12 @@ struct ContentView: View {
                 .frame(width: 240)
 
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Idioma")
+                    Text(model.localized(.transcriptionLanguageLabel))
                         .font(.caption.bold())
                         .foregroundStyle(.secondary)
-                    Picker("Idioma de transcripción", selection: $model.language) {
+                    Picker(model.localized(.transcriptionLanguageLabel), selection: $model.language) {
                         ForEach(TranscriptionLanguage.allCases) { language in
-                            Text(language.displayName).tag(language)
+                            Text(model.localizedTranscriptionLanguageName(language)).tag(language)
                         }
                     }
                     .labelsHidden()
@@ -220,23 +247,23 @@ struct ContentView: View {
 
                 VStack(alignment: .leading, spacing: 5) {
                     if model.mode == .online {
-                        Text("Fuente online")
+                        Text(model.localized(.onlineSourceLabel))
                             .font(.caption.bold())
                             .foregroundStyle(.secondary)
-                        Picker("Fuente online", selection: $model.onlineCaptureSource) {
+                        Picker(model.localized(.onlineSourceLabel), selection: $model.onlineCaptureSource) {
                             ForEach(OnlineCaptureSource.allCases) { source in
-                                Text(source.displayName).tag(source)
+                                Text(model.localizedOnlineSourceName(source)).tag(source)
                             }
                         }
                         .labelsHidden()
                         .pickerStyle(.segmented)
-                        .accessibilityLabel("Fuente de audio online")
+                        .accessibilityLabel(model.localized(.audioSourceOnlineAccessibility))
                         if model.onlineCaptureSource == .systemOutput {
-                            Text("Captura todo el audio que sale por tu equipo.")
+                            Text(model.localized(.systemOutputHint))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
-                                .accessibilityLabel("Captura todo el audio que sale por tu equipo")
+                                .accessibilityLabel(model.localized(.systemOutputHint))
                         } else {
                             HStack(spacing: 6) {
                                 sourcePicker
@@ -245,12 +272,12 @@ struct ContentView: View {
                                 } label: {
                                     Image(systemName: "arrow.clockwise")
                                 }
-                                .help("Actualizar fuentes de audio")
-                                .accessibilityLabel("Actualizar fuentes de audio")
+                                .help(model.localized(.refreshAudioSources))
+                                .accessibilityLabel(model.localized(.refreshAudioSources))
                             }
                         }
                     } else {
-                        Text("Micrófono")
+                        Text(model.localized(.microphonePickerLabel))
                             .font(.caption.bold())
                             .foregroundStyle(.secondary)
                         HStack(spacing: 6) {
@@ -260,8 +287,8 @@ struct ContentView: View {
                             } label: {
                                 Image(systemName: "arrow.clockwise")
                             }
-                            .help("Actualizar fuentes de audio")
-                            .accessibilityLabel("Actualizar fuentes de audio")
+                            .help(model.localized(.refreshAudioSources))
+                            .accessibilityLabel(model.localized(.refreshAudioSources))
                         }
                     }
                 }
@@ -274,11 +301,11 @@ struct ContentView: View {
 
             DisclosureGroup(isExpanded: $showsTechnicalVocabulary) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Ayuda a reconocer nombres, siglas y términos propios de la materia.")
+                    Text(model.localized(.technicalVocabularyHelp))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     TextField(
-                        "Ej.: Newton-Raphson, Runge-Kutta, PMBOK",
+                        model.localized(.technicalVocabularyPlaceholder),
                         text: $model.technicalVocabulary,
                     )
                     .textFieldStyle(.roundedBorder)
@@ -286,7 +313,7 @@ struct ContentView: View {
                 }
                 .padding(.top, 7)
             } label: {
-                Label("Agregar vocabulario técnico (opcional)", systemImage: "text.badge.plus")
+                Label(model.localized(.technicalVocabularyLabel), systemImage: "text.badge.plus")
                     .font(.caption)
             }
         }
@@ -302,8 +329,8 @@ struct ContentView: View {
     @ViewBuilder
     private var sourcePicker: some View {
         if model.mode == .online {
-            Picker("Aplicación", selection: $model.selectedApplicationIdentityID) {
-                Text("Seleccionar aplicación…").tag(String?.none)
+            Picker(model.localized(.applicationPickerLabel), selection: $model.selectedApplicationIdentityID) {
+                Text(model.localized(.selectApplication)).tag(String?.none)
                 ForEach(model.capture.applications) { app in
                     Text(app.name).tag(String?.some(app.logicalIdentityID))
                 }
@@ -311,8 +338,8 @@ struct ContentView: View {
             .labelsHidden()
             .frame(minWidth: 220)
         } else {
-            Picker("Micrófono", selection: $model.selectedMicrophoneID) {
-                Text("Seleccionar micrófono…").tag(String?.none)
+            Picker(model.localized(.microphonePickerLabel), selection: $model.selectedMicrophoneID) {
+                Text(model.localized(.selectMicrophone)).tag(String?.none)
                 ForEach(model.capture.microphones) { mic in
                     Text(mic.name).tag(String?.some(mic.id))
                 }
@@ -347,15 +374,15 @@ struct ContentView: View {
         VStack(alignment: .trailing, spacing: 5) {
             switch primaryControlState {
             case .stopping:
-                progressLabel("Guardando…")
+                progressLabel(model.localized(.statusSaving))
             case .starting:
                 HStack(spacing: 8) {
                     progressLabel(
                         model.isPreparingTranscription
-                            ? "Preparando transcripción…"
-                            : "Conectando al audio…",
+                            ? model.localized(.statusPreparingTranscription)
+                            : model.localized(.statusConnectingAudio),
                     )
-                    Button("Cancelar", role: .cancel) {
+                    Button(model.localized(.buttonCancel), role: .cancel) {
                         model.cancelStart()
                     }
                 }
@@ -365,14 +392,16 @@ struct ContentView: View {
                         paused ? model.resumeTranscription() : model.pauseTranscription()
                     } label: {
                         Label(
-                            paused ? "Reanudar" : "Pausar texto",
+                            paused
+                                ? model.localized(.buttonResumeText)
+                                : model.localized(.buttonPauseText),
                             systemImage: paused ? "play.fill" : "pause.fill",
                         )
                     }
                     Button(role: .destructive) {
                         Task { await model.stopClass() }
                     } label: {
-                        Label("Finalizar", systemImage: "stop.fill")
+                        Label(model.localized(.buttonFinish), systemImage: "stop.fill")
                     }
                 }
             case .processing:
@@ -380,7 +409,7 @@ struct ContentView: View {
                     ProgressView()
                         .controlSize(.small)
                     if model.isRetrying || model.state == .finalTranscription || model.state == .diarizing {
-                        Button("Cancelar procesamiento", role: .cancel) {
+                        Button(model.localized(.buttonCancelProcessing), role: .cancel) {
                             model.cancelFinalProcessing()
                         }
                     }
@@ -389,13 +418,13 @@ struct ContentView: View {
                 Button {
                     Task { await model.startClass() }
                 } label: {
-                    Label("Iniciar grabación", systemImage: "record.circle")
+                    Label(model.localized(.buttonStartRecording), systemImage: "record.circle")
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .disabled(!model.canStart)
-                if !model.canStart, let message = startGuidance.message {
-                    Text(message)
+                if !model.canStart, let key = startGuidance.localizationKey {
+                    Text(model.localized(key))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -433,12 +462,12 @@ struct ContentView: View {
                     Image(systemName: "waveform")
                         .foregroundStyle(.secondary)
                     Gauge(value: min(0, max(-60, model.capture.levelDBFS)), in: -60 ... 0) {
-                        Text("Nivel de audio")
+                Text(model.localized(.audioLevel))
                     }
                     .labelsHidden()
                     .gaugeStyle(.accessoryLinearCapacity)
                     .frame(width: 92)
-                    .accessibilityLabel("Nivel de audio")
+                    .accessibilityLabel(model.localized(.audioLevel))
                 }
             }
             Text(model.statusDetail)
@@ -450,7 +479,7 @@ struct ContentView: View {
                 Button {
                     Task { await model.retryProcessing() }
                 } label: {
-                    Label("Reintentar procesamiento", systemImage: "arrow.clockwise")
+                    Label(model.localized(.buttonRetryProcessing), systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
@@ -463,9 +492,11 @@ struct ContentView: View {
 
     private var statusTitle: String {
         if model.isRecording {
-            return model.isTranscriptionPaused ? "Grabando · texto pausado" : "Grabando y transcribiendo"
+            return model.isTranscriptionPaused
+                ? model.localized(.statusRecordingPaused)
+                : model.localized(.statusRecordingAndTranscribing)
         }
-        return model.state.rawValue
+        return model.localizedProcessingStateName(model.state)
     }
 
     private var statusColor: Color {
@@ -481,7 +512,7 @@ struct ContentView: View {
     private var speakersPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label("Voces", systemImage: "person.2.wave.2")
+                Label(model.localized(.voicesTitle), systemImage: "person.2.wave.2")
                     .font(.headline)
                 Spacer()
                 if !model.speakers.isEmpty {
@@ -496,9 +527,9 @@ struct ContentView: View {
                     Image(systemName: "person.2.wave.2")
                         .font(.title2)
                         .foregroundStyle(.secondary)
-                    Text("Aún no hay voces identificadas")
+                    Text(model.localized(.voicesEmpty))
                         .font(.subheadline.bold())
-                    Text("Se identificarán al finalizar la grabación.")
+                    Text(model.localized(.voicesDescription))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -522,22 +553,28 @@ struct ContentView: View {
                 } label: {
                     Label(
                         model.isCalibrating
-                            ? "Guardando voz… \(model.calibrationSecondsRemaining) s"
-                            : "Guardar voz del profesor (20 s)",
+                            ? model.localized(
+                                .calibrationInProgress,
+                                arguments: ["seconds": String(model.calibrationSecondsRemaining)],
+                            )
+                            : model.localized(.calibrationButton),
                         systemImage: "waveform.badge.mic",
                     )
                 }
                 .disabled(model.isCalibrating || model.isStopping)
-                .help("Crea una referencia local para reconocer al profesor en esta materia.")
+                .help(model.localized(.calibrationHelp))
             }
 
             if let professor = model.professorSpeakerID {
                 VStack(alignment: .leading, spacing: 3) {
-                    Label("Profesor: \(professor)", systemImage: "person.crop.circle.badge.checkmark")
+                    Label(
+                        "\(model.localized(.professorLabel)): \(model.localizedSpeakerName(id: professor))",
+                        systemImage: "person.crop.circle.badge.checkmark",
+                    )
                         .font(.subheadline.bold())
                         .foregroundStyle(.indigo)
                     if model.professorSelectionIsAutomatic {
-                        Text("Selección automática; puedes cambiarla.")
+                        Text(model.localized(.professorAutomatic))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -546,7 +583,7 @@ struct ContentView: View {
 
             Divider()
             HStack {
-                Label("Clases anteriores", systemImage: "clock.arrow.circlepath")
+                Label(model.localized(.historyTitle), systemImage: "clock.arrow.circlepath")
                     .font(.headline)
                 Spacer()
                 if !model.history.isEmpty {
@@ -557,7 +594,7 @@ struct ContentView: View {
             }
 
             if model.history.isEmpty {
-                Text("Tus grabaciones aparecerán aquí.")
+                Text(model.localized(.historyEmpty))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -575,13 +612,13 @@ struct ContentView: View {
                                             .font(.subheadline.bold())
                                             .lineLimit(1)
                                         Text(
-                                            "\(item.startedAt.formatted(date: .abbreviated, time: .shortened)) · "
+                                            "\(model.localizedDate(item.startedAt, dateStyle: .short)) · "
                                                 + Timecode.display(item.duration),
                                         )
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                         if item.isRecoverable {
-                                            Text("Necesita recuperar el procesamiento")
+                                            Text(model.localized(.historyRecoverable))
                                                 .font(.caption2)
                                                 .foregroundStyle(.orange)
                                         }
@@ -609,7 +646,7 @@ struct ContentView: View {
     private func speakerCard(_ speaker: SpeakerRecord) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text(speaker.displayName).font(.subheadline.bold())
+                Text(model.localizedSpeakerName(speaker)).font(.subheadline.bold())
                 Spacer()
                 Text(Timecode.display(speaker.totalSpeakingTime)).font(.caption.monospacedDigit())
             }
@@ -634,18 +671,20 @@ struct ContentView: View {
     }
 
     private func professorButtonTitle(for speaker: SpeakerRecord) -> String {
-        guard model.professorSpeakerID == speaker.id else { return "Elegir como profesor" }
-        return model.professorSelectionIsAutomatic ? "Confirmar profesor" : "Profesor ✓"
+        guard model.professorSpeakerID == speaker.id else { return model.localized(.professorChoose) }
+        return model.professorSelectionIsAutomatic
+            ? model.localized(.professorConfirm)
+            : model.localized(.professorConfirmed)
     }
 
     private var transcriptPanel: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 if model.finalReplacedLive {
-                    Picker("Transcripción", selection: $model.selectedTab) {
+                    Picker(model.localized(.transcriptPickerLabel), selection: $model.selectedTab) {
                         ForEach(model.availableTranscriptTabs) { tab in
                             Text(
-                                tab.rawValue
+                                model.localizedTranscriptTabName(tab)
                                     + (tab == .review && !model.reviewItems.isEmpty
                                         ? " (\(model.reviewItems.count))"
                                         : ""),
@@ -657,20 +696,24 @@ struct ContentView: View {
                     .frame(maxWidth: 500)
                 } else {
                     Label(
-                        model.isRecording ? "Transcripción en vivo" : "Transcripción",
+                        model.isRecording
+                            ? model.localized(.transcriptLiveTitle)
+                            : model.localized(.transcriptTitle),
                         systemImage: "text.alignleft",
                     )
                     .font(.headline)
                 }
-                if let actionTitle = liveFollowPresentation.actionTitle,
-                   model.isRecording {
+                if liveFollowPresentation.actionKey != nil, model.isRecording {
                     Button {
                         resumeLiveTranscriptFollowing()
                     } label: {
-                        Label(actionTitle, systemImage: "arrow.down.to.line.compact")
+                        Label(
+                            model.localized(liveFollowPresentation.actionKey!),
+                            systemImage: "arrow.down.to.line.compact",
+                        )
                     }
                     .controlSize(.small)
-                    .help("Volver al texto más reciente y continuar siguiéndolo")
+                    .help(model.localized(.liveFollowAction))
                 }
                 Spacer()
                 if model.isProcessing {
@@ -691,9 +734,9 @@ struct ContentView: View {
                 reviewPanel
             } else if !model.hasCopyableTranscript {
                 ContentUnavailableView(
-                    "La transcripción aparecerá aquí",
+                    model.localized(.transcriptEmptyTitle),
                     systemImage: "text.quote",
-                    description: Text("Configura la clase y pulsa Iniciar grabación."),
+                    description: Text(model.localized(.transcriptEmptyDescription)),
                 )
             } else {
                 TextEditor(text: editableText)
@@ -707,7 +750,7 @@ struct ContentView: View {
                 HStack {
                     Image(systemName: liveFollowPresentation.systemImage)
                         .foregroundStyle(followsLiveTranscript ? .indigo : .orange)
-                    Text(liveFollowPresentation.message)
+                    Text(model.localized(liveFollowPresentation.messageKey))
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
@@ -716,7 +759,7 @@ struct ContentView: View {
             } else if model.finalReplacedLive, model.selectedTab == .liveEdit {
                 HStack {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Tus correcciones se conservaron. Puedes compararlas con la transcripción final en las otras pestañas.")
+                    Text(model.localized(.liveCorrectionsKept))
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
@@ -733,7 +776,7 @@ struct ContentView: View {
             } else if model.finalReplacedLive {
                 HStack {
                     Image(systemName: "checkmark.seal.fill").foregroundStyle(.green)
-                    Text("La versión final reemplazó la provisional; puedes editar y exportar el texto.")
+                    Text(model.localized(.liveFinalReplaced))
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
@@ -748,14 +791,14 @@ struct ContentView: View {
             Button {
                 model.copyTranscript()
             } label: {
-                Label("Copiar transcripción", systemImage: "doc.on.doc")
+                Label(model.localized(.copyTranscript), systemImage: "doc.on.doc")
             }
             .disabled(!model.hasCopyableTranscript)
 
             Button {
                 model.copyForChatGPT()
             } label: {
-                Label("Copiar con contexto", systemImage: "text.badge.plus")
+                Label(model.localized(.copyForChatGPT), systemImage: "text.badge.plus")
             }
             .disabled(!model.hasCopyableTranscript)
 
@@ -764,14 +807,14 @@ struct ContentView: View {
             Button {
                 model.openCurrentTXT()
             } label: {
-                Label("Abrir archivo de texto", systemImage: "doc.text")
+                Label(model.localized(.openTextFile), systemImage: "doc.text")
             }
             .disabled(!model.canOpenTXT)
 
             Button {
                 model.openCurrentFolder()
             } label: {
-                Label("Mostrar carpeta en Finder", systemImage: "folder")
+                Label(model.localized(.showFolder), systemImage: "folder")
             }
             .disabled(model.currentFolder == nil)
 
@@ -781,12 +824,12 @@ struct ContentView: View {
                 Button {
                     model.export(kind)
                 } label: {
-                    Label("Exportar \(kind.rawValue)", systemImage: "square.and.arrow.up")
+                    Label(model.localizedExportName(kind), systemImage: "square.and.arrow.up")
                 }
                 .disabled(!model.hasCopyableTranscript)
             }
         } label: {
-            Label("Acciones", systemImage: "ellipsis.circle")
+            Label(model.localized(.actions), systemImage: "ellipsis.circle")
         }
     }
 
@@ -796,10 +839,12 @@ struct ContentView: View {
                 text: liveEditableText,
                 isEditing: $liveEditorIsEditing,
                 isFollowing: $followsLiveTranscript,
+                accessibilityLabel: model.localized(.liveEditing),
+                accessibilityHelp: model.localized(.liveAccessibilityHelp),
                 onFinalize: { _ = model.flushEditedLiveText() },
             )
             if model.liveEditableText.isEmpty {
-                Text("La transcripción aparecerá aquí mientras habla el profesor…")
+                Text(model.localized(.livePlaceholder))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 15)
                     .padding(.vertical, 18)
@@ -891,10 +936,10 @@ struct ContentView: View {
                 .font(.caption)
                 .textSelection(.enabled)
             Spacer()
-            Button("Ocultar") { model.errorMessage = nil }
+            Button(model.localized(.hide)) { model.errorMessage = nil }
                 .controlSize(.small)
             if model.canSelectSystemOutputAfterApplicationFailure {
-                Button("Capturar audio del equipo") {
+                Button(model.localized(.consentConfirm)) {
                     model.selectSystemOutputAfterApplicationFailure()
                 }
                 .controlSize(.small)
@@ -909,18 +954,25 @@ struct ContentView: View {
     private var reviewPanel: some View {
         if model.reviewItems.isEmpty {
             ContentUnavailableView(
-                "Nada para revisar",
+                model.localized(.reviewEmptyTitle),
                 systemImage: "checkmark.circle",
-                description: Text("Los fragmentos con baja confianza o voces superpuestas aparecerán aquí."),
+                description: Text(model.localized(.reviewEmptyDescription)),
             )
         } else {
             List(model.reviewItems) { item in
                 VStack(alignment: .leading, spacing: 5) {
                     HStack {
-                        Text("[\(item.segment.formattedTimestamp)] \(item.segment.speakerID)").font(.caption.bold())
-                        Text(item.reason).font(.caption).foregroundStyle(.orange)
+                        Text("[\(item.segment.formattedTimestamp)] \(model.localizedSpeakerName(id: item.segment.speakerID))")
+                            .font(.caption.bold())
+                        Text(model.localizedReviewReason(item.reason))
+                            .font(.caption)
+                            .foregroundStyle(.orange)
                         Spacer()
-                        Button(item.manuallyAssignedToProfessor ? "Asignado al profesor ✓" : "Asignar al profesor") {
+                        Button(
+                            item.manuallyAssignedToProfessor
+                                ? model.localized(.reviewAssigned)
+                                : model.localized(.reviewAssign),
+                        ) {
                             model.toggleReviewAssignment(item.id)
                         }
                         .controlSize(.small)

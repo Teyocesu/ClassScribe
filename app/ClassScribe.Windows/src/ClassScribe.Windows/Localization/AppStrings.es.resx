@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <data name="AppLanguageLabel" xml:space="preserve"><value>Idioma de la aplicación</value></data>
+  <data name="LanguageSystem" xml:space="preserve"><value>Sistema</value></data>
+  <data name="LanguageSpanish" xml:space="preserve"><value>Español</value></data>
+  <data name="LanguageEnglish" xml:space="preserve"><value>Inglés</value></data>
+  <data name="LanguageFrench" xml:space="preserve"><value>Francés</value></data>
+  <data name="HeaderSubtitle" xml:space="preserve"><value>Transcripción privada y local para Windows</value></data>
+  <data name="HeaderLocalProcessing" xml:space="preserve"><value>Procesamiento local</value></data>
+  <data name="NewClass" xml:space="preserve"><value>Nueva clase</value></data>
+  <data name="SubjectLabel" xml:space="preserve"><value>Materia</value></data>
+  <data name="SubjectPlaceholder" xml:space="preserve"><value>Nombre de la materia o reunión</value></data>
+  <data name="SubjectTooltip" xml:space="preserve"><value>Nombre de la materia o reunión</value></data>
+  <data name="CaptureTypeLabel" xml:space="preserve"><value>Tipo de captura</value></data>
+  <data name="CaptureModeOnline" xml:space="preserve"><value>Clase online · audio de una aplicación</value></data>
+  <data name="CaptureModeInPerson" xml:space="preserve"><value>Clase presencial · micrófono</value></data>
+  <data name="TranscriptionLanguageLabel" xml:space="preserve"><value>Idioma de transcripción</value></data>
+  <data name="SupportedLanguages" xml:space="preserve"><value>Reconocimiento optimizado para español, inglés o francés.</value></data>
+  <data name="AudioSourceLabel" xml:space="preserve"><value>Fuente de audio</value></data>
+  <data name="OnlineAudioAccessibility" xml:space="preserve"><value>Fuente de audio online</value></data>
+  <data name="OnlineSourceApplication" xml:space="preserve"><value>Una aplicación</value></data>
+  <data name="OnlineSourceSystemOutput" xml:space="preserve"><value>Audio del equipo</value></data>
+  <data name="SelectApplication" xml:space="preserve"><value>Seleccionar aplicación</value></data>
+  <data name="SelectMicrophone" xml:space="preserve"><value>Seleccionar micrófono</value></data>
+  <data name="RefreshApplications" xml:space="preserve"><value>Actualizar aplicaciones</value></data>
+  <data name="RefreshMicrophones" xml:space="preserve"><value>Actualizar micrófonos</value></data>
+  <data name="SystemOutputHint" xml:space="preserve"><value>Captura todo el audio que sale por tu equipo.</value></data>
+  <data name="TechnicalVocabularyLabel" xml:space="preserve"><value>Vocabulario técnico (opcional)</value></data>
+  <data name="TechnicalVocabularyTooltip" xml:space="preserve"><value>Nombres propios, siglas y términos separados por comas</value></data>
+  <data name="TechnicalVocabularyPlaceholder" xml:space="preserve"><value>Nombres propios, siglas y términos separados por comas</value></data>
+  <data name="AudioLevel" xml:space="preserve"><value>Nivel de audio</value></data>
+  <data name="StartRecording" xml:space="preserve"><value>Iniciar grabación</value></data>
+  <data name="StopProcessing" xml:space="preserve"><value>Detener y procesar</value></data>
+  <data name="PauseText" xml:space="preserve"><value>Pausar texto</value></data>
+  <data name="ResumeText" xml:space="preserve"><value>Reanudar texto</value></data>
+  <data name="CancelProcess" xml:space="preserve"><value>Cancelar proceso</value></data>
+  <data name="CaptureComputerAudio" xml:space="preserve"><value>Capturar audio del equipo</value></data>
+  <data name="CurrentSession" xml:space="preserve"><value>Sesión actual</value></data>
+  <data name="NoSession" xml:space="preserve"><value>Todavía no hay una sesión abierta</value></data>
+  <data name="OpenFolder" xml:space="preserve"><value>Abrir carpeta</value></data>
+  <data name="Reprocess" xml:space="preserve"><value>Reprocesar</value></data>
+  <data name="ReprocessTooltip" xml:space="preserve"><value>Repite transcripción y hablantes desde el audio guardado</value></data>
+  <data name="TabLive" xml:space="preserve"><value>En vivo</value></data>
+  <data name="TabAll" xml:space="preserve"><value>Todos</value></data>
+  <data name="TabProfessor" xml:space="preserve"><value>Profesor</value></data>
+  <data name="TabReview" xml:space="preserve"><value>Revisión</value></data>
+  <data name="TabHistory" xml:space="preserve"><value>Historial</value></data>
+  <data name="LiveEditingDescription" xml:space="preserve"><value>Puedes corregir el texto mientras se graba; tus cambios no se sobrescriben.</value></data>
+  <data name="LiveTranscriptAccessibility" xml:space="preserve"><value>Transcripción en vivo</value></data>
+  <data name="AllSpeakersAccessibility" xml:space="preserve"><value>Transcripción de todos los hablantes</value></data>
+  <data name="ApplyAndSave" xml:space="preserve"><value>Aplicar y guardar</value></data>
+  <data name="ProfessorSpeaker" xml:space="preserve"><value>Hablante profesor:</value></data>
+  <data name="ProfessorTranscript" xml:space="preserve"><value>Transcripción del profesor</value></data>
+  <data name="ReviewDescription" xml:space="preserve"><value>Revisa solapamientos o asignaciones dudosas. Marca los fragmentos que pertenecen al profesor.</value></data>
+  <data name="ReviewOverlapping" xml:space="preserve"><value>Voces superpuestas</value></data>
+  <data name="ReviewLowConfidence" xml:space="preserve"><value>Confianza baja ({0})</value></data>
+  <data name="Time" xml:space="preserve"><value>Tiempo</value></data>
+  <data name="Speaker" xml:space="preserve"><value>Hablante</value></data>
+  <data name="Reason" xml:space="preserve"><value>Motivo</value></data>
+  <data name="Text" xml:space="preserve"><value>Texto</value></data>
+  <data name="Professor" xml:space="preserve"><value>Profesor</value></data>
+  <data name="HistoryAccessibility" xml:space="preserve"><value>Historial de clases</value></data>
+  <data name="OpenPreviousClass" xml:space="preserve"><value>Abrir una clase anterior</value></data>
+  <data name="OpenPreviousDescription" xml:space="preserve"><value>Carga sus textos editables. Si quedó interrumpida, ClassScribe puede reconstruir el WAV y volver a procesarla.</value></data>
+  <data name="OpenSelection" xml:space="preserve"><value>Abrir selección</value></data>
+  <data name="SaveChanges" xml:space="preserve"><value>Guardar cambios</value></data>
+  <data name="CopyForChat" xml:space="preserve"><value>Copiar para ChatGPT</value></data>
+  <data name="Export" xml:space="preserve"><value>Exportar…</value></data>
+  <data name="FooterPrivacy" xml:space="preserve"><value>Audio y modelos permanecen en tu equipo; Internet solo se usa para la primera descarga del modelo.</value></data>
+  <data name="StatusReady" xml:space="preserve"><value>Lista para grabar</value></data>
+  <data name="StatusComputerAudioReady" xml:space="preserve"><value>Audio del equipo listo para grabar</value></data>
+  <data name="StatusComputerAudioCancelled" xml:space="preserve"><value>Captura del audio del equipo cancelada.</value></data>
+  <data name="StatusSystemOutputSelected" xml:space="preserve"><value>Audio del equipo seleccionado. Presiona Iniciar grabación para continuar.</value></data>
+  <data name="StatusSearchingApplications" xml:space="preserve"><value>Buscando aplicaciones abiertas…</value></data>
+  <data name="StatusSearchingMicrophones" xml:space="preserve"><value>Buscando micrófonos…</value></data>
+  <data name="StatusNoApplications" xml:space="preserve"><value>No hay aplicaciones con ventana abierta</value></data>
+  <data name="StatusNoMicrophones" xml:space="preserve"><value>No se encontraron micrófonos activos</value></data>
+  <data name="StatusSourcesReady" xml:space="preserve"><value>Lista para grabar</value></data>
+  <data name="StatusPermission" xml:space="preserve"><value>Revisa los permisos de micrófono de Windows</value></data>
+  <data name="StatusCompleteSubjectSource" xml:space="preserve"><value>Completa la materia y selecciona una fuente de audio.</value></data>
+  <data name="StatusPreparingBeforeRecording" xml:space="preserve"><value>Preparando transcripción antes de grabar…</value></data>
+  <data name="StatusModelReady" xml:space="preserve"><value>Modelo listo; iniciando grabación…</value></data>
+  <data name="StatusWaitingAudio" xml:space="preserve"><value>Esperando el primer callback de audio…</value></data>
+  <data name="StatusRecordingSaved" xml:space="preserve"><value>Grabando y guardando audio localmente</value></data>
+  <data name="StatusStartCancelled" xml:space="preserve"><value>Inicio cancelado; cualquier audio recibido quedó guardado</value></data>
+  <data name="StatusStartFailed" xml:space="preserve"><value>No se pudo iniciar la grabación</value></data>
+  <data name="StatusRecording" xml:space="preserve"><value>Grabando y transcribiendo</value></data>
+  <data name="StatusRecordingPaused" xml:space="preserve"><value>Grabando · transcripción en vivo pausada</value></data>
+  <data name="StatusClosingAudio" xml:space="preserve"><value>Cerrando y validando el audio…</value></data>
+  <data name="StatusPartialSaved" xml:space="preserve"><value>El audio parcial quedó guardado para reprocesar</value></data>
+  <data name="StatusProcessCancelled" xml:space="preserve"><value>Procesamiento cancelado; la grabación y el texto parcial se conservaron</value></data>
+  <data name="StatusSessionSavedRetry" xml:space="preserve"><value>Audio y texto guardados para reprocesar en el próximo inicio</value></data>
+  <data name="StatusSafeCancel" xml:space="preserve"><value>Cancelando de forma segura…</value></data>
+  <data name="StatusReprocessCancelled" xml:space="preserve"><value>Reprocesado cancelado; los archivos existentes no cambiaron</value></data>
+  <data name="StatusReprocessUnavailable" xml:space="preserve"><value>Esta sesión no conserva audio suficiente para reprocesar.</value></data>
+  <data name="StatusReprocessFailed" xml:space="preserve"><value>No se pudo reprocesar; los archivos anteriores siguen disponibles</value></data>
+  <data name="StatusProfessorSaved" xml:space="preserve"><value>Selección de profesor guardada</value></data>
+  <data name="StatusEditsSaved" xml:space="preserve"><value>Cambios guardados</value></data>
+  <data name="StatusOperationFailed" xml:space="preserve"><value>La operación no pudo completarse</value></data>
+  <data name="StatusLiveModelRetry" xml:space="preserve"><value>El audio sigue grabándose de forma segura; esperando voz</value></data>
+  <data name="StatusLiveWaitingVoice" xml:space="preserve"><value>Grabando audio; esperando voz para transcribir</value></data>
+  <data name="StatusLiveHypothesisRejected" xml:space="preserve"><value>Grabando audio; la hipótesis no fue aceptada y se conserva el texto anterior</value></data>
+  <data name="StatusLiveUnavailable" xml:space="preserve"><value>El audio sigue grabándose de forma segura; podrá retranscribirse al detener</value></data>
+  <data name="StatusLiveRetry" xml:space="preserve"><value>El audio sigue grabándose de forma segura; reintento en {0:0} s</value></data>
+  <data name="StatusFinalPreparing" xml:space="preserve"><value>Preparando transcripción final e identificando hablantes…</value></data>
+  <data name="StatusFinalizingSpeakers" xml:space="preserve"><value>Finalizando identificación de hablantes…</value></data>
+  <data name="StatusFinalReady" xml:space="preserve"><value>Transcripción final lista</value></data>
+  <data name="StatusFinalSpeakersIssue" xml:space="preserve"><value>La transcripción está completa, pero faltó separar hablantes: {0}</value></data>
+  <data name="StatusSessionOpen" xml:space="preserve"><value>Sesión abierta</value></data>
+  <data name="StatusRecoverableOpen" xml:space="preserve"><value>Sesión recuperable abierta</value></data>
+  <data name="StatusCaptureAwaiting" xml:space="preserve"><value>Esperando callbacks de audio…</value></data>
+  <data name="StatusCaptureNoCallbacks" xml:space="preserve"><value>La fuente dejó de entregar callbacks; el audio recibido se conserva.</value></data>
+  <data name="StatusCaptureSilent" xml:space="preserve"><value>Captura activa con callbacks silenciosos; el silencio no es un fallo.</value></data>
+  <data name="StatusCaptureAudible" xml:space="preserve"><value>Audio recibido; esperando voz o un resultado de transcripción.</value></data>
+  <data name="StatusStopToRecoverAudio" xml:space="preserve"><value>Detén la sesión para validar y recuperar el audio recibido</value></data>
+  <data name="StatusStopToRecoverDurable" xml:space="preserve"><value>Detén la sesión para conservar y recuperar el audio recibido</value></data>
+  <data name="StatusDownloading" xml:space="preserve"><value>Descargando {0}: {1:P0}</value></data>
+  <data name="StatusModelDownloaded" xml:space="preserve"><value>{0} listo</value></data>
+  <data name="WarningSourceRead" xml:space="preserve"><value>No se pudieron leer las fuentes de audio: {0}</value></data>
+  <data name="WarningModelRetry" xml:space="preserve"><value>El modelo de transcripción se reintentará: {0}</value></data>
+  <data name="WarningLiveUnavailable" xml:space="preserve"><value>La transcripción en vivo quedó no disponible para esta sesión: {0}</value></data>
+  <data name="WarningLiveRetry" xml:space="preserve"><value>El texto en vivo se reintentará: {0}</value></data>
+  <data name="WarningCapture" xml:space="preserve"><value>La captura informó un problema: {0}</value></data>
+  <data name="WarningDiarization" xml:space="preserve"><value>La transcripción está completa, pero faltó separar hablantes: {0}</value></data>
+  <data name="Windows11Required" xml:space="preserve"><value>ClassScribe para Windows requiere Windows 11 o una versión posterior.</value></data>
+  <data name="UnexpectedError" xml:space="preserve"><value>ClassScribe encontró un error inesperado. La grabación recuperable se conserva.
+
+{0}</value></data>
+  <data name="ConsentTitle" xml:space="preserve"><value>Capturar audio del equipo</value></data>
+  <data name="ConsentBody" xml:space="preserve"><value>ClassScribe capturará todo el audio que salga por el dispositivo de salida del equipo. Esto puede incluir otras aplicaciones, notificaciones y sonidos del sistema.
+
+El audio se procesa y guarda localmente en tu dispositivo.
+
+¿Quieres continuar?</value></data>
+  <data name="ConsentConfirm" xml:space="preserve"><value>Capturar audio del equipo</value></data>
+  <data name="ConsentCancel" xml:space="preserve"><value>Cancelar</value></data>
+  <data name="CloseRecordingPrompt" xml:space="preserve"><value>Hay una grabación activa. ¿Quieres detenerla, guardar el audio y salir?</value></data>
+  <data name="CloseProcessingPrompt" xml:space="preserve"><value>Hay un procesamiento en curso. ¿Quieres cancelarlo de forma segura y salir?</value></data>
+  <data name="HistoryEmpty" xml:space="preserve"><value>Tus grabaciones aparecerán aquí.</value></data>
+  <data name="HistoryRecoverable" xml:space="preserve"><value>Necesita recuperar el procesamiento</value></data>
+  <data name="ClassWithoutName" xml:space="preserve"><value>Clase sin nombre</value></data>
+  <data name="OpenPreviousEmpty" xml:space="preserve"><value>Elige una clase del historial.</value></data>
+  <data name="ReviewAssigned" xml:space="preserve"><value>Asignado al profesor</value></data>
+  <data name="ReviewAssign" xml:space="preserve"><value>Asignar al profesor</value></data>
+  <data name="SpeakerUnknown" xml:space="preserve"><value>Persona desconocida</value></data>
+  <data name="SpeakerPerson" xml:space="preserve"><value>Persona {0}</value></data>
+  <data name="SpeakerProfessor" xml:space="preserve"><value>Profesor</value></data>
+  <data name="SpeakerParticipant" xml:space="preserve"><value>Participante</value></data>
+  <data name="ExportSubject" xml:space="preserve"><value>Materia</value></data>
+  <data name="ExportDate" xml:space="preserve"><value>Fecha</value></data>
+  <data name="ExportDuration" xml:space="preserve"><value>Duración</value></data>
+  <data name="ExportMode" xml:space="preserve"><value>Modo</value></data>
+  <data name="ExportSource" xml:space="preserve"><value>Fuente</value></data>
+  <data name="ExportTranscript" xml:space="preserve"><value>Transcripción</value></data>
+  <data name="ExportOnlineMode" xml:space="preserve"><value>Clase online</value></data>
+  <data name="ExportInPersonMode" xml:space="preserve"><value>Clase presencial</value></data>
+</root>

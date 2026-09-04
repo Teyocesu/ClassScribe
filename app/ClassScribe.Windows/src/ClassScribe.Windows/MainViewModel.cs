@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Windows;
@@ -16,6 +17,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     };
 
     private readonly SessionStore sessionStore;
+    private readonly AppLocalization localization;
     private readonly LocalModelProvisioner modelProvisioner = new();
     private readonly WindowsAudioCapture audioCapture;
     private readonly Func<bool> systemOutputConsentPrompt;
@@ -37,7 +39,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private CaptureRecoverySuggestion? captureRecoverySuggestion;
     private CaptureFault? activeCaptureFault;
     private HistoryRow? selectedHistory;
-    private SpeakerRecord? selectedProfessor;
+    private SpeakerChoice? selectedProfessor;
     private ClassMetadata? currentMetadata;
     private string? currentFolder;
     private string subject = string.Empty;
@@ -46,8 +48,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private string allText = string.Empty;
     private string professorText = string.Empty;
     private string automaticLiveText = string.Empty;
-    private string statusText = "Lista para grabar";
-    private string warningText = string.Empty;
+    private LocalizedMessage statusMessage = LocalizedMessage.Keyed("StatusReady");
+    private LocalizedMessage? warningMessage;
     private string elapsedText = "00:00";
     private double audioLevel;
     private CaptureSignalState captureSignalState = CaptureSignalState.AwaitingCallbacks;
@@ -78,27 +80,31 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         SessionStore? sessionStore = null,
         WindowsAudioCapture? audioCapture = null,
         Func<bool>? systemOutputConsentPrompt = null,
-        Func<IProgress<ModelDownloadProgress>?, CancellationToken, Task>? prepareTranscription = null)
+        Func<IProgress<ModelDownloadProgress>?, CancellationToken, Task>? prepareTranscription = null,
+        AppLocalization? localization = null)
     {
         this.sessionStore = sessionStore ?? new SessionStore();
+        this.localization = localization ?? AppLocalization.Instance;
+        this.localization.PropertyChanged += Localization_PropertyChanged;
         this.audioCapture = audioCapture ?? new WindowsAudioCapture();
         this.systemOutputConsentPrompt = systemOutputConsentPrompt ?? (() => false);
         CaptureModes =
         [
-            new CaptureModeChoice(CaptureMode.Online, "Clase online · audio de una aplicación"),
-            new CaptureModeChoice(CaptureMode.InPerson, "Clase presencial · micrófono"),
+            new CaptureModeChoice(CaptureMode.Online, this.localization["CaptureModeOnline"]),
+            new CaptureModeChoice(CaptureMode.InPerson, this.localization["CaptureModeInPerson"]),
         ];
         OnlineSourceChoices =
         [
-            new OnlineCaptureSourceChoice(OnlineCaptureSource.Application, "Una aplicación"),
-            new OnlineCaptureSourceChoice(OnlineCaptureSource.SystemOutput, "Audio del equipo"),
+            new OnlineCaptureSourceChoice(OnlineCaptureSource.Application, this.localization["OnlineSourceApplication"]),
+            new OnlineCaptureSourceChoice(OnlineCaptureSource.SystemOutput, this.localization["OnlineSourceSystemOutput"]),
         ];
         Languages =
         [
-            new LanguageChoice("es", "Español"),
-            new LanguageChoice("en", "English"),
-            new LanguageChoice("fr", "Français"),
+            new LanguageChoice("es", this.localization["LanguageSpanish"]),
+            new LanguageChoice("en", this.localization["LanguageEnglish"]),
+            new LanguageChoice("fr", this.localization["LanguageFrench"]),
         ];
+        InterfaceLanguages = this.localization.InterfaceLanguages;
         selectedMode = CaptureModes[0];
         selectedOnlineSource = OnlineSourceChoices[0];
         selectedLanguage = Languages[0];
@@ -112,11 +118,13 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public IReadOnlyList<LanguageChoice> Languages { get; }
 
+    public ObservableCollection<InterfaceLanguageOption> InterfaceLanguages { get; }
+
     public ObservableCollection<AudioSourceOption> Sources { get; } = [];
 
     public ObservableCollection<HistoryRow> History { get; } = [];
 
-    public ObservableCollection<SpeakerRecord> Speakers { get; } = [];
+    public ObservableCollection<SpeakerChoice> Speakers { get; } = [];
 
     public ObservableCollection<ReviewRow> ReviewRows { get; } = [];
 
@@ -182,7 +190,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         set => SetProperty(ref selectedHistory, value);
     }
 
-    public SpeakerRecord? SelectedProfessor
+    public SpeakerChoice? SelectedProfessor
     {
         get => selectedProfessor;
         set => SetProperty(ref selectedProfessor, value);
@@ -235,20 +243,35 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public string StatusText
     {
-        get => statusText;
-        private set => SetProperty(ref statusText, value);
+        get => localization.Resolve(statusMessage);
+        private set
+        {
+            if (!string.Equals(StatusText, value, StringComparison.Ordinal))
+            {
+                statusMessage = LocalizedMessage.Raw(value);
+                OnPropertyChanged();
+            }
+        }
     }
 
     public string WarningText
     {
-        get => warningText;
+        get => warningMessage is null ? string.Empty : localization.Resolve(warningMessage);
         private set
         {
-            if (SetProperty(ref warningText, value))
+            if (!string.Equals(WarningText, value, StringComparison.Ordinal))
             {
+                warningMessage = string.IsNullOrEmpty(value) ? null : LocalizedMessage.Raw(value);
+                OnPropertyChanged();
                 OnPropertyChanged(nameof(HasWarning));
             }
         }
+    }
+
+    public string InterfaceLanguageCode
+    {
+        get => localization.InterfaceLanguageCode;
+        set => localization.Select(value);
     }
 
     public bool HasWarning => !string.IsNullOrWhiteSpace(WarningText);
@@ -330,7 +353,9 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    public string PauseButtonText => IsPaused ? "Reanudar texto" : "Pausar texto";
+    public string PauseButtonText => IsPaused
+        ? localization["ResumeText"]
+        : localization["PauseText"];
 
     public bool CanStart => !IsBusy
         && !IsRecording
@@ -349,7 +374,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public bool HasCurrentSession => currentFolder is not null;
 
     public string CurrentFolderLabel => currentFolder is null
-        ? "Todavía no hay una sesión abierta"
+        ? localization["NoSession"]
         : Path.GetFileName(currentFolder);
 
     public bool CanReprocess => !IsBusy
@@ -384,14 +409,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             && SelectedOnlineSource.Value == OnlineCaptureSource.SystemOutput)
         {
             WarningText = string.Empty;
-            StatusText = "Audio del equipo listo para grabar";
+            SetStatus("StatusComputerAudioReady");
             NotifyAvailability();
             return;
         }
 
-        StatusText = mode == CaptureMode.Online
-            ? "Buscando aplicaciones abiertas…"
-            : "Buscando micrófonos…";
+        SetStatus(mode == CaptureMode.Online
+            ? "StatusSearchingApplications"
+            : "StatusSearchingMicrophones");
         WarningText = string.Empty;
         try
         {
@@ -408,11 +433,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
             SelectedSource = Sources.FirstOrDefault(source => source.Id == previousSourceID)
                 ?? Sources.FirstOrDefault();
-            StatusText = Sources.Count == 0
+            SetStatus(Sources.Count == 0
                 ? mode == CaptureMode.Online
-                    ? "No hay aplicaciones con ventana abierta"
-                    : "No se encontraron micrófonos activos"
-                : "Lista para grabar";
+                    ? "StatusNoApplications"
+                    : "StatusNoMicrophones"
+                : "StatusSourcesReady");
         }
         catch (Exception error) when (error is InvalidOperationException
                                            or System.ComponentModel.Win32Exception
@@ -420,8 +445,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             Sources.Clear();
             SelectedSource = null;
-            WarningText = $"No se pudieron leer las fuentes de audio: {error.Message}";
-            StatusText = "Revisa los permisos de micrófono de Windows";
+            SetWarning("WarningSourceRead", error.Message);
+            SetStatus("StatusPermission");
         }
     }
 
@@ -435,7 +460,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         if (!CanStart)
         {
-            WarningText = "Completa la materia y selecciona una fuente de audio.";
+            SetWarning("StatusCompleteSubjectSource");
             return;
         }
 
@@ -447,11 +472,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 : CaptureScope.Application
             : CaptureScope.Microphone;
         var source = captureScope == CaptureScope.SystemOutput
-            ? new AudioSourceOption(AudioSourceKind.SystemOutput, "system-output", "Audio del equipo")
+            ? new AudioSourceOption(AudioSourceKind.SystemOutput, "system-output", localization["OnlineSourceSystemOutput"])
             : SelectedSource;
         if (source is null)
         {
-            WarningText = "Completa la materia y selecciona una fuente de audio.";
+            SetWarning("StatusCompleteSubjectSource");
             return;
         }
 
@@ -488,7 +513,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             if (!accepted)
             {
                 InvalidateAttempt(attempt);
-                StatusText = "Captura del audio del equipo cancelada.";
+                SetStatus("StatusComputerAudioCancelled");
                 return;
             }
 
@@ -572,7 +597,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         try
         {
-            StatusText = "Preparando transcripción antes de grabar…";
+            SetStatus("StatusPreparingBeforeRecording");
             var modelProgress = new Progress<ModelDownloadProgress>(
                 value => UpdateModelProgress(value, attempt));
             await prepareTranscription(modelProgress, cancellationToken).ConfigureAwait(true);
@@ -581,7 +606,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            StatusText = "Modelo listo; iniciando grabación…";
+            SetStatus("StatusModelReady");
             currentFolder = sessionStore.CreateFolder(subjectSnapshot, startedAt);
             currentMetadata = new ClassMetadata
             {
@@ -612,7 +637,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            StatusText = "Esperando el primer callback de audio…";
+            SetStatus("StatusWaitingAudio");
             captureStartInvoked = true;
             await audioCapture.StartAsync(
                     source,
@@ -653,7 +678,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
             else
             {
-                StatusText = "Grabando y guardando audio localmente";
+                SetStatus("StatusRecordingSaved");
             }
             StartBackgroundLoops();
         }
@@ -664,7 +689,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            StatusText = "Inicio cancelado; cualquier audio recibido quedó guardado";
+            SetStatus("StatusStartCancelled");
             await MarkCurrentStateAsync(ProcessingState.Cancelled, attempt).ConfigureAwait(true);
         }
         catch (Exception error)
@@ -682,8 +707,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 captureRecoverySuggestion = CaptureRecoverySuggestion.SystemOutput;
                 OnPropertyChanged(nameof(ShowSystemOutputRecovery));
             }
-            WarningText = error.Message;
-            StatusText = "No se pudo iniciar la grabación";
+            SetWarningRaw(error.Message);
+            SetStatus("StatusStartFailed");
             await MarkCurrentStateAsync(ProcessingState.Failed, attempt).ConfigureAwait(true);
         }
         finally
@@ -719,9 +744,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         IsPaused = !IsPaused;
-        StatusText = IsPaused
-            ? "Grabando audio · transcripción en vivo pausada"
-            : "Grabando y transcribiendo";
+        SetStatus(IsPaused ? "StatusRecordingPaused" : "StatusRecording");
     }
 
     public Task StopAsync() => StopAsync(processAfterStop: true);
@@ -769,7 +792,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         IsPaused = false;
         WarningText = string.Empty;
         isStopping = true;
-        StatusText = "Cerrando y validando el audio…";
+        SetStatus("StatusClosingAudio");
         processingCancellation = new CancellationTokenSource();
         NotifyAvailability();
 
@@ -856,7 +879,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                     return;
                 }
 
-                StatusText = "Audio y texto guardados para reprocesar en el próximo inicio";
+                SetStatus("StatusSessionSavedRetry");
             }
         }
         catch (OperationCanceledException)
@@ -867,7 +890,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
 
             IsRecording = false;
-            StatusText = "Procesamiento cancelado; la grabación y el texto parcial se conservaron";
+            SetStatus("StatusProcessCancelled");
             await MarkCurrentStateAsync(ProcessingState.Cancelled, attempt).ConfigureAwait(true);
         }
         catch (Exception error)
@@ -884,23 +907,17 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             {
                 captureRecoverySuggestion = null;
                 OnPropertyChanged(nameof(ShowSystemOutputRecovery));
-                var failurePrefix = terminal.Category switch
-                {
-                    CaptureFailureCategory.DurableMaster => "La escritura del audio durable falló",
-                    CaptureFailureCategory.Storage => "El almacenamiento del audio falló",
-                    _ => "La captura de audio informó un problema",
-                };
-                WarningText = $"{failurePrefix}: {terminal.Message}";
-                StatusText = terminal.PreservedWavePath is not null
-                    ? "El audio parcial quedó guardado para reprocesar"
-                    : "La sesión quedó guardada para reintentar";
+                SetWarning("WarningCapture", terminal.Message);
+                SetStatus(terminal.PreservedWavePath is not null
+                    ? "StatusPartialSaved"
+                    : "StatusSessionSavedRetry");
                 await PersistRecoverableLiveTextAsync(attempt).ConfigureAwait(true);
                 await MarkCurrentStateAsync(ProcessingState.Recoverable, attempt).ConfigureAwait(true);
                 return;
             }
 
-            WarningText = error.Message;
-            StatusText = "La sesión quedó guardada para reintentar";
+            SetWarningRaw(error.Message);
+            SetStatus("StatusSessionSavedRetry");
             await MarkCurrentStateAsync(ProcessingState.Failed, attempt).ConfigureAwait(true);
         }
         finally
@@ -929,12 +946,12 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         if (pendingSystemOutputConsent is not null)
         {
             InvalidatePendingSystemOutputConsent();
-            StatusText = "Captura del audio del equipo cancelada.";
+            SetStatus("StatusComputerAudioCancelled");
             return;
         }
 
         processingCancellation?.Cancel();
-        StatusText = "Cancelando de forma segura…";
+        SetStatus("StatusSafeCancel");
     }
 
     public async Task LoadSelectedHistoryAsync()
@@ -963,7 +980,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         if (!CanReprocess || currentFolder is null || currentMetadata is null)
         {
-            WarningText = "Esta sesión no conserva audio suficiente para reprocesar.";
+            SetWarning("StatusReprocessUnavailable");
             return;
         }
 
@@ -1004,7 +1021,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            StatusText = "Reprocesado cancelado; los archivos existentes no cambiaron";
+            SetStatus("StatusReprocessCancelled");
             await MarkCurrentStateAsync(ProcessingState.Cancelled, attempt).ConfigureAwait(true);
         }
         catch (Exception error)
@@ -1014,8 +1031,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            WarningText = error.Message;
-            StatusText = "No se pudo reprocesar; los archivos anteriores siguen disponibles";
+            SetWarningRaw(error.Message);
+            SetStatus("StatusReprocessFailed");
             await MarkCurrentStateAsync(ProcessingState.Failed, attempt).ConfigureAwait(true);
         }
         finally
@@ -1082,7 +1099,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 },
             ],
         };
-        var speakers = Speakers.ToArray();
+        var speakers = Speakers.Select(static speaker => speaker.Model).ToArray();
         var diarizationProposal = activeDiarizationProposal;
         await sessionStore.SaveFinalAsync(
                 metadata,
@@ -1103,7 +1120,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         RememberHumanCorrection(humanCorrection);
         ApplyActiveHumanCorrection();
 
-        StatusText = "Selección de profesor guardada";
+        SetStatus("StatusProfessorSaved");
     }
 
     public async Task SaveEditsAsync()
@@ -1149,7 +1166,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 allSegments,
                 selectedProfessorID,
                 review);
-            var speakers = Speakers.ToArray();
+            var speakers = Speakers.Select(static speaker => speaker.Model).ToArray();
             var diarizationProposal = activeDiarizationProposal;
             await sessionStore.SaveFinalAsync(
                     metadata,
@@ -1168,7 +1185,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         RememberHumanCorrection(humanCorrection);
-        StatusText = "Cambios guardados";
+        SetStatus("StatusEditsSaved");
         await RefreshHistoryAsync(attempt).ConfigureAwait(true);
     }
 
@@ -1180,7 +1197,9 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             currentMetadata.Duration,
             currentMetadata.Mode,
             currentMetadata.Source,
-            TranscriptActions.FullTranscript(AllText, LiveText));
+            TranscriptActions.FullTranscript(AllText, LiveText),
+            localization.MetadataLabels,
+            localization.Culture);
 
     public string? CurrentFolder => currentFolder;
 
@@ -1194,6 +1213,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         disposed = true;
+        localization.PropertyChanged -= Localization_PropertyChanged;
         InvalidatePendingSystemOutputConsent();
         liveCancellation?.Cancel();
         timerCancellation?.Cancel();
@@ -1216,8 +1236,67 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public void ReportUiError(Exception error)
     {
         CrashLog.Write(error);
-        WarningText = error.Message;
-        StatusText = "La operación no pudo completarse";
+        SetWarningRaw(error.Message);
+        SetStatus("StatusOperationFailed");
+    }
+
+    private void SetStatus(string key, params object?[] arguments)
+    {
+        statusMessage = LocalizedMessage.Keyed(key, arguments);
+        OnPropertyChanged(nameof(StatusText));
+    }
+
+    private void SetWarning(string key, params object?[] arguments)
+    {
+        warningMessage = LocalizedMessage.Keyed(key, arguments);
+        OnPropertyChanged(nameof(WarningText));
+        OnPropertyChanged(nameof(HasWarning));
+    }
+
+    private void SetWarningRaw(string value)
+    {
+        warningMessage = string.IsNullOrEmpty(value) ? null : LocalizedMessage.Raw(value);
+        OnPropertyChanged(nameof(WarningText));
+        OnPropertyChanged(nameof(HasWarning));
+    }
+
+    private void Localization_PropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        foreach (var choice in CaptureModes)
+        {
+            choice.Refresh(localization);
+        }
+
+        foreach (var choice in OnlineSourceChoices)
+        {
+            choice.Refresh(localization);
+        }
+
+        foreach (var choice in Languages)
+        {
+            choice.Refresh(localization);
+        }
+
+        foreach (var speaker in Speakers)
+        {
+            speaker.RefreshLocalization();
+        }
+
+        foreach (var row in ReviewRows)
+        {
+            row.RefreshLocalization();
+        }
+
+        foreach (var row in History)
+        {
+            row.RefreshLocalization();
+        }
+
+        OnPropertyChanged(nameof(InterfaceLanguageCode));
+        OnPropertyChanged(nameof(StatusText));
+        OnPropertyChanged(nameof(WarningText));
+        OnPropertyChanged(nameof(PauseButtonText));
+        OnPropertyChanged(nameof(CurrentFolderLabel));
     }
 
     private void StartBackgroundLoops()
@@ -1469,7 +1548,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        StatusText = "Preparando transcripción final e identificando hablantes…";
+        SetStatus("StatusFinalPreparing");
         ModelProgress = 0;
         var progress = new Progress<ModelDownloadProgress>(
             value => UpdateModelProgress(value, attempt));
@@ -1594,7 +1673,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         string? diarizationWarning = null;
         try
         {
-            StatusText = "Finalizando identificación de hablantes…";
+            SetStatus("StatusFinalizingSpeakers");
             var spans = await diarizationTask.ConfigureAwait(true);
             if (!IsCurrent(attempt))
             {
@@ -1643,13 +1722,13 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         Speakers.Clear();
         foreach (var speaker in speakers)
         {
-            Speakers.Add(speaker);
+            Speakers.Add(new SpeakerChoice(speaker, localization));
         }
 
         ReviewRows.Clear();
         foreach (var item in review)
         {
-            ReviewRows.Add(new ReviewRow(item));
+            ReviewRows.Add(new ReviewRow(item, localization));
         }
 
         SelectedProfessor = Speakers.FirstOrDefault(speaker => speaker.Id == professorId);
@@ -1686,12 +1765,12 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         if (diarizationWarning is null)
         {
             WarningText = string.Empty;
-            StatusText = "Transcripción final lista";
+            SetStatus("StatusFinalReady");
         }
         else
         {
-            WarningText = $"La transcripción está completa, pero faltó separar hablantes: {diarizationWarning}";
-            StatusText = "Transcripción lista para editar o reprocesar";
+            SetWarning("WarningDiarization", diarizationWarning);
+            SetStatus("StatusFinalReady");
         }
 
         NotifyCurrentSessionChanged();
@@ -1766,21 +1845,21 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             Speakers.Clear();
             foreach (var speaker in loadedSpeakers)
             {
-                Speakers.Add(speaker);
+                Speakers.Add(new SpeakerChoice(speaker, localization));
             }
 
             ReviewRows.Clear();
             foreach (var item in loadedReview)
             {
-                ReviewRows.Add(new ReviewRow(item));
+                ReviewRows.Add(new ReviewRow(item, localization));
             }
 
             SelectedProfessor = Speakers.FirstOrDefault(speaker =>
                 speaker.Id == summary.Metadata.ProfessorSpeakerID);
             captureRecoverySuggestion = null;
             OnPropertyChanged(nameof(ShowSystemOutputRecovery));
-            WarningText = summary.RecoveryReason ?? string.Empty;
-            StatusText = summary.IsRecoverable ? "Sesión recuperable abierta" : "Sesión abierta";
+            SetWarningRaw(summary.RecoveryReason ?? string.Empty);
+            SetStatus(summary.IsRecoverable ? "StatusRecoverableOpen" : "StatusSessionOpen");
             ElapsedText = Timecode.Display(summary.Metadata.Duration);
             NotifyCurrentSessionChanged();
         }
@@ -1808,7 +1887,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         History.Clear();
         foreach (var session in sessions)
         {
-            History.Add(new HistoryRow(session));
+            History.Add(new HistoryRow(session, localization));
         }
 
         SelectedHistory = History.FirstOrDefault(row => row.Session.Folder == selectedFolder)
@@ -1885,8 +1964,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         if (!IsTerminalCaptureFaultPresentationActive)
         {
-            StatusText = IsPaused ? "Grabando · texto en vivo pausado" : "Grabando y transcribiendo";
-            WarningText = string.Empty;
+            SetStatus(IsPaused ? "StatusRecordingPaused" : "StatusRecording");
+            SetWarningRaw(string.Empty);
         }
     }
 
@@ -1913,14 +1992,21 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         lastPresentedCaptureSignalState = snapshot.State;
-        StatusText = snapshot.State switch
+        switch (snapshot.State)
         {
-            CaptureSignalState.AwaitingCallbacks => "Esperando callbacks de audio…",
-            CaptureSignalState.NoCallbacks => "La fuente dejó de entregar callbacks; conserva el audio recibido y revisa la fuente.",
-            CaptureSignalState.Silent => "Captura activa con callbacks silenciosos; el silencio no es un fallo.",
-            CaptureSignalState.Audible => "Audio recibido; esperando voz o un resultado de transcripción.",
-            _ => StatusText,
-        };
+            case CaptureSignalState.AwaitingCallbacks:
+                SetStatus("StatusCaptureAwaiting");
+                break;
+            case CaptureSignalState.NoCallbacks:
+                SetStatus("StatusCaptureNoCallbacks");
+                break;
+            case CaptureSignalState.Silent:
+                SetStatus("StatusCaptureSilent");
+                break;
+            case CaptureSignalState.Audible:
+                SetStatus("StatusCaptureAudible");
+                break;
+        }
     }
 
     private void SetLiveProgrammatically(string value)
@@ -1951,9 +2037,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            StatusText = progress.ReceivedBytes < progress.TotalBytes
-                ? $"Descargando {progress.Name}: {progress.Fraction:P0}"
-                : $"{progress.Name} listo";
+            SetStatus(progress.ReceivedBytes < progress.TotalBytes
+                ? "StatusDownloading"
+                : "StatusModelDownloaded",
+                progress.Name,
+                progress.Fraction);
         });
     }
 
@@ -2144,7 +2232,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         SelectedOnlineSource = OnlineSourceChoices.First(choice =>
             choice.Value == OnlineCaptureSource.SystemOutput);
-        StatusText = "Audio del equipo seleccionado. Presiona Iniciar grabación para continuar.";
+        SetStatus("StatusSystemOutputSelected");
     }
 
     private bool IsCurrent(SessionAttemptID? attempt) =>
@@ -2163,18 +2251,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             ? CaptureRecoverySuggestion.SystemOutput
             : null;
         OnPropertyChanged(nameof(ShowSystemOutputRecovery));
-        var faultPrefix = fault.Category switch
-        {
-            CaptureFailureCategory.Source => "La fuente de audio se interrumpió",
-            CaptureFailureCategory.DurableMaster => "La escritura del audio durable falló",
-            CaptureFailureCategory.Storage => "El almacenamiento del audio falló",
-            _ => "La captura de audio informó un problema",
-        };
-        WarningText = $"{faultPrefix}: {fault.Error.Message}";
-        StatusText = fault.Category is CaptureFailureCategory.DurableMaster
+        SetWarning("WarningCapture", fault.Error.Message);
+        SetStatus(fault.Category is CaptureFailureCategory.DurableMaster
             or CaptureFailureCategory.Storage
-            ? "Detén la sesión para conservar y recuperar el audio recibido"
-            : "Detén la sesión para validar y recuperar el audio recibido";
+            ? "StatusStopToRecoverDurable"
+            : "StatusStopToRecoverAudio");
     }
 
     private static string NormalizeLanguage(string? language) => language switch

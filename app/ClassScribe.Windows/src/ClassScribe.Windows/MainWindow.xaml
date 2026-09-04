@@ -1,6 +1,7 @@
 <Window x:Class="ClassScribe.Windows.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:ClassScribe.Windows"
         xmlns:automation="clr-namespace:System.Windows.Automation;assembly=PresentationCore"
         Title="ClassScribe" Width="1180" Height="800"
         MinWidth="960" MinHeight="680"
@@ -8,6 +9,7 @@
         Loaded="Window_Loaded" Closing="Window_Closing">
   <Window.Resources>
     <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+    <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVisibility" />
     <Style x:Key="SectionLabel" TargetType="TextBlock">
       <Setter Property="FontWeight" Value="SemiBold" />
       <Setter Property="Margin" Value="3,12,3,3" />
@@ -52,13 +54,22 @@
         </Border>
         <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
           <TextBlock Text="ClassScribe" FontSize="23" FontWeight="SemiBold" Foreground="#242134" />
-          <TextBlock Text="Transcripción privada y local para Windows" Foreground="#6F6A81" />
+          <TextBlock Text="{Binding [HeaderSubtitle], Source={x:Static local:AppLocalization.Instance}}" Foreground="#6F6A81" />
         </StackPanel>
         <StackPanel Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center">
           <TextBlock Text="{Binding ElapsedText}" FontSize="20" FontWeight="SemiBold"
                      HorizontalAlignment="Right" />
           <TextBlock Text="{Binding StatusText}" Foreground="#6F6A81" MaxWidth="430"
                      TextTrimming="CharacterEllipsis" HorizontalAlignment="Right" />
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,6,0,0">
+            <TextBlock Text="{Binding [AppLanguageLabel], Source={x:Static local:AppLocalization.Instance}}"
+                       Foreground="#6F6A81" VerticalAlignment="Center" Margin="0,0,6,0" />
+            <ComboBox ItemsSource="{Binding InterfaceLanguages}"
+                      SelectedValuePath="Code"
+                      SelectedValue="{Binding InterfaceLanguageCode, UpdateSourceTrigger=PropertyChanged}"
+                      DisplayMemberPath="Name" MinWidth="120"
+                      automation:AutomationProperties.Name="{Binding [AppLanguageLabel], Source={x:Static local:AppLocalization.Instance}}" />
+          </StackPanel>
         </StackPanel>
       </Grid>
     </Border>
@@ -74,73 +85,85 @@
               CornerRadius="12" Padding="16">
         <ScrollViewer VerticalScrollBarVisibility="Auto">
           <StackPanel>
-            <TextBlock Text="Nueva clase" FontSize="19" FontWeight="SemiBold" Foreground="#29263A" />
+            <TextBlock Text="{Binding [NewClass], Source={x:Static local:AppLocalization.Instance}}" FontSize="19" FontWeight="SemiBold" Foreground="#29263A" />
 
-            <TextBlock Style="{StaticResource SectionLabel}" Text="Materia" />
-            <TextBox Text="{Binding Subject, UpdateSourceTrigger=PropertyChanged}"
-                     automation:AutomationProperties.Name="Materia"
-                     ToolTip="Nombre de la materia o reunión" />
+            <TextBlock Style="{StaticResource SectionLabel}" Text="{Binding [SubjectLabel], Source={x:Static local:AppLocalization.Instance}}" />
+            <Grid>
+              <TextBox Text="{Binding Subject, UpdateSourceTrigger=PropertyChanged}"
+                       automation:AutomationProperties.Name="{Binding [SubjectLabel], Source={x:Static local:AppLocalization.Instance}}"
+                       ToolTip="{Binding [SubjectTooltip], Source={x:Static local:AppLocalization.Instance}}" />
+              <TextBlock Text="{Binding [SubjectPlaceholder], Source={x:Static local:AppLocalization.Instance}}"
+                         IsHitTestVisible="False" VerticalAlignment="Center" Margin="11,0,8,0"
+                         Foreground="#A6A2B3"
+                         Visibility="{Binding Subject, Converter={StaticResource EmptyStringToVisibility}}" />
+            </Grid>
 
-            <TextBlock Style="{StaticResource SectionLabel}" Text="Tipo de captura" />
+            <TextBlock Style="{StaticResource SectionLabel}" Text="{Binding [CaptureTypeLabel], Source={x:Static local:AppLocalization.Instance}}" />
             <ComboBox ItemsSource="{Binding CaptureModes}" SelectedItem="{Binding SelectedMode}"
                       DisplayMemberPath="Name" SelectionChanged="CaptureMode_SelectionChanged"
-                      automation:AutomationProperties.Name="Tipo de captura" />
+                      automation:AutomationProperties.Name="{Binding [CaptureTypeLabel], Source={x:Static local:AppLocalization.Instance}}" />
 
-            <TextBlock Style="{StaticResource SectionLabel}" Text="Idioma de la clase" />
+            <TextBlock Style="{StaticResource SectionLabel}" Text="{Binding [TranscriptionLanguageLabel], Source={x:Static local:AppLocalization.Instance}}" />
             <ComboBox ItemsSource="{Binding Languages}" SelectedItem="{Binding SelectedLanguage}"
                       DisplayMemberPath="Name"
-                      automation:AutomationProperties.Name="Idioma de transcripción" />
-            <TextBlock Text="Reconocimiento optimizado para español, inglés o francés."
+                      automation:AutomationProperties.Name="{Binding [TranscriptionLanguageLabel], Source={x:Static local:AppLocalization.Instance}}" />
+            <TextBlock Text="{Binding [SupportedLanguages], Source={x:Static local:AppLocalization.Instance}}"
                        Margin="5,2,5,4" Foreground="#777287" FontSize="12" TextWrapping="Wrap" />
 
-            <TextBlock Style="{StaticResource SectionLabel}" Text="Fuente de audio" />
+            <TextBlock Style="{StaticResource SectionLabel}" Text="{Binding [AudioSourceLabel], Source={x:Static local:AppLocalization.Instance}}" />
             <StackPanel Visibility="{Binding IsOnline, Converter={StaticResource BoolToVisibility}}">
               <ComboBox ItemsSource="{Binding OnlineSourceChoices}" SelectedItem="{Binding SelectedOnlineSource}"
                         DisplayMemberPath="Name"
-                        automation:AutomationProperties.Name="Fuente de audio online" />
+                        automation:AutomationProperties.Name="{Binding [OnlineAudioAccessibility], Source={x:Static local:AppLocalization.Instance}}" />
               <DockPanel LastChildFill="True" Margin="0,5,0,0"
                          Visibility="{Binding IsApplicationSource, Converter={StaticResource BoolToVisibility}}">
-                <Button DockPanel.Dock="Right" Content="Actualizar" Click="RefreshSources_Click"
-                        Padding="10,7" ToolTip="Volver a buscar aplicaciones abiertas" />
+                <Button DockPanel.Dock="Right" Content="{Binding [RefreshApplications], Source={x:Static local:AppLocalization.Instance}}" Click="RefreshSources_Click"
+                        Padding="10,7" ToolTip="{Binding [RefreshApplications], Source={x:Static local:AppLocalization.Instance}}" />
                 <ComboBox ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedSource}"
                           DisplayMemberPath="DisplayName" MinWidth="225"
-                          automation:AutomationProperties.Name="Aplicación de audio" />
+                          automation:AutomationProperties.Name="{Binding [OnlineSourceApplication], Source={x:Static local:AppLocalization.Instance}}" />
               </DockPanel>
-              <TextBlock Text="Captura todo el audio que sale por tu equipo."
+              <TextBlock Text="{Binding [SystemOutputHint], Source={x:Static local:AppLocalization.Instance}}"
                          Visibility="{Binding IsSystemOutputSource, Converter={StaticResource BoolToVisibility}}"
                          Margin="5,5,5,0" Foreground="#777287" FontSize="12" TextWrapping="Wrap"
-                         automation:AutomationProperties.Name="Captura todo el audio que sale por tu equipo" />
+                         automation:AutomationProperties.Name="{Binding [SystemOutputHint], Source={x:Static local:AppLocalization.Instance}}" />
             </StackPanel>
             <StackPanel Visibility="{Binding IsInPerson, Converter={StaticResource BoolToVisibility}}">
               <DockPanel LastChildFill="True">
-                <Button DockPanel.Dock="Right" Content="Actualizar" Click="RefreshSources_Click"
-                        Padding="10,7" ToolTip="Volver a buscar micrófonos" />
+                <Button DockPanel.Dock="Right" Content="{Binding [RefreshMicrophones], Source={x:Static local:AppLocalization.Instance}}" Click="RefreshSources_Click"
+                        Padding="10,7" ToolTip="{Binding [RefreshMicrophones], Source={x:Static local:AppLocalization.Instance}}" />
                 <ComboBox ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedSource}"
                           DisplayMemberPath="DisplayName" MinWidth="225"
-                          automation:AutomationProperties.Name="Micrófono de audio" />
+                          automation:AutomationProperties.Name="{Binding [SelectMicrophone], Source={x:Static local:AppLocalization.Instance}}" />
               </DockPanel>
             </StackPanel>
 
-            <TextBlock Style="{StaticResource SectionLabel}" Text="Vocabulario técnico (opcional)" />
-            <TextBox Text="{Binding Vocabulary, UpdateSourceTrigger=PropertyChanged}"
-                     Height="68" AcceptsReturn="True" TextWrapping="Wrap"
-                     VerticalScrollBarVisibility="Auto"
-                     automation:AutomationProperties.Name="Vocabulario técnico"
-                     ToolTip="Nombres propios, siglas y términos separados por comas" />
+            <TextBlock Style="{StaticResource SectionLabel}" Text="{Binding [TechnicalVocabularyLabel], Source={x:Static local:AppLocalization.Instance}}" />
+            <Grid Height="68">
+              <TextBox Text="{Binding Vocabulary, UpdateSourceTrigger=PropertyChanged}"
+                       Height="68" AcceptsReturn="True" TextWrapping="Wrap"
+                       VerticalScrollBarVisibility="Auto"
+                       automation:AutomationProperties.Name="{Binding [TechnicalVocabularyLabel], Source={x:Static local:AppLocalization.Instance}}"
+                       ToolTip="{Binding [TechnicalVocabularyTooltip], Source={x:Static local:AppLocalization.Instance}}" />
+              <TextBlock Text="{Binding [TechnicalVocabularyPlaceholder], Source={x:Static local:AppLocalization.Instance}}"
+                         IsHitTestVisible="False" Margin="11,10,8,0" VerticalAlignment="Top"
+                         Foreground="#A6A2B3" TextWrapping="Wrap"
+                         Visibility="{Binding Vocabulary, Converter={StaticResource EmptyStringToVisibility}}" />
+            </Grid>
 
-            <TextBlock Style="{StaticResource SectionLabel}" Text="Nivel de audio" />
+            <TextBlock Style="{StaticResource SectionLabel}" Text="{Binding [AudioLevel], Source={x:Static local:AppLocalization.Instance}}" />
             <ProgressBar Value="{Binding AudioLevel, Mode=OneWay}" Maximum="1" Height="10" Margin="4,3,4,8"
                          Foreground="{StaticResource AccentBrush}" />
 
             <UniformGrid Columns="2" Margin="0,4,0,0">
-              <Button Content="Iniciar" Style="{StaticResource PrimaryButton}"
+              <Button Content="{Binding [StartRecording], Source={x:Static local:AppLocalization.Instance}}" Style="{StaticResource PrimaryButton}"
                       IsEnabled="{Binding CanStart}" Click="Start_Click"
-                      automation:AutomationProperties.Name="Iniciar grabación" />
-              <Button Content="Detener" IsEnabled="{Binding CanStop}" Click="Stop_Click"
-                      automation:AutomationProperties.Name="Detener y procesar" />
+                      automation:AutomationProperties.Name="{Binding [StartRecording], Source={x:Static local:AppLocalization.Instance}}" />
+              <Button Content="{Binding [StopProcessing], Source={x:Static local:AppLocalization.Instance}}" IsEnabled="{Binding CanStop}" Click="Stop_Click"
+                      automation:AutomationProperties.Name="{Binding [StopProcessing], Source={x:Static local:AppLocalization.Instance}}" />
               <Button Content="{Binding PauseButtonText}" IsEnabled="{Binding CanPause}"
                       Click="Pause_Click" />
-              <Button Content="Cancelar proceso" IsEnabled="{Binding CanCancel}"
+              <Button Content="{Binding [CancelProcess], Source={x:Static local:AppLocalization.Instance}}" IsEnabled="{Binding CanCancel}"
                       Click="Cancel_Click" />
             </UniformGrid>
 
@@ -152,22 +175,22 @@
                     Visibility="{Binding HasWarning, Converter={StaticResource BoolToVisibility}}">
               <TextBlock Text="{Binding WarningText}" TextWrapping="Wrap" Foreground="#6A4B0B" />
             </Border>
-            <Button Content="Capturar audio del equipo"
+            <Button Content="{Binding [CaptureComputerAudio], Source={x:Static local:AppLocalization.Instance}}"
                     Visibility="{Binding ShowSystemOutputRecovery, Converter={StaticResource BoolToVisibility}}"
                     IsEnabled="{Binding ShowSystemOutputRecovery}"
                     Click="SelectSystemOutputRecovery_Click"
-                    automation:AutomationProperties.Name="Capturar audio del equipo"
+                    automation:AutomationProperties.Name="{Binding [CaptureComputerAudio], Source={x:Static local:AppLocalization.Instance}}"
                     Margin="3,4,3,0" />
 
             <Separator Margin="3,15,3,10" />
-            <TextBlock Text="Sesión actual" FontWeight="SemiBold" />
+            <TextBlock Text="{Binding [CurrentSession], Source={x:Static local:AppLocalization.Instance}}" FontWeight="SemiBold" />
             <TextBlock Text="{Binding CurrentFolderLabel}" TextWrapping="Wrap"
                        Foreground="#777287" Margin="0,4,0,7" />
             <UniformGrid Columns="2">
-              <Button Content="Abrir carpeta" IsEnabled="{Binding HasCurrentSession}"
+              <Button Content="{Binding [OpenFolder], Source={x:Static local:AppLocalization.Instance}}" IsEnabled="{Binding HasCurrentSession}"
                       Click="OpenFolder_Click" />
-              <Button Content="Reprocesar" IsEnabled="{Binding CanReprocess}"
-                      Click="Reprocess_Click" ToolTip="Repite transcripción y hablantes desde el audio guardado" />
+              <Button Content="{Binding [Reprocess], Source={x:Static local:AppLocalization.Instance}}" IsEnabled="{Binding CanReprocess}"
+                      Click="Reprocess_Click" ToolTip="{Binding [ReprocessTooltip], Source={x:Static local:AppLocalization.Instance}}" />
             </UniformGrid>
           </StackPanel>
         </ScrollViewer>
@@ -176,71 +199,71 @@
       <Border Grid.Column="2" Background="White" BorderBrush="#E2DFEC" BorderThickness="1"
               CornerRadius="12" Padding="10">
         <TabControl x:Name="DocumentsTabs" Background="Transparent" BorderThickness="0">
-          <TabItem Header="En vivo">
+          <TabItem Header="{Binding [TabLive], Source={x:Static local:AppLocalization.Instance}}">
             <Grid Margin="4,10,4,4">
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
               </Grid.RowDefinitions>
-              <TextBlock Text="Puedes corregir el texto mientras se graba; tus cambios no se sobrescriben."
+              <TextBlock Text="{Binding [LiveEditingDescription], Source={x:Static local:AppLocalization.Instance}}"
                          Foreground="#777287" Margin="5,0,5,8" />
               <TextBox Grid.Row="1" Style="{StaticResource TranscriptBox}"
                        Text="{Binding LiveText, UpdateSourceTrigger=PropertyChanged}"
-                       automation:AutomationProperties.Name="Transcripción en vivo" />
+                       automation:AutomationProperties.Name="{Binding [LiveTranscriptAccessibility], Source={x:Static local:AppLocalization.Instance}}" />
             </Grid>
           </TabItem>
 
-          <TabItem Header="Todos">
+          <TabItem Header="{Binding [TabAll], Source={x:Static local:AppLocalization.Instance}}">
             <TextBox Margin="4,10,4,4" Style="{StaticResource TranscriptBox}"
                      Text="{Binding AllText, UpdateSourceTrigger=PropertyChanged}"
-                     automation:AutomationProperties.Name="Transcripción de todos los hablantes" />
+                     automation:AutomationProperties.Name="{Binding [AllSpeakersAccessibility], Source={x:Static local:AppLocalization.Instance}}" />
           </TabItem>
 
-          <TabItem Header="Profesor">
+          <TabItem Header="{Binding [TabProfessor], Source={x:Static local:AppLocalization.Instance}}">
             <Grid Margin="4,10,4,4">
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
               </Grid.RowDefinitions>
               <DockPanel Margin="4,0,4,8">
-                <Button DockPanel.Dock="Right" Content="Aplicar y guardar"
+                <Button DockPanel.Dock="Right" Content="{Binding [ApplyAndSave], Source={x:Static local:AppLocalization.Instance}}"
                         Click="ApplyProfessor_Click" Padding="12,7" />
-                <TextBlock DockPanel.Dock="Left" Text="Hablante profesor:" VerticalAlignment="Center"
+                <TextBlock DockPanel.Dock="Left" Text="{Binding [ProfessorSpeaker], Source={x:Static local:AppLocalization.Instance}}" VerticalAlignment="Center"
                            FontWeight="SemiBold" Margin="3,0,8,0" />
                 <ComboBox ItemsSource="{Binding Speakers}" SelectedItem="{Binding SelectedProfessor}"
                           DisplayMemberPath="DisplayName" MinWidth="190"
-                          automation:AutomationProperties.Name="Hablante profesor" />
+                          automation:AutomationProperties.Name="{Binding [ProfessorSpeaker], Source={x:Static local:AppLocalization.Instance}}" />
               </DockPanel>
               <TextBox Grid.Row="1" Style="{StaticResource TranscriptBox}"
                        Text="{Binding ProfessorText, UpdateSourceTrigger=PropertyChanged}"
-                       automation:AutomationProperties.Name="Transcripción del profesor" />
+                       automation:AutomationProperties.Name="{Binding [ProfessorTranscript], Source={x:Static local:AppLocalization.Instance}}" />
             </Grid>
           </TabItem>
 
-          <TabItem Header="Revisión">
+          <TabItem Header="{Binding [TabReview], Source={x:Static local:AppLocalization.Instance}}">
             <Grid Margin="4,10,4,4">
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
               </Grid.RowDefinitions>
-              <TextBlock Text="Revisa solapamientos o asignaciones dudosas. Marca los fragmentos que pertenecen al profesor."
+              <TextBlock Text="{Binding [ReviewDescription], Source={x:Static local:AppLocalization.Instance}}"
                          Foreground="#777287" TextWrapping="Wrap" Margin="5,0,5,8" />
               <DataGrid Grid.Row="1" ItemsSource="{Binding ReviewRows}" AutoGenerateColumns="False"
                         CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal"
                         AlternatingRowBackground="#F8F7FC" BorderBrush="#DDD9EE">
                 <DataGrid.Columns>
-                  <DataGridTextColumn Header="Tiempo" Binding="{Binding Time}" Width="70" IsReadOnly="True" />
-                  <DataGridTextColumn Header="Hablante" Binding="{Binding Speaker}" Width="105" IsReadOnly="True" />
-                  <DataGridTextColumn Header="Motivo" Binding="{Binding Reason}" Width="180" IsReadOnly="True" />
-                  <DataGridTextColumn Header="Texto" Binding="{Binding Text}" Width="*" IsReadOnly="True" />
-                  <DataGridCheckBoxColumn Header="Profesor" Binding="{Binding IncludeForProfessor, UpdateSourceTrigger=PropertyChanged}"
+                  <DataGridTextColumn Header="{Binding [Time], Source={x:Static local:AppLocalization.Instance}}" Binding="{Binding Time}" Width="70" IsReadOnly="True" />
+                  <DataGridTextColumn Header="{Binding [Speaker], Source={x:Static local:AppLocalization.Instance}}" Binding="{Binding Speaker}" Width="105" IsReadOnly="True" />
+                  <DataGridTextColumn Header="{Binding [Reason], Source={x:Static local:AppLocalization.Instance}}" Binding="{Binding Reason}" Width="180" IsReadOnly="True" />
+                  <DataGridTextColumn Header="{Binding [Text], Source={x:Static local:AppLocalization.Instance}}" Binding="{Binding Text}" Width="*" IsReadOnly="True" />
+                  <DataGridCheckBoxColumn Header="{Binding [Professor], Source={x:Static local:AppLocalization.Instance}}" Binding="{Binding IncludeForProfessor, UpdateSourceTrigger=PropertyChanged}"
                                           Width="75" />
                 </DataGrid.Columns>
               </DataGrid>
             </Grid>
           </TabItem>
 
-          <TabItem Header="Historial">
+          <TabItem Header="{Binding [TabHistory], Source={x:Static local:AppLocalization.Instance}}">
             <Grid Margin="4,10,4,4">
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="310" />
@@ -248,7 +271,7 @@
                 <ColumnDefinition Width="*" />
               </Grid.ColumnDefinitions>
               <ListBox ItemsSource="{Binding History}" SelectedItem="{Binding SelectedHistory}"
-                       BorderBrush="#DDD9EE" automation:AutomationProperties.Name="Historial de clases">
+                       BorderBrush="#DDD9EE" automation:AutomationProperties.Name="{Binding [HistoryAccessibility], Source={x:Static local:AppLocalization.Instance}}">
                 <ListBox.ItemTemplate>
                   <DataTemplate>
                     <StackPanel Margin="7,6" MinWidth="260">
@@ -261,12 +284,12 @@
               </ListBox>
               <Border Grid.Column="2" Background="#F8F7FC" CornerRadius="8" Padding="22">
                 <StackPanel VerticalAlignment="Center">
-                  <TextBlock Text="Abrir una clase anterior" FontSize="19" FontWeight="SemiBold"
+                  <TextBlock Text="{Binding [OpenPreviousClass], Source={x:Static local:AppLocalization.Instance}}" FontSize="19" FontWeight="SemiBold"
                              HorizontalAlignment="Center" />
-                  <TextBlock Text="Carga sus textos editables. Si quedó interrumpida, ClassScribe puede reconstruir el WAV y volver a procesarla."
+                  <TextBlock Text="{Binding [OpenPreviousDescription], Source={x:Static local:AppLocalization.Instance}}"
                              TextAlignment="Center" TextWrapping="Wrap" Foreground="#777287"
                              Margin="12,8,12,16" />
-                  <Button Content="Abrir selección" Style="{StaticResource PrimaryButton}"
+                  <Button Content="{Binding [OpenSelection], Source={x:Static local:AppLocalization.Instance}}" Style="{StaticResource PrimaryButton}"
                           Click="LoadHistory_Click" HorizontalAlignment="Center" MinWidth="150" />
                 </StackPanel>
               </Border>
@@ -280,12 +303,12 @@
             Padding="16,10">
       <DockPanel>
         <TextBlock DockPanel.Dock="Left"
-                   Text="Audio y modelos permanecen en tu equipo; Internet solo se usa para la primera descarga del modelo."
+                   Text="{Binding [FooterPrivacy], Source={x:Static local:AppLocalization.Instance}}"
                    Foreground="#777287" VerticalAlignment="Center" />
         <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
-          <Button Content="Guardar cambios" IsEnabled="{Binding HasCurrentSession}" Click="Save_Click" />
-          <Button Content="Copiar para chat" IsEnabled="{Binding HasCurrentSession}" Click="Copy_Click" />
-          <Button Content="Exportar…" IsEnabled="{Binding HasCurrentSession}" Click="Export_Click" />
+          <Button Content="{Binding [SaveChanges], Source={x:Static local:AppLocalization.Instance}}" IsEnabled="{Binding HasCurrentSession}" Click="Save_Click" />
+          <Button Content="{Binding [CopyForChat], Source={x:Static local:AppLocalization.Instance}}" IsEnabled="{Binding HasCurrentSession}" Click="Copy_Click" />
+          <Button Content="{Binding [Export], Source={x:Static local:AppLocalization.Instance}}" IsEnabled="{Binding HasCurrentSession}" Click="Export_Click" />
         </StackPanel>
       </DockPanel>
     </Border>

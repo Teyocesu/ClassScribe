@@ -244,6 +244,29 @@ public static class TranscriptExporter
     private sealed record Paragraph(double Start, string SpeakerID, string Text, TranscriptSegment LastSegment);
 }
 
+public sealed record TranscriptMetadataLabels(
+    string Subject,
+    string Date,
+    string Duration,
+    string Mode,
+    string Source,
+    string Transcript,
+    string OnlineMode,
+    string InPersonMode)
+{
+    public static TranscriptMetadataLabels Spanish { get; } = new(
+        "Materia",
+        "Fecha",
+        "Duración",
+        "Modo",
+        "Fuente",
+        "Transcripción",
+        "Clase online",
+        "Clase presencial");
+
+    public string ModeName(CaptureMode mode) => mode == CaptureMode.Online ? OnlineMode : InPersonMode;
+}
+
 public static class TranscriptActions
 {
     public static string BestAvailable(params string?[] candidates) => candidates
@@ -259,10 +282,19 @@ public static class TranscriptActions
         double duration,
         CaptureMode mode,
         string source,
-        string transcript) =>
-        $"Materia: {subject}\n"
-        + $"Fecha: {date.ToLocalTime():D} {date.ToLocalTime():t}\n"
-        + $"Duración: {Timecode.Display(duration)}\n"
-        + $"Modo: {mode.ToSpanish()}\n"
-        + $"Fuente: {source}\n\nTranscripción:\n\n{transcript}";
+        string transcript,
+        TranscriptMetadataLabels? labels = null,
+        CultureInfo? culture = null)
+    {
+        labels ??= TranscriptMetadataLabels.Spanish;
+        var localDate = date.ToLocalTime();
+        var dateText = culture is null
+            ? $"{localDate:D} {localDate:t}"
+            : $"{localDate.ToString("D", culture)} {localDate.ToString("t", culture)}";
+        return $"{labels.Subject}: {subject}\n"
+            + $"{labels.Date}: {dateText}\n"
+            + $"{labels.Duration}: {Timecode.Display(duration)}\n"
+            + $"{labels.Mode}: {labels.ModeName(mode)}\n"
+            + $"{labels.Source}: {source}\n\n{labels.Transcript}:\n\n{transcript}";
+    }
 }

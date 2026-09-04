@@ -7,6 +7,7 @@ public partial class App : Application
 {
     protected override void OnStartup(StartupEventArgs e)
     {
+        var localization = AppLocalization.Instance;
         DispatcherUnhandledException += HandleDispatcherException;
         AppDomain.CurrentDomain.UnhandledException += HandleUnhandledException;
         TaskScheduler.UnobservedTaskException += HandleUnobservedException;
@@ -22,7 +23,7 @@ public partial class App : Application
         if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
         {
             MessageBox.Show(
-                "ClassScribe para Windows requiere Windows 11 o una versión posterior.",
+                localization["Windows11Required"],
                 "ClassScribe",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
@@ -39,7 +40,7 @@ public partial class App : Application
     {
         CrashLog.Write(e.Exception);
         MessageBox.Show(
-            $"ClassScribe encontró un error inesperado. La grabación recuperable se conserva.\n\n{e.Exception.Message}",
+            AppLocalization.Instance.Get("UnexpectedError", e.Exception.Message),
             "ClassScribe",
             MessageBoxButton.OK,
             MessageBoxImage.Error);

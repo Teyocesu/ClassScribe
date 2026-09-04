@@ -1,7 +1,9 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Windows;
+using System.Windows.Data;
 using ClassScribe.Core;
 using Microsoft.Win32;
 
@@ -18,7 +20,7 @@ public partial class MainWindow : Window, IAsyncDisposable
     {
         InitializeComponent();
         viewModel = new MainViewModel(
-            systemOutputConsentPrompt: () => SystemOutputConsentDialog.Show(this));
+            systemOutputConsentPrompt: () => SystemOutputConsentDialog.Show(this, AppLocalization.Instance));
         DataContext = viewModel;
     }
 
@@ -91,12 +93,12 @@ public partial class MainWindow : Window, IAsyncDisposable
             var slug = FilenameSlug.Create(viewModel.Subject);
             var dialog = new SaveFileDialog
             {
-                Title = "Exportar transcripción",
+                Title = AppLocalization.Instance["Export"],
                 FileName = $"{(slug.Length == 0 ? "clase" : slug)}-transcripcion.txt",
                 DefaultExt = ".txt",
                 AddExtension = true,
                 OverwritePrompt = true,
-                Filter = "Texto (*.txt)|*.txt|Markdown (*.md)|*.md",
+                Filter = AppLocalization.Instance["Text"] + " (*.txt)|*.txt|Markdown (*.md)|*.md",
             };
             if (dialog.ShowDialog(this) != true)
             {
@@ -166,7 +168,7 @@ public partial class MainWindow : Window, IAsyncDisposable
             {
                 var answer = MessageBox.Show(
                     this,
-                    "Hay una grabación activa. ¿Quieres detenerla, guardar el audio y salir?",
+                    AppLocalization.Instance["CloseRecordingPrompt"],
                     "ClassScribe",
                     MessageBoxButton.YesNo,
                     MessageBoxImage.Warning);
@@ -181,7 +183,7 @@ public partial class MainWindow : Window, IAsyncDisposable
             {
                 var answer = MessageBox.Show(
                     this,
-                    "Hay un procesamiento en curso. ¿Quieres cancelarlo de forma segura y salir?",
+                    AppLocalization.Instance["CloseProcessingPrompt"],
                     "ClassScribe",
                     MessageBoxButton.YesNo,
                     MessageBoxImage.Warning);
@@ -226,14 +228,23 @@ public partial class MainWindow : Window, IAsyncDisposable
     }
 }
 
+public sealed class EmptyStringToVisibilityConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object? parameter, CultureInfo culture) =>
+        string.IsNullOrWhiteSpace(value as string) ? Visibility.Visible : Visibility.Collapsed;
+
+    public object ConvertBack(object value, Type targetType, object? parameter, CultureInfo culture) =>
+        throw new NotSupportedException();
+}
+
 internal static class SystemOutputConsentDialog
 {
-    public static bool Show(Window owner)
+    public static bool Show(Window owner, AppLocalization localization)
     {
         var dialog = new Window
         {
             Owner = owner,
-            Title = "Capturar audio del equipo",
+            Title = localization["ConsentTitle"],
             Width = 500,
             SizeToContent = SizeToContent.Height,
             ResizeMode = ResizeMode.NoResize,
@@ -246,10 +257,7 @@ internal static class SystemOutputConsentDialog
         };
         root.Children.Add(new System.Windows.Controls.TextBlock
         {
-            Text = "ClassScribe capturará todo el audio que salga por el dispositivo de salida del equipo. "
-                + "Esto puede incluir otras aplicaciones, notificaciones y sonidos del sistema.\n\n"
-                + "El audio se procesa y guarda localmente en tu dispositivo.\n\n"
-                + "¿Quieres continuar?",
+            Text = localization["ConsentBody"],
             TextWrapping = TextWrapping.Wrap,
             MaxWidth = 440,
         });
@@ -263,7 +271,7 @@ internal static class SystemOutputConsentDialog
         var accepted = false;
         var confirm = new System.Windows.Controls.Button
         {
-            Content = "Capturar audio del equipo",
+            Content = localization["ConsentConfirm"],
             IsDefault = true,
             MinWidth = 180,
             Margin = new Thickness(0, 0, 8, 0),
@@ -276,7 +284,7 @@ internal static class SystemOutputConsentDialog
         };
         var cancel = new System.Windows.Controls.Button
         {
-            Content = "Cancelar",
+            Content = localization["ConsentCancel"],
             IsCancel = true,
             MinWidth = 90,
             Padding = new Thickness(10, 6, 10, 6),

@@ -118,17 +118,23 @@ struct LiveTranscriptEditor: NSViewRepresentable {
     @Binding private var text: String
     @Binding private var isEditing: Bool
     @Binding private var isFollowing: Bool
+    private var accessibilityLabel: String
+    private var accessibilityHelp: String
     private var onFinalize: @MainActor () -> Void
 
     init(
         text: Binding<String>,
         isEditing: Binding<Bool>,
         isFollowing: Binding<Bool>,
+        accessibilityLabel: String = ClassScribeLocalization.text(.liveEditing, language: .spanish),
+        accessibilityHelp: String = ClassScribeLocalization.text(.liveAccessibilityHelp, language: .spanish),
         onFinalize: @escaping @MainActor () -> Void = {},
     ) {
         _text = text
         _isEditing = isEditing
         _isFollowing = isFollowing
+        self.accessibilityLabel = accessibilityLabel
+        self.accessibilityHelp = accessibilityHelp
         self.onFinalize = onFinalize
     }
 
@@ -186,10 +192,8 @@ struct LiveTranscriptEditor: NSViewRepresentable {
             width: scrollView.contentSize.width,
             height: CGFloat.greatestFiniteMagnitude,
         )
-        textView.setAccessibilityLabel("Transcripción en vivo editable")
-        textView.setAccessibilityHelp(
-            "El seguimiento se pausa al editar para conservar el cursor y la posición visible.",
-        )
+        textView.setAccessibilityLabel(accessibilityLabel)
+        textView.setAccessibilityHelp(accessibilityHelp)
 
         scrollView.documentView = textView
         context.coordinator.observeUserScrolling(in: scrollView)
@@ -204,6 +208,8 @@ struct LiveTranscriptEditor: NSViewRepresentable {
             onFinalize: onFinalize,
         )
         guard let textView = scrollView.documentView as? NSTextView else { return }
+        textView.setAccessibilityLabel(accessibilityLabel)
+        textView.setAccessibilityHelp(accessibilityHelp)
         context.coordinator.synchronizeFollowing(in: textView)
         context.coordinator.receiveExternalText(text, in: textView, scrollView: scrollView)
     }
