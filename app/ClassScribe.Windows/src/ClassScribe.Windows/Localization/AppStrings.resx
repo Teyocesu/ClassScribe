@@ -146,6 +146,18 @@ Do you want to continue?</value></data>
   <data name="OpenPreviousEmpty" xml:space="preserve"><value>Choose a class from the history.</value></data>
   <data name="ReviewAssigned" xml:space="preserve"><value>Assigned to professor</value></data>
   <data name="ReviewAssign" xml:space="preserve"><value>Assign to professor</value></data>
+  <data name="SpeakerManagement" xml:space="preserve"><value>Manage speakers</value></data>
+  <data name="SpeakerManualCorrection" xml:space="preserve"><value>Manual changes are saved in this session and reapplied when reprocessing.</value></data>
+  <data name="RenameSpeaker" xml:space="preserve"><value>Rename</value></data>
+  <data name="SpeakerNamePlaceholder" xml:space="preserve"><value>Speaker name</value></data>
+  <data name="MergeSpeaker" xml:space="preserve"><value>Merge</value></data>
+  <data name="MergeTarget" xml:space="preserve"><value>Merge target</value></data>
+  <data name="SelectSpeakerTarget" xml:space="preserve"><value>New speaker:</value></data>
+  <data name="ReassignSpeaker" xml:space="preserve"><value>Reassign segment</value></data>
+  <data name="SplitSegment" xml:space="preserve"><value>Split segment</value></data>
+  <data name="SplitAfterWord" xml:space="preserve"><value>After “{0}”</value></data>
+  <data name="StatusSpeakerCorrectionsSaved" xml:space="preserve"><value>Speaker correction saved</value></data>
+  <data name="WarningSpeakerCorrectionUnresolved" xml:space="preserve"><value>Some speaker corrections need review because they could not be reconciled safely.</value></data>
   <data name="SpeakerUnknown" xml:space="preserve"><value>Unknown person</value></data>
   <data name="SpeakerPerson" xml:space="preserve"><value>Person {0}</value></data>
   <data name="SpeakerProfessor" xml:space="preserve"><value>Professor</value></data>

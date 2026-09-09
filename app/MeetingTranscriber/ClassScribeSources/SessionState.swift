@@ -302,6 +302,7 @@ enum SpeakerCorrectionKind: String, Codable, Sendable {
     case reassign
     case professorConfirmation
     case review
+    case split
 }
 
 struct SpeakerCorrectionOperation: Codable, Equatable, Sendable {
@@ -312,6 +313,17 @@ struct SpeakerCorrectionOperation: Codable, Equatable, Sendable {
     var displayName: String?
     var segmentIDs: [UUID]
     var createdAt: Date
+    /// Optional anchors keep corrections reconcilable when a later ASR run
+    /// assigns new segment UUIDs. Missing anchors remain valid for legacy
+    /// operations and are never guessed during reprojection.
+    var anchorStart: TimeInterval? = nil
+    var anchorEnd: TimeInterval? = nil
+    var anchorText: String? = nil
+    /// Number of words kept on the left side of a manual split.
+    var splitAfterWordIndex: Int? = nil
+    /// Review assignments need an explicit false value when a user toggles
+    /// the same item again; old operations without this field mean enabled.
+    var isActive: Bool? = nil
 }
 
 struct HumanCorrectionOverlay: Codable, Equatable, Sendable {
@@ -319,12 +331,49 @@ struct HumanCorrectionOverlay: Codable, Equatable, Sendable {
     var operations: [SpeakerCorrectionOperation] = []
     var editedAllText: String?
     var editedProfessorText: String?
+
+    init(
+        schemaVersion: Int = 1,
+        operations: [SpeakerCorrectionOperation] = [],
+        editedAllText: String? = nil,
+        editedProfessorText: String? = nil,
+    ) {
+        self.schemaVersion = schemaVersion
+        self.operations = operations
+        self.editedAllText = editedAllText
+        self.editedProfessorText = editedProfessorText
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case operations
+        case editedAllText
+        case editedProfessorText
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        operations = try container.decodeIfPresent([SpeakerCorrectionOperation].self, forKey: .operations) ?? []
+        editedAllText = try container.decodeIfPresent(String.self, forKey: .editedAllText)
+        editedProfessorText = try container.decodeIfPresent(String.self, forKey: .editedProfessorText)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(operations, forKey: .operations)
+        try container.encodeIfPresent(editedAllText, forKey: .editedAllText)
+        try container.encodeIfPresent(editedProfessorText, forKey: .editedProfessorText)
+    }
 }
 
 struct HumanCorrectionUpdate: Equatable, Sendable {
     var operations: [SpeakerCorrectionOperation] = []
     var allText: String?
     var professorText: String?
+    var clearAllText = false
+    var clearProfessorText = false
 }
 
 struct HumanCorrectionOverlayReference: Codable, Equatable, Sendable {

@@ -99,15 +99,25 @@ internal sealed class SpeakerChoice : ObservableObject
     public void RefreshLocalization() => OnPropertyChanged(nameof(DisplayName));
 }
 
+internal sealed record SplitBoundaryChoice(int AfterWordIndex, string Label)
+{
+    public override string ToString() => Label;
+}
+
 internal sealed class ReviewRow : ObservableObject
 {
     private readonly AppLocalization localization;
+    private readonly string? storedSpeakerName;
     private bool includeForProfessor;
 
-    public ReviewRow(ReviewItem item, AppLocalization? localization = null)
+    public ReviewRow(
+        ReviewItem item,
+        AppLocalization? localization = null,
+        string? storedSpeakerName = null)
     {
         Item = item;
         this.localization = localization ?? AppLocalization.Instance;
+        this.storedSpeakerName = storedSpeakerName;
         includeForProfessor = item.ManuallyAssignedToProfessor;
     }
 
@@ -117,7 +127,7 @@ internal sealed class ReviewRow : ObservableObject
 
     public string Speaker => SpeakerPresentation.LocalizedName(
         Item.Segment.SpeakerID,
-        storedDisplayName: null,
+        storedDisplayName: storedSpeakerName,
         localization);
 
     public string Reason => ReviewReasonPresentation.Localized(Item.Reason, localization);

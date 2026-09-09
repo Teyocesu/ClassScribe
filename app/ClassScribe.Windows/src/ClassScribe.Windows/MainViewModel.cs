@@ -40,6 +40,12 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private CaptureFault? activeCaptureFault;
     private HistoryRow? selectedHistory;
     private SpeakerChoice? selectedProfessor;
+    private SpeakerChoice? selectedSpeaker;
+    private SpeakerChoice? selectedMergeTarget;
+    private SpeakerChoice? selectedCorrectionSpeaker;
+    private ReviewRow? selectedReviewRow;
+    private SplitBoundaryChoice? selectedSplitBoundary;
+    private string speakerNameDraft = string.Empty;
     private ClassMetadata? currentMetadata;
     private string? currentFolder;
     private string subject = string.Empty;
@@ -128,6 +134,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public ObservableCollection<ReviewRow> ReviewRows { get; } = [];
 
+    public ObservableCollection<SplitBoundaryChoice> SplitBoundaries { get; } = [];
+
     public CaptureModeChoice SelectedMode
     {
         get => selectedMode;
@@ -195,6 +203,72 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         get => selectedProfessor;
         set => SetProperty(ref selectedProfessor, value);
     }
+
+    public SpeakerChoice? SelectedSpeaker
+    {
+        get => selectedSpeaker;
+        set
+        {
+            if (SetProperty(ref selectedSpeaker, value))
+            {
+                SpeakerNameDraft = value?.Model.DisplayName ?? string.Empty;
+                OnPropertyChanged(nameof(MergeTargets));
+            }
+        }
+    }
+
+    public SpeakerChoice? SelectedMergeTarget
+    {
+        get => selectedMergeTarget;
+        set => SetProperty(ref selectedMergeTarget, value);
+    }
+
+    public SpeakerChoice? SelectedCorrectionSpeaker
+    {
+        get => selectedCorrectionSpeaker;
+        set => SetProperty(ref selectedCorrectionSpeaker, value);
+    }
+
+    public ReviewRow? SelectedReviewRow
+    {
+        get => selectedReviewRow;
+        set
+        {
+            if (SetProperty(ref selectedReviewRow, value))
+            {
+                var currentID = value?.Item.Segment.SpeakerID;
+                SelectedCorrectionSpeaker = Speakers.FirstOrDefault(speaker =>
+                    speaker.Id != currentID) ?? Speakers.FirstOrDefault();
+                RefreshSplitBoundaries();
+                NotifyCorrectionAvailability();
+            }
+        }
+    }
+
+    public SplitBoundaryChoice? SelectedSplitBoundary
+    {
+        get => selectedSplitBoundary;
+        set => SetProperty(ref selectedSplitBoundary, value);
+    }
+
+    public string SpeakerNameDraft
+    {
+        get => speakerNameDraft;
+        set => SetProperty(ref speakerNameDraft, value);
+    }
+
+    public IReadOnlyList<SpeakerChoice> MergeTargets => Speakers
+        .Where(speaker => selectedSpeaker is null || speaker.Id != selectedSpeaker.Id)
+        .ToArray();
+
+    public bool HasSpeakerCorrections => activeHumanCorrectionOverlay?.Operations.Count > 0;
+
+    public bool CanEditSpeakers => !IsBusy && !IsRecording && segments.Count > 0;
+
+    public bool CanSplitSelectedReview => CanEditSpeakers
+        && SelectedReviewRow is not null
+        && SelectedSplitBoundary is not null
+        && SpeakerCorrectionProjection.CanSplit(SelectedReviewRow.Item.Segment);
 
     public string Subject
     {
@@ -573,6 +647,12 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         Speakers.Clear();
         ReviewRows.Clear();
         SelectedProfessor = null;
+        SelectedSpeaker = null;
+        SelectedMergeTarget = null;
+        SelectedCorrectionSpeaker = null;
+        SelectedReviewRow = null;
+        SplitBoundaries.Clear();
+        SelectedSplitBoundary = null;
         automaticLiveText = string.Empty;
         liveWasEdited = false;
         qualityCoverageHasGap = false;
@@ -1075,7 +1155,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             allSegments,
             selectedProfessorID,
             review);
-        ProfessorText = TranscriptExporter.PlainText(professor);
+        ProfessorText = TranscriptExporter.PlainText(professor, Speakers.Select(static speaker => speaker.Model).ToArray());
         metadata = metadata with
         {
             ProfessorSpeakerID = selectedProfessorID,
@@ -1085,19 +1165,20 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             CapturePhase = ClassScribe.Core.CapturePhase.Idle,
             AsrPhase = ClassScribe.Core.AsrPhase.Idle,
         };
+        var professorOperation = new SpeakerCorrectionOperation
+        {
+            Id = Guid.NewGuid(),
+            Kind = SpeakerCorrectionKind.ProfessorConfirmation,
+            SpeakerID = selectedProfessorID,
+            SegmentIDs = [],
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
         var humanCorrection = new HumanCorrectionUpdate
         {
-            Operations =
-            [
-                new SpeakerCorrectionOperation
-                {
-                    Id = Guid.NewGuid(),
-                    Kind = SpeakerCorrectionKind.ProfessorConfirmation,
-                    SpeakerID = selectedProfessorID,
-                    SegmentIDs = [],
-                    CreatedAt = DateTimeOffset.UtcNow,
-                },
-            ],
+            Operations = new[] { professorOperation }
+                .Concat(CreateReviewCorrectionOperations())
+                .ToArray(),
+            ClearProfessorText = true,
         };
         var speakers = Speakers.Select(static speaker => speaker.Model).ToArray();
         var diarizationProposal = activeDiarizationProposal;
@@ -1118,10 +1199,246 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         currentMetadata = metadata;
         RememberHumanCorrection(humanCorrection);
-        ApplyActiveHumanCorrection();
+        ApplyActiveHumanCorrectionText();
 
         SetStatus("StatusProfessorSaved");
     }
+
+    public async Task RenameSelectedSpeakerAsync()
+    {
+        if (SelectedSpeaker is null
+            || string.IsNullOrWhiteSpace(SpeakerNameDraft)
+            || !CanEditSpeakers)
+        {
+            return;
+        }
+
+        await ApplySpeakerCorrectionAsync(new SpeakerCorrectionOperation
+        {
+            Id = Guid.NewGuid(),
+            Kind = SpeakerCorrectionKind.Rename,
+            SpeakerID = SelectedSpeaker.Id,
+            DisplayName = SpeakerNameDraft.Trim(),
+            CreatedAt = DateTimeOffset.UtcNow,
+        }).ConfigureAwait(true);
+    }
+
+    public async Task MergeSelectedSpeakersAsync()
+    {
+        if (SelectedSpeaker is null
+            || SelectedMergeTarget is null
+            || !SpeakerCorrectionProjection.CanMerge(
+                SelectedMergeTarget.Id,
+                SelectedSpeaker.Id,
+                activeHumanCorrectionOverlay?.Operations ?? [],
+                Speakers.Select(static speaker => speaker.Id).ToHashSet(StringComparer.Ordinal))
+            || !CanEditSpeakers)
+        {
+            return;
+        }
+
+        // Keep the selected speaker as the canonical identity and fold the
+        // merge target into it. This makes the operation deterministic.
+        await ApplySpeakerCorrectionAsync(new SpeakerCorrectionOperation
+        {
+            Id = Guid.NewGuid(),
+            Kind = SpeakerCorrectionKind.Merge,
+            SpeakerID = SelectedMergeTarget.Id,
+            TargetSpeakerID = SelectedSpeaker.Id,
+            CreatedAt = DateTimeOffset.UtcNow,
+        }).ConfigureAwait(true);
+    }
+
+    public async Task ReassignSelectedSegmentAsync()
+    {
+        if (SelectedReviewRow is null
+            || SelectedCorrectionSpeaker is null
+            || !CanEditSpeakers
+            || SelectedCorrectionSpeaker.Id == SelectedReviewRow.Item.Segment.SpeakerID)
+        {
+            return;
+        }
+
+        var segment = SelectedReviewRow.Item.Segment;
+        await ApplySpeakerCorrectionAsync(new SpeakerCorrectionOperation
+        {
+            Id = Guid.NewGuid(),
+            Kind = SpeakerCorrectionKind.Reassign,
+            SpeakerID = segment.SpeakerID,
+            TargetSpeakerID = SelectedCorrectionSpeaker.Id,
+            SegmentIDs = [segment.Id],
+            AnchorStart = segment.Start,
+            AnchorEnd = segment.End,
+            AnchorText = segment.Text,
+            CreatedAt = DateTimeOffset.UtcNow,
+        }).ConfigureAwait(true);
+    }
+
+    public async Task SplitSelectedSegmentAsync()
+    {
+        if (SelectedReviewRow is null
+            || SelectedSplitBoundary is null
+            || !CanSplitSelectedReview)
+        {
+            return;
+        }
+
+        var segment = SelectedReviewRow.Item.Segment;
+        await ApplySpeakerCorrectionAsync(new SpeakerCorrectionOperation
+        {
+            Id = Guid.NewGuid(),
+            Kind = SpeakerCorrectionKind.Split,
+            SpeakerID = segment.SpeakerID,
+            SegmentIDs = [segment.Id],
+            AnchorStart = segment.Start,
+            AnchorEnd = segment.End,
+            AnchorText = segment.Text,
+            SplitAfterWordIndex = SelectedSplitBoundary.AfterWordIndex,
+            CreatedAt = DateTimeOffset.UtcNow,
+        }).ConfigureAwait(true);
+    }
+
+    private async Task ApplySpeakerCorrectionAsync(SpeakerCorrectionOperation operation)
+    {
+        if (currentMetadata is null || currentFolder is null || segments.Count == 0)
+        {
+            return;
+        }
+
+        var existingOverlay = activeHumanCorrectionOverlay ?? new HumanCorrectionOverlay();
+        var overlay = existingOverlay with
+        {
+            Operations = existingOverlay.Operations
+                .Concat([operation])
+                .ToArray(),
+        };
+        var result = SpeakerCorrectionProjection.Apply(
+            segments,
+            Speakers.Select(static speaker => speaker.Model).ToArray(),
+            ReviewRows.Select(static row => row.ToModel()).ToArray(),
+            SelectedProfessor?.Id ?? currentMetadata.ProfessorSpeakerID,
+            currentMetadata.ProfessorSelectionIsAutomatic,
+            overlay);
+        if (result.UnresolvedOperationIDs.Contains(operation.Id))
+        {
+            SetWarning("WarningSpeakerCorrectionUnresolved");
+            return;
+        }
+
+        var professor = SpeakerAssignment.ProfessorSegments(
+            result.Segments,
+            result.ProfessorSpeakerID,
+            result.Review);
+        var metadata = currentMetadata with
+        {
+            SpeakerCount = result.Speakers.Count,
+            ProfessorSpeakerID = result.ProfessorSpeakerID,
+            ProfessorSelectionIsAutomatic = result.ProfessorSelectionIsAutomatic,
+            HumanCorrectionOverlayReference = currentMetadata.HumanCorrectionOverlayReference
+                ?? new HumanCorrectionOverlayReference { RelativePath = "human-correction-overlay.json" },
+        };
+        var update = new HumanCorrectionUpdate
+        {
+            Operations = new[] { operation }
+                .Concat(CreateReviewCorrectionOperations())
+                .ToArray(),
+            ClearAllText = true,
+            ClearProfessorText = true,
+        };
+        await sessionStore.SaveFinalAsync(
+                metadata,
+                result.Segments,
+                professor,
+                result.Review,
+                result.Speakers,
+                currentFolder,
+                humanCorrection: update,
+                diarizationProposal: activeDiarizationProposal)
+            .ConfigureAwait(true);
+        if (!IsCurrent(activeAttempt))
+        {
+            return;
+        }
+
+        currentMetadata = metadata;
+        activeHumanCorrectionOverlay = overlay;
+        segments.Clear();
+        segments.AddRange(result.Segments);
+        Speakers.Clear();
+        foreach (var speaker in result.Speakers)
+        {
+            Speakers.Add(new SpeakerChoice(speaker, localization));
+        }
+
+        ReviewRows.Clear();
+        foreach (var item in result.Review)
+        {
+            ReviewRows.Add(CreateReviewRow(item));
+        }
+
+        SelectedProfessor = Speakers.FirstOrDefault(speaker =>
+            speaker.Id == result.ProfessorSpeakerID);
+        SelectedSpeaker = SelectedProfessor ?? Speakers.FirstOrDefault();
+        SelectedMergeTarget = MergeTargets.FirstOrDefault();
+        AllText = TranscriptExporter.PlainText(result.Segments, result.Speakers);
+        ProfessorText = TranscriptExporter.PlainText(professor, result.Speakers);
+        RefreshSplitBoundaries();
+        SetStatus("StatusSpeakerCorrectionsSaved");
+        await RefreshHistoryAsync(activeAttempt).ConfigureAwait(true);
+        NotifyCorrectionAvailability();
+    }
+
+    private void RefreshSplitBoundaries()
+    {
+        SplitBoundaries.Clear();
+        SelectedSplitBoundary = null;
+        if (SelectedReviewRow?.Item.Segment.WordTimings is not { Count: > 1 } timings
+            || !SpeakerCorrectionProjection.CanSplit(SelectedReviewRow.Item.Segment))
+        {
+            return;
+        }
+
+        for (var index = 0; index < timings.Count - 1; index++)
+        {
+            SplitBoundaries.Add(new SplitBoundaryChoice(
+                index + 1,
+                localization.Get("SplitAfterWord", timings[index].Text)));
+        }
+
+        SelectedSplitBoundary = SplitBoundaries.FirstOrDefault();
+    }
+
+    private void NotifyCorrectionAvailability()
+    {
+        OnPropertyChanged(nameof(CanEditSpeakers));
+        OnPropertyChanged(nameof(CanSplitSelectedReview));
+        OnPropertyChanged(nameof(HasSpeakerCorrections));
+        OnPropertyChanged(nameof(MergeTargets));
+    }
+
+    private ReviewRow CreateReviewRow(ReviewItem item) =>
+        new(
+            item,
+            localization,
+            Speakers.FirstOrDefault(speaker => speaker.Id == item.Segment.SpeakerID)?.Model.DisplayName);
+
+    private IReadOnlyList<SpeakerCorrectionOperation> CreateReviewCorrectionOperations() =>
+        ReviewRows.Select(row =>
+        {
+            var segment = row.Item.Segment;
+            return new SpeakerCorrectionOperation
+            {
+                Id = Guid.NewGuid(),
+                Kind = SpeakerCorrectionKind.Review,
+                SpeakerID = segment.SpeakerID,
+                SegmentIDs = [segment.Id],
+                AnchorStart = segment.Start,
+                AnchorEnd = segment.End,
+                AnchorText = segment.Text,
+                IsActive = row.IncludeForProfessor,
+                CreatedAt = DateTimeOffset.UtcNow,
+            };
+        }).ToArray();
 
     public async Task SaveEditsAsync()
     {
@@ -1142,6 +1459,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             AllText = AllText,
             ProfessorText = ProfessorText,
+            Operations = CreateReviewCorrectionOperations(),
         };
 
         if (segments.Count == 0)
@@ -1619,7 +1937,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         segments.Clear();
         segments.AddRange(finalSegments);
-        AllText = TranscriptExporter.PlainText(segments);
+        AllText = TranscriptExporter.PlainText(segments, Speakers.Select(static speaker => speaker.Model).ToArray());
         ProfessorText = string.Empty;
         var humanProfessorSelection = !currentMetadata.ProfessorSelectionIsAutomatic;
         var humanProfessorSpeakerID = humanProfessorSelection
@@ -1665,7 +1983,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        ApplyActiveHumanCorrection();
+        ApplyActiveHumanCorrectionText();
 
         IReadOnlyList<TranscriptSegment> assigned = segments.ToArray();
         IReadOnlyList<ReviewItem> review = [];
@@ -1713,12 +2031,25 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         segments.Clear();
         segments.AddRange(assigned);
-        var professorId = humanProfessorSelection
+        var automaticProfessorID = humanProfessorSelection
             ? humanProfessorSpeakerID
             : SpeakerAssignment.ProvisionalProfessor(speakers);
-        var professor = SpeakerAssignment.ProfessorSegments(segments, professorId, review);
-        AllText = TranscriptExporter.PlainText(segments);
-        ProfessorText = TranscriptExporter.PlainText(professor);
+        var correctionProjection = SpeakerCorrectionProjection.Apply(
+            assigned,
+            speakers,
+            review,
+            automaticProfessorID,
+            professorSelectionIsAutomatic: !humanProfessorSelection,
+            activeHumanCorrectionOverlay ?? new HumanCorrectionOverlay());
+        assigned = correctionProjection.Segments;
+        review = correctionProjection.Review;
+        speakers = correctionProjection.Speakers;
+        var professorId = correctionProjection.ProfessorSpeakerID;
+        var professor = SpeakerAssignment.ProfessorSegments(assigned, professorId, review);
+        segments.Clear();
+        segments.AddRange(assigned);
+        AllText = TranscriptExporter.PlainText(assigned, speakers);
+        ProfessorText = TranscriptExporter.PlainText(professor, speakers);
         Speakers.Clear();
         foreach (var speaker in speakers)
         {
@@ -1728,10 +2059,13 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         ReviewRows.Clear();
         foreach (var item in review)
         {
-            ReviewRows.Add(new ReviewRow(item, localization));
+            ReviewRows.Add(CreateReviewRow(item));
         }
 
         SelectedProfessor = Speakers.FirstOrDefault(speaker => speaker.Id == professorId);
+        SelectedSpeaker = Speakers.FirstOrDefault();
+        SelectedMergeTarget = MergeTargets.FirstOrDefault();
+        SelectedReviewRow = ReviewRows.FirstOrDefault();
         currentMetadata = currentMetadata with
         {
             State = ProcessingState.Complete,
@@ -1740,7 +2074,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             AsrPhase = ClassScribe.Core.AsrPhase.Idle,
             SpeakerCount = Speakers.Count,
             ProfessorSpeakerID = professorId,
-            ProfessorSelectionIsAutomatic = !humanProfessorSelection,
+            ProfessorSelectionIsAutomatic = correctionProjection.ProfessorSelectionIsAutomatic,
         };
         await sessionStore.SaveAutomaticProjectionAsync(
                 currentMetadata,
@@ -1759,12 +2093,19 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        ApplyActiveHumanCorrection();
+        ApplyActiveHumanCorrectionText();
 
         ModelProgress = 1;
         if (diarizationWarning is null)
         {
-            WarningText = string.Empty;
+            if (correctionProjection.UnresolvedOperationIDs.Count > 0)
+            {
+                SetWarning("WarningSpeakerCorrectionUnresolved");
+            }
+            else
+            {
+                WarningText = string.Empty;
+            }
             SetStatus("StatusFinalReady");
         }
         else
@@ -1833,32 +2174,61 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            segments.Clear();
-            segments.AddRange(loadedSegments);
             activeHumanCorrectionOverlay = loadedOverlay;
+            var restoredProjection = SpeakerCorrectionProjection.Apply(
+                loadedSegments,
+                loadedSpeakers,
+                loadedReview,
+                summary.Metadata.ProfessorSpeakerID,
+                summary.Metadata.ProfessorSelectionIsAutomatic,
+                loadedOverlay ?? new HumanCorrectionOverlay());
+            segments.Clear();
+            segments.AddRange(restoredProjection.Segments);
             AllText = loadedOverlay?.EditedAllText ?? TranscriptActions.BestAvailable(
                 loadedAll,
-                loadedSegments.Length > 0 ? TranscriptExporter.PlainText(loadedSegments) : null,
+                restoredProjection.Segments.Length > 0
+                    ? TranscriptExporter.PlainText(restoredProjection.Segments, restoredProjection.Speakers)
+                    : null,
                 loadedLive);
             ProfessorText = loadedOverlay?.EditedProfessorText ?? loadedProfessor ?? string.Empty;
             SetLiveProgrammatically(loadedLive ?? string.Empty);
             Speakers.Clear();
-            foreach (var speaker in loadedSpeakers)
+            foreach (var speaker in restoredProjection.Speakers)
             {
                 Speakers.Add(new SpeakerChoice(speaker, localization));
             }
 
             ReviewRows.Clear();
-            foreach (var item in loadedReview)
+            foreach (var item in restoredProjection.Review)
             {
-                ReviewRows.Add(new ReviewRow(item, localization));
+                ReviewRows.Add(CreateReviewRow(item));
             }
 
             SelectedProfessor = Speakers.FirstOrDefault(speaker =>
-                speaker.Id == summary.Metadata.ProfessorSpeakerID);
+                speaker.Id == restoredProjection.ProfessorSpeakerID);
+            SelectedSpeaker = Speakers.FirstOrDefault();
+            SelectedMergeTarget = MergeTargets.FirstOrDefault();
+            SelectedReviewRow = ReviewRows.FirstOrDefault();
+            currentMetadata = currentMetadata with
+            {
+                SpeakerCount = restoredProjection.Speakers.Count,
+                ProfessorSpeakerID = restoredProjection.ProfessorSpeakerID,
+                ProfessorSelectionIsAutomatic = restoredProjection.ProfessorSelectionIsAutomatic,
+            };
             captureRecoverySuggestion = null;
             OnPropertyChanged(nameof(ShowSystemOutputRecovery));
-            SetWarningRaw(summary.RecoveryReason ?? string.Empty);
+            if (!string.IsNullOrWhiteSpace(summary.RecoveryReason))
+            {
+                SetWarningRaw(summary.RecoveryReason);
+            }
+            else if (restoredProjection.UnresolvedOperationIDs.Count > 0)
+            {
+                SetWarning("WarningSpeakerCorrectionUnresolved");
+            }
+            else
+            {
+                SetWarningRaw(string.Empty);
+            }
             SetStatus(summary.IsRecoverable ? "StatusRecoverableOpen" : "StatusSessionOpen");
             ElapsedText = Timecode.Display(summary.Metadata.Duration);
             NotifyCurrentSessionChanged();
@@ -2045,7 +2415,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         });
     }
 
-    private void ApplyActiveHumanCorrection()
+    private void ApplyActiveHumanCorrectionText()
     {
         if (activeHumanCorrectionOverlay?.EditedAllText is { } editedAllText)
         {
@@ -2067,8 +2437,12 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 .Concat(correction.Operations.Where(operation =>
                     existing.Operations.All(previous => previous.Id != operation.Id)))
                 .ToArray(),
-            EditedAllText = correction.AllText ?? existing.EditedAllText,
-            EditedProfessorText = correction.ProfessorText ?? existing.EditedProfessorText,
+            EditedAllText = correction.ClearAllText
+                ? correction.AllText
+                : correction.AllText ?? existing.EditedAllText,
+            EditedProfessorText = correction.ClearProfessorText
+                ? correction.ProfessorText
+                : correction.ProfessorText ?? existing.EditedProfessorText,
         };
     }
 
@@ -2150,6 +2524,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanPause));
         OnPropertyChanged(nameof(CanCancel));
         OnPropertyChanged(nameof(CanReprocess));
+        OnPropertyChanged(nameof(CanEditSpeakers));
+        OnPropertyChanged(nameof(CanSplitSelectedReview));
         OnPropertyChanged(nameof(PendingSystemOutputConsent));
         OnPropertyChanged(nameof(ShowSystemOutputRecovery));
     }

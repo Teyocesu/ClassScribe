@@ -365,6 +365,7 @@ public enum SpeakerCorrectionKind
     Reassign,
     ProfessorConfirmation,
     Review,
+    Split,
 }
 
 public sealed record SpeakerCorrectionOperation
@@ -376,6 +377,11 @@ public sealed record SpeakerCorrectionOperation
     public string? DisplayName { get; init; }
     public IReadOnlyList<Guid> SegmentIDs { get; init; } = [];
     public DateTimeOffset CreatedAt { get; init; }
+    public double? AnchorStart { get; init; }
+    public double? AnchorEnd { get; init; }
+    public string? AnchorText { get; init; }
+    public int? SplitAfterWordIndex { get; init; }
+    public bool? IsActive { get; init; }
 }
 
 public sealed record HumanCorrectionOverlay
@@ -394,6 +400,8 @@ public sealed record HumanCorrectionUpdate
     public IReadOnlyList<SpeakerCorrectionOperation> Operations { get; init; } = [];
     public string? AllText { get; init; }
     public string? ProfessorText { get; init; }
+    public bool ClearAllText { get; init; }
+    public bool ClearProfessorText { get; init; }
 }
 
 public sealed record HumanCorrectionOverlayReference
@@ -462,6 +470,7 @@ internal sealed class SpeakerCorrectionKindJsonConverter : JsonConverter<Speaker
                 "reassign" => SpeakerCorrectionKind.Reassign,
                 "professorConfirmation" => SpeakerCorrectionKind.ProfessorConfirmation,
                 "review" => SpeakerCorrectionKind.Review,
+                "split" => SpeakerCorrectionKind.Split,
                 _ => throw new JsonException("Tipo de corrección de hablante desconocido."),
             };
         }
@@ -489,6 +498,7 @@ internal sealed class SpeakerCorrectionKindJsonConverter : JsonConverter<Speaker
             SpeakerCorrectionKind.Reassign => "reassign",
             SpeakerCorrectionKind.ProfessorConfirmation => "professorConfirmation",
             SpeakerCorrectionKind.Review => "review",
+            SpeakerCorrectionKind.Split => "split",
             _ => throw new ArgumentOutOfRangeException(nameof(value)),
         });
 }

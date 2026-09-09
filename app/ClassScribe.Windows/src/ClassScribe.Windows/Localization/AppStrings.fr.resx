@@ -146,6 +146,18 @@ Voulez-vous continuer ?</value></data>
   <data name="OpenPreviousEmpty" xml:space="preserve"><value>Choisissez un cours dans l’historique.</value></data>
   <data name="ReviewAssigned" xml:space="preserve"><value>Attribué au professeur</value></data>
   <data name="ReviewAssign" xml:space="preserve"><value>Attribuer au professeur</value></data>
+  <data name="SpeakerManagement" xml:space="preserve"><value>Gérer les locuteurs</value></data>
+  <data name="SpeakerManualCorrection" xml:space="preserve"><value>Les modifications manuelles sont enregistrées dans cette session et réappliquées lors du retraitement.</value></data>
+  <data name="RenameSpeaker" xml:space="preserve"><value>Renommer</value></data>
+  <data name="SpeakerNamePlaceholder" xml:space="preserve"><value>Nom du locuteur</value></data>
+  <data name="MergeSpeaker" xml:space="preserve"><value>Fusionner</value></data>
+  <data name="MergeTarget" xml:space="preserve"><value>Cible de fusion</value></data>
+  <data name="SelectSpeakerTarget" xml:space="preserve"><value>Nouveau locuteur :</value></data>
+  <data name="ReassignSpeaker" xml:space="preserve"><value>Réattribuer le segment</value></data>
+  <data name="SplitSegment" xml:space="preserve"><value>Diviser le segment</value></data>
+  <data name="SplitAfterWord" xml:space="preserve"><value>Après « {0} »</value></data>
+  <data name="StatusSpeakerCorrectionsSaved" xml:space="preserve"><value>Correction des locuteurs enregistrée</value></data>
+  <data name="WarningSpeakerCorrectionUnresolved" xml:space="preserve"><value>Certaines corrections de locuteurs doivent être vérifiées car elles n’ont pas pu être réconciliées en toute sécurité.</value></data>
   <data name="SpeakerUnknown" xml:space="preserve"><value>Personne inconnue</value></data>
   <data name="SpeakerPerson" xml:space="preserve"><value>Personne {0}</value></data>
   <data name="SpeakerProfessor" xml:space="preserve"><value>Professeur</value></data>

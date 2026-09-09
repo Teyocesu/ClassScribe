@@ -200,8 +200,12 @@ public sealed class SessionStore
                     .Concat(humanCorrection.Operations.Where(operation =>
                         existingOverlay.Operations.All(existing => existing.Id != operation.Id)))
                     .ToArray(),
-                EditedAllText = humanCorrection.AllText ?? existingOverlay.EditedAllText,
-                EditedProfessorText = humanCorrection.ProfessorText ?? existingOverlay.EditedProfessorText,
+                EditedAllText = humanCorrection.ClearAllText
+                    ? null
+                    : humanCorrection.AllText ?? existingOverlay.EditedAllText,
+                EditedProfessorText = humanCorrection.ClearProfessorText
+                    ? null
+                    : humanCorrection.ProfessorText ?? existingOverlay.EditedProfessorText,
             };
             await AtomicFile.WriteJsonAsync(
                     overlayPath,
@@ -273,8 +277,8 @@ public sealed class SessionStore
         await AtomicFile.WriteJsonAsync(
             Path.Combine(folder, "speakers.json"), speakers, JsonOptions, cancellationToken).ConfigureAwait(false);
 
-        var allText = overlay?.EditedAllText ?? automaticAllText ?? TranscriptExporter.PlainText(all);
-        var professorText = overlay?.EditedProfessorText ?? automaticProfessorText ?? TranscriptExporter.PlainText(professor);
+        var allText = overlay?.EditedAllText ?? automaticAllText ?? TranscriptExporter.PlainText(all, speakers);
+        var professorText = overlay?.EditedProfessorText ?? automaticProfessorText ?? TranscriptExporter.PlainText(professor, speakers);
         await SaveTextPairAsync("all-speakers", allText, metadata, folder, cancellationToken).ConfigureAwait(false);
         await SaveTextPairAsync("professor", professorText, metadata, folder, cancellationToken).ConfigureAwait(false);
         await AtomicFile.WriteTextAsync(

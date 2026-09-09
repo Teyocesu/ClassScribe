@@ -110,6 +110,8 @@ struct ContentView: View {
     @State private var liveEditorIsEditing = false
     @State private var followsLiveTranscript = true
     @State private var hasUnseenLiveTranscript = false
+    @State private var editingSpeakerID: String?
+    @State private var editingSpeakerName = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -515,6 +517,12 @@ struct ContentView: View {
                 Label(model.localized(.voicesTitle), systemImage: "person.2.wave.2")
                     .font(.headline)
                 Spacer()
+                if model.hasSpeakerCorrections {
+                    Label(model.localized(.speakerManualCorrection), systemImage: "pencil.and.outline")
+                        .font(.caption2)
+                        .foregroundStyle(.indigo)
+                        .help(model.localized(.speakerManualCorrection))
+                }
                 if !model.speakers.isEmpty {
                     Text("\(model.speakers.count)")
                         .font(.caption)
@@ -646,7 +654,16 @@ struct ContentView: View {
     private func speakerCard(_ speaker: SpeakerRecord) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text(model.localizedSpeakerName(speaker)).font(.subheadline.bold())
+                if editingSpeakerID == speaker.id {
+                    TextField(
+                        model.localized(.speakerRenamePlaceholder),
+                        text: $editingSpeakerName,
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { saveSpeakerName(speaker) }
+                } else {
+                    Text(model.localizedSpeakerName(speaker)).font(.subheadline.bold())
+                }
                 Spacer()
                 Text(Timecode.display(speaker.totalSpeakingTime)).font(.caption.monospacedDigit())
             }
@@ -657,6 +674,40 @@ struct ContentView: View {
                     .lineLimit(2)
             }
             HStack {
+                if editingSpeakerID == speaker.id {
+                    Button(model.localized(.speakerSaveName)) {
+                        saveSpeakerName(speaker)
+                    }
+                    .controlSize(.mini)
+                    Button(model.localized(.buttonCancel)) {
+                        editingSpeakerID = nil
+                    }
+                    .controlSize(.mini)
+                } else {
+                    Menu {
+                        Button {
+                            editingSpeakerID = speaker.id
+                            editingSpeakerName = speaker.displayName
+                        } label: {
+                            Label(model.localized(.speakerRename), systemImage: "pencil")
+                        }
+                        ForEach(model.speakers.filter { $0.id != speaker.id }) { other in
+                            Button {
+                                model.mergeSpeakers(sourceID: other.id, targetID: speaker.id)
+                            } label: {
+                                Label(
+                                    "\(model.localized(.speakerMergeWith)) \(model.localizedSpeakerName(other))",
+                                    systemImage: "arrow.triangle.merge",
+                                )
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .controlSize(.mini)
+                    .help(model.localized(.speakerManagement))
+                }
                 Spacer()
                 Button(professorButtonTitle(for: speaker)) {
                     model.selectProfessor(speaker.id)
@@ -668,6 +719,11 @@ struct ContentView: View {
         .padding(8)
         .background(model.professorSpeakerID == speaker.id ? Color.indigo.opacity(0.12) : Color.secondary.opacity(0.07))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func saveSpeakerName(_ speaker: SpeakerRecord) {
+        model.renameSpeaker(speaker.id, displayName: editingSpeakerName)
+        editingSpeakerID = nil
     }
 
     private func professorButtonTitle(for speaker: SpeakerRecord) -> String {
@@ -908,10 +964,19 @@ struct ContentView: View {
                 case .professor:
                     return model.editedProfessorText
                         ?? (model.professorSegments.isEmpty
-                            ? (model.editedAllText ?? TranscriptExporter.plainText(model.allSegments))
-                            : TranscriptExporter.plainText(model.professorSegments))
+                            ? (model.editedAllText ?? TranscriptExporter.plainText(
+                                model.allSegments,
+                                speakerNames: model.speakerDisplayNames,
+                            ))
+                            : TranscriptExporter.plainText(
+                                model.professorSegments,
+                                speakerNames: model.speakerDisplayNames,
+                            ))
                 case .everyone:
-                    return model.editedAllText ?? TranscriptExporter.plainText(model.allSegments)
+                    return model.editedAllText ?? TranscriptExporter.plainText(
+                        model.allSegments,
+                        speakerNames: model.speakerDisplayNames,
+                    )
                 case .review: return ""
                 }
             },
@@ -976,6 +1041,46 @@ struct ContentView: View {
                             model.toggleReviewAssignment(item.id)
                         }
                         .controlSize(.small)
+                    }
+                    HStack(spacing: 6) {
+                        Picker(
+                            model.localized(.speakerReassignTarget),
+                            selection: Binding(
+                                get: { model.reassignmentTarget(for: item.segment.id) },
+                                set: { model.setReassignmentTarget($0, for: item.segment.id) },
+                            ),
+                        ) {
+                            ForEach(model.speakers) { speaker in
+                                Text(model.localizedSpeakerName(speaker)).tag(speaker.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 180)
+                        Button(model.localized(.speakerReassign)) {
+                            model.reassignSegment(
+                                item.segment.id,
+                                to: model.reassignmentTarget(for: item.segment.id),
+                            )
+                        }
+                        .controlSize(.small)
+                        if model.canSplitSegment(item.segment.id) {
+                            Menu {
+                                ForEach(model.splitBoundaries(for: item.segment.id)) { boundary in
+                                    Button(model.localized(
+                                        .speakerSplitAfterWord,
+                                        arguments: ["word": boundary.word],
+                                    )) {
+                                        model.splitSegment(
+                                            item.segment.id,
+                                            afterWordIndex: boundary.afterWordIndex,
+                                        )
+                                    }
+                                }
+                            } label: {
+                                Label(model.localized(.speakerSplit), systemImage: "scissors")
+                            }
+                            .controlSize(.small)
+                        }
                     }
                     Text(item.segment.text).textSelection(.enabled)
                 }

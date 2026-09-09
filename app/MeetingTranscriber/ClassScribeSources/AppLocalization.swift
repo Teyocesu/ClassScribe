@@ -126,6 +126,8 @@ enum LocalizationKey: String, CaseIterable, Sendable {
     case statusCancellingProcessing
     case statusProcessingCancelled
     case statusProfessorChanged
+    case statusSpeakerCorrectionsSaved
+    case statusSpeakerCorrectionsUnresolved
     case statusProfessorCalibrating
     case statusVoiceReferenceSaved
     case statusHistoryRecoverable
@@ -228,6 +230,16 @@ enum LocalizationKey: String, CaseIterable, Sendable {
     case professorChoose
     case professorConfirm
     case professorConfirmed
+    case speakerManagement
+    case speakerManualCorrection
+    case speakerRename
+    case speakerRenamePlaceholder
+    case speakerSaveName
+    case speakerMergeWith
+    case speakerReassign
+    case speakerReassignTarget
+    case speakerSplit
+    case speakerSplitAfterWord
     case transcriptPickerLabel
     case transcriptTitle
     case transcriptLiveTitle
@@ -394,6 +406,8 @@ enum ClassScribeLocalization {
         LocalizationKey.statusCancellingProcessing.rawValue: [.spanish: "Cancelando procesamiento; el texto y el audio permanecen disponibles.", .english: "Cancelling processing; the text and audio remain available.", .french: "Annulation du traitement ; le texte et l’audio restent disponibles."],
         LocalizationKey.statusProcessingCancelled.rawValue: [.spanish: "Procesamiento cancelado; se conservaron el audio y el mejor texto disponible.", .english: "Processing cancelled; audio and the best available text were preserved.", .french: "Traitement annulé ; l’audio et le meilleur texte disponible ont été conservés."],
         LocalizationKey.statusProfessorChanged.rawValue: [.spanish: "Profesor cambiado a {{id}}; vista filtrada regenerada.", .english: "Professor changed to {{id}}; filtered view regenerated.", .french: "Professeur changé pour {{id}} ; vue filtrée régénérée."],
+        LocalizationKey.statusSpeakerCorrectionsSaved.rawValue: [.spanish: "Corrección de hablantes guardada.", .english: "Speaker correction saved.", .french: "Correction des locuteurs enregistrée."],
+        LocalizationKey.statusSpeakerCorrectionsUnresolved.rawValue: [.spanish: "Algunas correcciones de hablantes necesitan revisión porque no pudieron reconciliarse con seguridad.", .english: "Some speaker corrections need review because they could not be reconciled safely.", .french: "Certaines corrections de locuteurs doivent être vérifiées car elles n’ont pas pu être réconciliées en toute sécurité."],
         LocalizationKey.statusProfessorCalibrating.rawValue: [.spanish: "Calibración: procura que hable principalmente el profesor durante 20 segundos.", .english: "Calibration: have mostly the professor speak for 20 seconds.", .french: "Calibration : faites parler principalement le professeur pendant 20 secondes."],
         LocalizationKey.statusVoiceReferenceSaved.rawValue: [.spanish: "Referencia local de voz calibrada. No se subió ningún dato.", .english: "Local voice reference calibrated. No data was uploaded.", .french: "Référence vocale locale calibrée. Aucune donnée n’a été envoyée."],
         LocalizationKey.statusHistoryRecoverable.rawValue: [.spanish: "Sesión recuperable cargada. El audio y el mejor texto disponible permanecen intactos.", .english: "Recoverable session loaded. Audio and the best available text remain intact.", .french: "Session récupérable chargée. L’audio et le meilleur texte disponible restent intacts."],
@@ -496,6 +510,16 @@ enum ClassScribeLocalization {
         LocalizationKey.professorChoose.rawValue: [.spanish: "Elegir como profesor", .english: "Choose as professor", .french: "Choisir comme professeur"],
         LocalizationKey.professorConfirm.rawValue: [.spanish: "Confirmar profesor", .english: "Confirm professor", .french: "Confirmer le professeur"],
         LocalizationKey.professorConfirmed.rawValue: [.spanish: "Profesor ✓", .english: "Professor ✓", .french: "Professeur ✓"],
+        LocalizationKey.speakerManagement.rawValue: [.spanish: "Administrar hablantes", .english: "Manage speakers", .french: "Gérer les locuteurs"],
+        LocalizationKey.speakerManualCorrection.rawValue: [.spanish: "Los cambios manuales se guardan en esta sesión y se reaplican al reprocesar.", .english: "Manual changes are saved in this session and reapplied when reprocessing.", .french: "Les modifications manuelles sont enregistrées dans cette session et réappliquées lors du retraitement."],
+        LocalizationKey.speakerRename.rawValue: [.spanish: "Renombrar", .english: "Rename", .french: "Renommer"],
+        LocalizationKey.speakerRenamePlaceholder.rawValue: [.spanish: "Nombre del hablante", .english: "Speaker name", .french: "Nom du locuteur"],
+        LocalizationKey.speakerSaveName.rawValue: [.spanish: "Guardar nombre", .english: "Save name", .french: "Enregistrer le nom"],
+        LocalizationKey.speakerMergeWith.rawValue: [.spanish: "Fusionar con", .english: "Merge with", .french: "Fusionner avec"],
+        LocalizationKey.speakerReassign.rawValue: [.spanish: "Reasignar segmento", .english: "Reassign segment", .french: "Réattribuer le segment"],
+        LocalizationKey.speakerReassignTarget.rawValue: [.spanish: "Nuevo hablante", .english: "New speaker", .french: "Nouveau locuteur"],
+        LocalizationKey.speakerSplit.rawValue: [.spanish: "Dividir segmento", .english: "Split segment", .french: "Diviser le segment"],
+        LocalizationKey.speakerSplitAfterWord.rawValue: [.spanish: "Después de «{{word}}»", .english: "After “{{word}}”", .french: "Après « {{word}} »"],
         LocalizationKey.transcriptPickerLabel.rawValue: [.spanish: "Transcripción", .english: "Transcript", .french: "Transcription"],
         LocalizationKey.transcriptTitle.rawValue: [.spanish: "Transcripción", .english: "Transcript", .french: "Transcription"],
         LocalizationKey.transcriptLiveTitle.rawValue: [.spanish: "Transcripción en vivo", .english: "Live transcript", .french: "Transcription en direct"],
@@ -553,6 +577,8 @@ enum SpeakerPresentation {
     ) -> String {
         let raw = id.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalized = raw.lowercased()
+        let stored = storedDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let storedIsAutomatic = stored == nil || stored == raw
         let unknownNames = [
             "persona desconocida",
             "person unknown",
@@ -562,6 +588,13 @@ enum SpeakerPresentation {
         ]
         if unknownNames.contains(normalized) {
             return ClassScribeLocalization.text(.speakerUnknown, language: language)
+        }
+
+        // A human-entered display name is presentation data and must win over
+        // the legacy, Spanish-shaped ID. Only the automatic value that still
+        // mirrors the ID is eligible for localization.
+        if let stored, !stored.isEmpty, !storedIsAutomatic {
+            return stored
         }
 
         let parts = raw.split(whereSeparator: { $0 == " " || $0 == "_" || $0 == "-" })
@@ -582,7 +615,7 @@ enum SpeakerPresentation {
         if normalized == "participante" || normalized == "participant" {
             return ClassScribeLocalization.text(.speakerParticipant, language: language)
         }
-        return storedDisplayName ?? id
+        return stored ?? id
     }
 }
 

@@ -146,6 +146,18 @@ El audio se procesa y guarda localmente en tu dispositivo.
   <data name="OpenPreviousEmpty" xml:space="preserve"><value>Elige una clase del historial.</value></data>
   <data name="ReviewAssigned" xml:space="preserve"><value>Asignado al profesor</value></data>
   <data name="ReviewAssign" xml:space="preserve"><value>Asignar al profesor</value></data>
+  <data name="SpeakerManagement" xml:space="preserve"><value>Administrar hablantes</value></data>
+  <data name="SpeakerManualCorrection" xml:space="preserve"><value>Los cambios manuales se guardan en esta sesión y se reaplican al reprocesar.</value></data>
+  <data name="RenameSpeaker" xml:space="preserve"><value>Renombrar</value></data>
+  <data name="SpeakerNamePlaceholder" xml:space="preserve"><value>Nombre del hablante</value></data>
+  <data name="MergeSpeaker" xml:space="preserve"><value>Fusionar</value></data>
+  <data name="MergeTarget" xml:space="preserve"><value>Destino de la fusión</value></data>
+  <data name="SelectSpeakerTarget" xml:space="preserve"><value>Nuevo hablante:</value></data>
+  <data name="ReassignSpeaker" xml:space="preserve"><value>Reasignar segmento</value></data>
+  <data name="SplitSegment" xml:space="preserve"><value>Dividir segmento</value></data>
+  <data name="SplitAfterWord" xml:space="preserve"><value>Después de «{0}»</value></data>
+  <data name="StatusSpeakerCorrectionsSaved" xml:space="preserve"><value>Corrección de hablantes guardada</value></data>
+  <data name="WarningSpeakerCorrectionUnresolved" xml:space="preserve"><value>Algunas correcciones de hablantes necesitan revisión porque no pudieron reconciliarse con seguridad.</value></data>
   <data name="SpeakerUnknown" xml:space="preserve"><value>Persona desconocida</value></data>
   <data name="SpeakerPerson" xml:space="preserve"><value>Persona {0}</value></data>
   <data name="SpeakerProfessor" xml:space="preserve"><value>Profesor</value></data>

@@ -70,6 +70,18 @@ public partial class MainWindow : Window, IAsyncDisposable
     private async void ApplyProfessor_Click(object sender, RoutedEventArgs e) =>
         await RunUiActionAsync(viewModel.ApplyProfessorSelectionAsync).ConfigureAwait(true);
 
+    private async void RenameSpeaker_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(viewModel.RenameSelectedSpeakerAsync).ConfigureAwait(true);
+
+    private async void MergeSpeaker_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(viewModel.MergeSelectedSpeakersAsync).ConfigureAwait(true);
+
+    private async void ReassignSpeaker_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(viewModel.ReassignSelectedSegmentAsync).ConfigureAwait(true);
+
+    private async void SplitSegment_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(viewModel.SplitSelectedSegmentAsync).ConfigureAwait(true);
+
     private async void Save_Click(object sender, RoutedEventArgs e) =>
         await RunUiActionAsync(viewModel.SaveEditsAsync).ConfigureAwait(true);
 

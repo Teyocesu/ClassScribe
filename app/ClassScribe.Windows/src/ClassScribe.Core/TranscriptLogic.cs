@@ -181,8 +181,26 @@ public static class SpeakerAssignment
 public static class TranscriptExporter
 {
     public static string PlainText(IReadOnlyList<TranscriptSegment> segments) =>
+        PlainText(segments, new Dictionary<string, string>(StringComparer.Ordinal));
+
+    public static string PlainText(
+        IReadOnlyList<TranscriptSegment> segments,
+        IReadOnlyList<SpeakerRecord> speakers) =>
+        PlainText(
+            segments,
+            speakers.ToDictionary(
+                static speaker => speaker.Id,
+                static speaker => speaker.DisplayName,
+                StringComparer.Ordinal));
+
+    private static string PlainText(
+        IReadOnlyList<TranscriptSegment> segments,
+        IReadOnlyDictionary<string, string> speakerNames) =>
         string.Join("\n\n", Paragraphs(segments).Select(paragraph =>
-            $"[{Timecode.Display(paragraph.Start)}] {paragraph.SpeakerID}: {paragraph.Text}"));
+        {
+            var speakerName = speakerNames.GetValueOrDefault(paragraph.SpeakerID) ?? paragraph.SpeakerID;
+            return $"[{Timecode.Display(paragraph.Start)}] {speakerName}: {paragraph.Text}";
+        }));
 
     public static string Markdown(
         string subject,
@@ -191,6 +209,24 @@ public static class TranscriptExporter
     {
         var body = string.Join("\n\n", Paragraphs(segments).Select(paragraph =>
             $"- **[{Timecode.Display(paragraph.Start)}] {paragraph.SpeakerID}:** {paragraph.Text}"));
+        return Markdown(subject, date, body);
+    }
+
+    public static string Markdown(
+        string subject,
+        DateTimeOffset date,
+        IReadOnlyList<TranscriptSegment> segments,
+        IReadOnlyList<SpeakerRecord> speakers)
+    {
+        var names = speakers.ToDictionary(
+            static speaker => speaker.Id,
+            static speaker => speaker.DisplayName,
+            StringComparer.Ordinal);
+        var body = string.Join("\n\n", Paragraphs(segments).Select(paragraph =>
+        {
+            var speakerName = names.GetValueOrDefault(paragraph.SpeakerID) ?? paragraph.SpeakerID;
+            return $"- **[{Timecode.Display(paragraph.Start)}] {speakerName}:** {paragraph.Text}";
+        }));
         return Markdown(subject, date, body);
     }
 

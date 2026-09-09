@@ -70,6 +70,7 @@ struct RestoredSession {
     var editedLiveText: String?
     var editedAllText: String?
     var editedProfessorText: String?
+    var humanCorrectionOverlay: HumanCorrectionOverlay?
 }
 
 struct LiveTranscriptContext: Codable, Equatable {
@@ -277,10 +278,14 @@ struct SessionStore {
             humanOverlay.operations.append(contentsOf: humanCorrection.operations.filter { operation in
                 !humanOverlay.operations.contains(where: { $0.id == operation.id })
             })
-            if let allText = humanCorrection.allText {
+            if humanCorrection.clearAllText {
+                humanOverlay.editedAllText = nil
+            } else if let allText = humanCorrection.allText {
                 humanOverlay.editedAllText = allText
             }
-            if let professorText = humanCorrection.professorText {
+            if humanCorrection.clearProfessorText {
+                humanOverlay.editedProfessorText = nil
+            } else if let professorText = humanCorrection.professorText {
                 humanOverlay.editedProfessorText = professorText
             }
             try writeJSON(humanOverlay, to: folder.appendingPathComponent("human-correction-overlay.json"))
@@ -321,8 +326,13 @@ struct SessionStore {
         try writeJSON(all, to: folder.appendingPathComponent("all-speakers.json"))
         try writeJSON(review, to: folder.appendingPathComponent("review.json"))
         try writeJSON(speakers, to: folder.appendingPathComponent("speakers.json"))
-        let readableAll = overlay?.editedAllText ?? automaticAllText ?? TranscriptExporter.plainText(all)
-        let readableProfessor = overlay?.editedProfessorText ?? automaticProfessorText ?? TranscriptExporter.plainText(professor)
+        let speakerNames = Dictionary(uniqueKeysWithValues: speakers.map { ($0.id, $0.displayName) })
+        let readableAll = overlay?.editedAllText
+            ?? automaticAllText
+            ?? TranscriptExporter.plainText(all, speakerNames: speakerNames)
+        let readableProfessor = overlay?.editedProfessorText
+            ?? automaticProfessorText
+            ?? TranscriptExporter.plainText(professor, speakerNames: speakerNames)
         try writeText(readableAll, to: folder.appendingPathComponent("all-speakers.txt"))
         try writeText(
             TranscriptExporter.markdown(subject: metadata.subject, date: metadata.startedAt, text: readableAll),
@@ -486,13 +496,14 @@ struct SessionStore {
         let review: [ReviewItem] = decodeFile("review.json", in: folder) ?? []
         let overlay: HumanCorrectionOverlay? = decodeFile("human-correction-overlay.json", in: folder)
         let accumulator = loadLive(folder: folder) ?? LiveTranscriptAccumulator()
-        let allBase = TranscriptExporter.plainText(allSegments)
+        let speakerNames = Dictionary(uniqueKeysWithValues: speakers.map { ($0.id, $0.displayName) })
+        let allBase = TranscriptExporter.plainText(allSegments, speakerNames: speakerNames)
         let professorSegments = SpeakerAssignment.professorSegments(
             from: allSegments,
             professorID: summary.metadata.professorSpeakerID,
             review: review,
         )
-        let professorBase = TranscriptExporter.plainText(professorSegments)
+        let professorBase = TranscriptExporter.plainText(professorSegments, speakerNames: speakerNames)
         let allReadable = readNonemptyText(folder.appendingPathComponent("all-speakers.txt"))
         let professorReadable = readNonemptyText(folder.appendingPathComponent("professor.txt"))
         let preferred = preferredText(in: folder, accumulator: accumulator)
@@ -516,6 +527,7 @@ struct SessionStore {
             editedAllText: overlay?.editedAllText ?? allReadable.flatMap { $0 == allBase ? nil : $0 },
             editedProfessorText: overlay?.editedProfessorText
                 ?? professorReadable.flatMap { $0 == professorBase ? nil : $0 },
+            humanCorrectionOverlay: overlay,
         )
     }
 

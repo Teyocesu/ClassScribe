@@ -192,6 +192,30 @@
               <Button Content="{Binding [Reprocess], Source={x:Static local:AppLocalization.Instance}}" IsEnabled="{Binding CanReprocess}"
                       Click="Reprocess_Click" ToolTip="{Binding [ReprocessTooltip], Source={x:Static local:AppLocalization.Instance}}" />
             </UniformGrid>
+
+            <GroupBox Header="{Binding [SpeakerManagement], Source={x:Static local:AppLocalization.Instance}}"
+                      Margin="0,14,0,0"
+                      Visibility="{Binding CanEditSpeakers, Converter={StaticResource BoolToVisibility}}">
+              <StackPanel Margin="8">
+                <TextBlock Text="{Binding [SpeakerManualCorrection], Source={x:Static local:AppLocalization.Instance}}"
+                           Foreground="#777287" TextWrapping="Wrap" FontSize="12" Margin="0,0,0,7" />
+                <ListBox ItemsSource="{Binding Speakers}" SelectedItem="{Binding SelectedSpeaker}"
+                         DisplayMemberPath="DisplayName" Height="86" BorderBrush="#DDD9EE"
+                         automation:AutomationProperties.Name="{Binding [SpeakerManagement], Source={x:Static local:AppLocalization.Instance}}" />
+                <TextBox Text="{Binding SpeakerNameDraft, UpdateSourceTrigger=PropertyChanged}"
+                         ToolTip="{Binding [SpeakerNamePlaceholder], Source={x:Static local:AppLocalization.Instance}}"
+                         Margin="0,6,0,6" />
+                <UniformGrid Columns="2">
+                  <Button Content="{Binding [RenameSpeaker], Source={x:Static local:AppLocalization.Instance}}"
+                          Click="RenameSpeaker_Click" IsEnabled="{Binding CanEditSpeakers}" />
+                  <ComboBox ItemsSource="{Binding MergeTargets}" SelectedItem="{Binding SelectedMergeTarget}"
+                            DisplayMemberPath="DisplayName"
+                            ToolTip="{Binding [MergeTarget], Source={x:Static local:AppLocalization.Instance}}" />
+                  <Button Content="{Binding [MergeSpeaker], Source={x:Static local:AppLocalization.Instance}}"
+                          Click="MergeSpeaker_Click" IsEnabled="{Binding CanEditSpeakers}" />
+                </UniformGrid>
+              </StackPanel>
+            </GroupBox>
           </StackPanel>
         </ScrollViewer>
       </Border>
@@ -244,11 +268,26 @@
             <Grid Margin="4,10,4,4">
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
               </Grid.RowDefinitions>
               <TextBlock Text="{Binding [ReviewDescription], Source={x:Static local:AppLocalization.Instance}}"
                          Foreground="#777287" TextWrapping="Wrap" Margin="5,0,5,8" />
-              <DataGrid Grid.Row="1" ItemsSource="{Binding ReviewRows}" AutoGenerateColumns="False"
+              <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="5,0,5,8">
+                <TextBlock Text="{Binding [SelectSpeakerTarget], Source={x:Static local:AppLocalization.Instance}}"
+                           VerticalAlignment="Center" Margin="0,0,6,0" />
+                <ComboBox ItemsSource="{Binding Speakers}" SelectedItem="{Binding SelectedCorrectionSpeaker}"
+                          DisplayMemberPath="DisplayName" MinWidth="150" />
+                <Button Content="{Binding [ReassignSpeaker], Source={x:Static local:AppLocalization.Instance}}"
+                        Click="ReassignSpeaker_Click" IsEnabled="{Binding CanEditSpeakers}" Margin="6,0,0,0" />
+                <ComboBox ItemsSource="{Binding SplitBoundaries}" SelectedItem="{Binding SelectedSplitBoundary}"
+                          MinWidth="145" Margin="6,0,0,0"
+                          ToolTip="{Binding [SplitSegment], Source={x:Static local:AppLocalization.Instance}}" />
+                <Button Content="{Binding [SplitSegment], Source={x:Static local:AppLocalization.Instance}}"
+                        Click="SplitSegment_Click" IsEnabled="{Binding CanSplitSelectedReview}" Margin="6,0,0,0" />
+              </StackPanel>
+              <DataGrid Grid.Row="2" ItemsSource="{Binding ReviewRows}" SelectedItem="{Binding SelectedReviewRow}"
+                        AutoGenerateColumns="False"
                         CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal"
                         AlternatingRowBackground="#F8F7FC" BorderBrush="#DDD9EE">
                 <DataGrid.Columns>

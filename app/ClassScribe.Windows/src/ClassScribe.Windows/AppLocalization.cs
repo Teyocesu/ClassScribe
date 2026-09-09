@@ -327,9 +327,19 @@ internal static class SpeakerPresentation
         AppLocalization localization)
     {
         var candidate = id.Trim();
+        var stored = storedDisplayName?.Trim();
+        var storedIsAutomatic = stored is null || string.Equals(stored, candidate, StringComparison.Ordinal);
         if (IsUnknown(candidate) || (storedDisplayName is not null && IsUnknown(storedDisplayName)))
         {
             return localization["SpeakerUnknown"];
+        }
+
+        // Human-entered display names are presentation data and must win over
+        // the legacy, Spanish-shaped ID. Only the automatic value that still
+        // mirrors the ID is eligible for localization.
+        if (!string.IsNullOrWhiteSpace(stored) && !storedIsAutomatic)
+        {
+            return stored;
         }
 
         if (TryPersonNumber(candidate, out var number)
@@ -348,7 +358,7 @@ internal static class SpeakerPresentation
             return localization["SpeakerParticipant"];
         }
 
-        return storedDisplayName ?? id;
+        return stored ?? id;
     }
 
     private static bool IsUnknown(string value) => value.Trim().ToLowerInvariant() is

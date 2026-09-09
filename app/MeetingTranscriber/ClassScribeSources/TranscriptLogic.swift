@@ -544,15 +544,30 @@ enum SpeakerAssignment {
 
 enum TranscriptExporter {
     static func plainText(_ segments: [TranscriptSegment]) -> String {
+        plainText(segments, speakerNames: [:])
+    }
+
+    static func plainText(_ segments: [TranscriptSegment], speakerNames: [String: String]) -> String {
         paragraphs(segments).map { paragraph in
-            "[\(Timecode.display(paragraph.start))] \(paragraph.speakerID): \(paragraph.text)"
+            let speakerName = speakerNames[paragraph.speakerID] ?? paragraph.speakerID
+            return "[\(Timecode.display(paragraph.start))] \(speakerName): \(paragraph.text)"
         }.joined(separator: "\n\n")
     }
 
     static func markdown(subject: String, date: Date, segments: [TranscriptSegment]) -> String {
+        markdown(subject: subject, date: date, segments: segments, speakerNames: [:])
+    }
+
+    static func markdown(
+        subject: String,
+        date: Date,
+        segments: [TranscriptSegment],
+        speakerNames: [String: String],
+    ) -> String {
         let dateText = date.formatted(date: .long, time: .shortened)
         return "# \(subject)\n\n_\(dateText)_\n\n" + paragraphs(segments).map { paragraph in
-            "- **[\(Timecode.display(paragraph.start))] \(paragraph.speakerID):** \(paragraph.text)"
+            let speakerName = speakerNames[paragraph.speakerID] ?? paragraph.speakerID
+            return "- **[\(Timecode.display(paragraph.start))] \(speakerName):** \(paragraph.text)"
         }.joined(separator: "\n\n") + "\n"
     }
 

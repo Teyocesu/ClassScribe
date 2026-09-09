@@ -130,6 +130,10 @@ final class ClassScribeModel {
     var reviewItems: [ReviewItem] = []
     var professorSpeakerID: String?
     var professorSelectionIsAutomatic = true
+    /// The durable overlay is session-owned and never changes the ASR or
+    /// diarization artifacts. These transient targets only back the review UI.
+    private var activeHumanCorrectionOverlay: HumanCorrectionOverlay?
+    private var reviewReassignmentTargets: [UUID: String] = [:]
     var finalReplacedLive = false
     var editedLiveText: String?
     var editedProfessorText: String?
@@ -303,7 +307,11 @@ final class ClassScribeModel {
     }
 
     func localizedSpeakerName(id: String) -> String {
-        SpeakerPresentation.localizedName(id: id, language: resolvedInterfaceLanguage)
+        SpeakerPresentation.localizedName(
+            id: id,
+            storedDisplayName: speakers.first(where: { $0.id == id })?.displayName,
+            language: resolvedInterfaceLanguage,
+        )
     }
 
     func localizedReviewReason(_ reason: String) -> String {
@@ -379,6 +387,40 @@ final class ClassScribeModel {
         default:
             return .raw(error.localizedDescription)
         }
+    }
+
+    @discardableResult
+    private func applyActiveHumanCorrections() -> Bool {
+        guard let overlay = activeHumanCorrectionOverlay else { return false }
+        let result = SpeakerCorrectionProjection.apply(
+            segments: allSegments,
+            speakers: speakers,
+            review: reviewItems,
+            professorSpeakerID: professorSpeakerID,
+            professorSelectionIsAutomatic: professorSelectionIsAutomatic,
+            overlay: overlay,
+        )
+        allSegments = result.segments
+        speakers = result.speakers
+        reviewItems = result.review
+        professorSpeakerID = result.professorSpeakerID
+        professorSelectionIsAutomatic = result.professorSelectionIsAutomatic
+        if !result.unresolvedOperationIDs.isEmpty {
+            setStatus(.key(.statusSpeakerCorrectionsUnresolved))
+        }
+        return !result.unresolvedOperationIDs.isEmpty
+    }
+
+    private func rememberHumanCorrection(_ update: HumanCorrectionUpdate) {
+        var overlay = activeHumanCorrectionOverlay ?? HumanCorrectionOverlay()
+        overlay.operations.append(contentsOf: update.operations.filter { operation in
+            !overlay.operations.contains(where: { $0.id == operation.id })
+        })
+        if update.clearAllText { overlay.editedAllText = nil }
+        if update.clearProfessorText { overlay.editedProfessorText = nil }
+        if let allText = update.allText { overlay.editedAllText = allText }
+        if let professorText = update.professorText { overlay.editedProfessorText = professorText }
+        activeHumanCorrectionOverlay = overlay
     }
 
     var isRecording: Bool {
@@ -462,6 +504,10 @@ final class ClassScribeModel {
         SpeakerAssignment.professorSegments(from: allSegments, professorID: professorSpeakerID, review: reviewItems)
     }
 
+    var speakerDisplayNames: [String: String] {
+        Dictionary(uniqueKeysWithValues: speakers.map { ($0.id, $0.displayName) })
+    }
+
     var displayedText: String {
         if !finalReplacedLive {
             return editedLiveText ?? liveVisibleText
@@ -470,13 +516,22 @@ final class ClassScribeModel {
         case .liveEdit:
             return editedLiveText ?? liveVisibleText
         case .professor:
-            let professor = editedProfessorText ?? TranscriptExporter.plainText(professorSegments)
+            let professor = editedProfessorText ?? TranscriptExporter.plainText(
+                professorSegments,
+                speakerNames: speakerDisplayNames,
+            )
             if !professor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return professor
             }
-            return editedAllText ?? TranscriptExporter.plainText(allSegments)
+            return editedAllText ?? TranscriptExporter.plainText(
+                allSegments,
+                speakerNames: speakerDisplayNames,
+            )
         case .everyone:
-            return editedAllText ?? TranscriptExporter.plainText(allSegments)
+            return editedAllText ?? TranscriptExporter.plainText(
+                allSegments,
+                speakerNames: speakerDisplayNames,
+            )
         case .review:
             return reviewItems.map { "[\($0.segment.formattedTimestamp)] \($0.reason)\n\($0.segment.text)" }.joined(separator: "\n\n")
         }
@@ -499,7 +554,10 @@ final class ClassScribeModel {
         // Export silently switch to ProfessorText. An explicit empty edit is
         // user-owned and therefore remains empty instead of reviving ASR text.
         let finalText: String? = if editedAllText != nil || !allSegments.isEmpty {
-            editedAllText ?? TranscriptExporter.plainText(allSegments)
+            editedAllText ?? TranscriptExporter.plainText(
+                allSegments,
+                speakerNames: speakerDisplayNames,
+            )
         } else {
             nil
         }
@@ -666,6 +724,8 @@ final class ClassScribeModel {
         liveEditReconciler.reset()
         asrOriginalReference = nil
         activeDiarizationProposal = nil
+        activeHumanCorrectionOverlay = nil
+        reviewReassignmentTargets = [:]
         var startedSession: ClassSessionContext?
         var captureStartInvoked = false
         var captureStartCompleted = false
@@ -1002,24 +1062,25 @@ final class ClassScribeModel {
         professorSpeakerID = id
         professorSelectionIsAutomatic = false
         setStatus(.key(.statusProfessorChanged, arguments: [
-            "id": SpeakerPresentation.localizedName(id: id, language: resolvedInterfaceLanguage),
+            "id": localizedSpeakerName(id: id),
         ]))
         selectedTab = .professor
-        persistFinalOutputs(
-            humanCorrection: HumanCorrectionUpdate(
-                operations: [SpeakerCorrectionOperation(
-                    id: UUID(),
-                    kind: .professorConfirmation,
-                    speakerID: id,
-                    targetSpeakerID: nil,
-                    displayName: nil,
-                    segmentIDs: [],
-                    createdAt: Date(),
-                )],
-                allText: nil,
-                professorText: nil,
-            ),
+        let update = HumanCorrectionUpdate(
+            operations: [SpeakerCorrectionOperation(
+                id: UUID(),
+                kind: .professorConfirmation,
+                speakerID: id,
+                targetSpeakerID: nil,
+                displayName: nil,
+                segmentIDs: [],
+                createdAt: Date(),
+            )],
+            allText: nil,
+            professorText: nil,
+            clearProfessorText: true,
         )
+        rememberHumanCorrection(update)
+        _ = persistFinalOutputs(humanCorrection: update)
         saveProfessorReference(for: id)
     }
 
@@ -1027,21 +1088,154 @@ final class ClassScribeModel {
         guard let index = reviewItems.firstIndex(where: { $0.id == id }) else { return }
         reviewItems[index].manuallyAssignedToProfessor.toggle()
         let segment = reviewItems[index].segment
-        persistFinalOutputs(
-            humanCorrection: HumanCorrectionUpdate(
-                operations: [SpeakerCorrectionOperation(
-                    id: UUID(),
-                    kind: .review,
-                    speakerID: segment.speakerID,
-                    targetSpeakerID: nil,
-                    displayName: nil,
-                    segmentIDs: [segment.id],
-                    createdAt: Date(),
-                )],
-                allText: nil,
-                professorText: nil,
+        let assignment = reviewItems[index].manuallyAssignedToProfessor
+        let update = HumanCorrectionUpdate(
+            operations: [SpeakerCorrectionOperation(
+                id: UUID(),
+                kind: .review,
+                speakerID: segment.speakerID,
+                targetSpeakerID: nil,
+                displayName: nil,
+                segmentIDs: [segment.id],
+                createdAt: Date(),
+                anchorStart: segment.start,
+                anchorEnd: segment.end,
+                anchorText: segment.text,
+                isActive: assignment,
+            )],
+            allText: nil,
+            professorText: nil,
+        )
+        rememberHumanCorrection(update)
+        _ = persistFinalOutputs(humanCorrection: update)
+    }
+
+    var hasSpeakerCorrections: Bool {
+        !(activeHumanCorrectionOverlay?.operations.isEmpty ?? true)
+    }
+
+    func reassignmentTarget(for segmentID: UUID) -> String {
+        reviewReassignmentTargets[segmentID]
+            ?? speakers.first?.id
+            ?? ""
+    }
+
+    func setReassignmentTarget(_ target: String, for segmentID: UUID) {
+        reviewReassignmentTargets[segmentID] = target
+    }
+
+    func splitBoundaries(for segmentID: UUID) -> [SpeakerSplitBoundary] {
+        guard let segment = allSegments.first(where: { $0.id == segmentID }),
+              let timings = segment.wordTimings,
+              SpeakerCorrectionProjection.canSplit(segment)
+        else { return [] }
+        return timings.dropLast().indices.map { index in
+            SpeakerSplitBoundary(
+                afterWordIndex: index + 1,
+                word: timings[index].text,
+            )
+        }
+    }
+
+    func renameSpeaker(_ id: String, displayName: String) {
+        let cleanName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty,
+              speakers.contains(where: { $0.id == id })
+        else { return }
+        applyHumanSpeakerCorrection(
+            SpeakerCorrectionOperation(
+                id: UUID(),
+                kind: .rename,
+                speakerID: id,
+                targetSpeakerID: nil,
+                displayName: cleanName,
+                segmentIDs: [],
+                createdAt: Date(),
             ),
         )
+    }
+
+    func mergeSpeakers(sourceID: String, targetID: String) {
+        guard SpeakerCorrectionProjection.canMerge(
+            sourceID: sourceID,
+            targetID: targetID,
+            existingOperations: activeHumanCorrectionOverlay?.operations ?? [],
+            knownSpeakerIDs: Set(speakers.map(\.id)),
+        ) else { return }
+        applyHumanSpeakerCorrection(
+            SpeakerCorrectionOperation(
+                id: UUID(),
+                kind: .merge,
+                speakerID: sourceID,
+                targetSpeakerID: targetID,
+                displayName: nil,
+                segmentIDs: [],
+                createdAt: Date(),
+            ),
+        )
+    }
+
+    func reassignSegment(_ segmentID: UUID, to targetID: String) {
+        guard let segment = allSegments.first(where: { $0.id == segmentID }),
+              speakers.contains(where: { $0.id == targetID })
+        else { return }
+        applyHumanSpeakerCorrection(
+            SpeakerCorrectionOperation(
+                id: UUID(),
+                kind: .reassign,
+                speakerID: segment.speakerID,
+                targetSpeakerID: targetID,
+                displayName: nil,
+                segmentIDs: [segment.id],
+                createdAt: Date(),
+                anchorStart: segment.start,
+                anchorEnd: segment.end,
+                anchorText: segment.text,
+            ),
+        )
+    }
+
+    func canSplitSegment(_ segmentID: UUID) -> Bool {
+        guard let segment = allSegments.first(where: { $0.id == segmentID }) else { return false }
+        return SpeakerCorrectionProjection.canSplit(segment)
+    }
+
+    func splitSegment(_ segmentID: UUID, afterWordIndex: Int) {
+        guard let segment = allSegments.first(where: { $0.id == segmentID }),
+              splitBoundaries(for: segmentID).contains(where: { $0.afterWordIndex == afterWordIndex })
+        else { return }
+        applyHumanSpeakerCorrection(
+            SpeakerCorrectionOperation(
+                id: UUID(),
+                kind: .split,
+                speakerID: segment.speakerID,
+                targetSpeakerID: nil,
+                displayName: nil,
+                segmentIDs: [segment.id],
+                createdAt: Date(),
+                anchorStart: segment.start,
+                anchorEnd: segment.end,
+                anchorText: segment.text,
+                splitAfterWordIndex: afterWordIndex,
+            ),
+        )
+    }
+
+    private func applyHumanSpeakerCorrection(_ operation: SpeakerCorrectionOperation) {
+        guard activeSession != nil else { return }
+        let update = HumanCorrectionUpdate(
+            operations: [operation],
+            allText: nil,
+            professorText: nil,
+            clearAllText: true,
+            clearProfessorText: true,
+        )
+        rememberHumanCorrection(update)
+        let hasUnresolvedCorrections = applyActiveHumanCorrections()
+        _ = persistFinalOutputs(humanCorrection: update)
+        if !hasUnresolvedCorrections {
+            setStatus(.key(.statusSpeakerCorrectionsSaved))
+        }
     }
 
     func calibrateProfessorVoice() {
@@ -1245,12 +1439,15 @@ final class ClassScribeModel {
         elapsed = metadata.duration
         professorSpeakerID = metadata.professorSpeakerID
         professorSelectionIsAutomatic = metadata.professorSelectionIsAutomatic
+        activeHumanCorrectionOverlay = restored.humanCorrectionOverlay
+        reviewReassignmentTargets = [:]
         accumulator = restored.liveAccumulator
         liveEditReconciler.reset(asrText: accumulator.visibleText)
         syncLiveTextFromAccumulator()
         allSegments = restored.allSegments
         speakers = restored.speakers
         reviewItems = restored.review
+        let hasUnresolvedCorrections = applyActiveHumanCorrections()
         editedAllText = restored.editedAllText
         editedProfessorText = restored.editedProfessorText
         editedLiveText = restored.preferredTextSource == .recovered
@@ -1270,7 +1467,9 @@ final class ClassScribeModel {
             capturePhase = .failedRecoverable
             asrPhase = .failedRecoverable
         }
-        setStatus(summary.isRecoverable ? .key(.statusHistoryRecoverable) : .key(.statusHistoryLoaded))
+        setStatus(hasUnresolvedCorrections
+            ? .key(.statusSpeakerCorrectionsUnresolved)
+            : (summary.isRecoverable ? .key(.statusHistoryRecoverable) : .key(.statusHistoryLoaded)))
         errorMessage = summary.recoveryReason
         captureRecoverySuggestion = nil
         let vocabularyURL = summary.folder.appendingPathComponent("technical-vocabulary.txt")
@@ -1691,15 +1890,18 @@ final class ClassScribeModel {
                 self.reviewItems = assignment.review
                 self.speakers = self.makeSpeakers(spans: diarization.spans, embeddings: diarization.embeddings)
                 self.chooseProfessorAutomatically(subject: session.subject, embeddings: diarization.embeddings)
+                let hasUnresolvedCorrections = self.applyActiveHumanCorrections()
                 self.finalReplacedLive = true
                 self.state = .complete
                 self.sessionPhase = .complete
                 self.capturePhase = .idle
                 self.asrPhase = .idle
-                self.setStatus(vocabularyWarning
-                    ?? (self.editedLiveText == nil
-                        ? .key(.statusFinalReplacedLive)
-                        : .key(.statusFinalReadyWithEdits)))
+                self.setStatus(hasUnresolvedCorrections
+                    ? .key(.statusSpeakerCorrectionsUnresolved)
+                    : (vocabularyWarning
+                        ?? (self.editedLiveText == nil
+                            ? .key(.statusFinalReplacedLive)
+                            : .key(.statusFinalReadyWithEdits))))
                 if !self.persistFinalOutputs(session: session) {
                     self.state = .recoverable
                     self.sessionPhase = .recoverable
@@ -1875,8 +2077,14 @@ final class ClassScribeModel {
                     review: reviewItems,
                     speakers: speakers,
                     folder: session.folder,
-                    automaticAllText: TranscriptExporter.plainText(allSegments),
-                    automaticProfessorText: TranscriptExporter.plainText(professorSegments),
+                    automaticAllText: TranscriptExporter.plainText(
+                        allSegments,
+                        speakerNames: speakerDisplayNames,
+                    ),
+                    automaticProfessorText: TranscriptExporter.plainText(
+                        professorSegments,
+                        speakerNames: speakerDisplayNames,
+                    ),
                     diarizationProposal: activeDiarizationProposal,
                 )
             }
@@ -1902,8 +2110,14 @@ final class ClassScribeModel {
                     review: reviewItems,
                     speakers: speakers,
                     folder: session.folder,
-                    automaticAllText: TranscriptExporter.plainText(allSegments),
-                    automaticProfessorText: TranscriptExporter.plainText(professorSegments),
+                    automaticAllText: TranscriptExporter.plainText(
+                        allSegments,
+                        speakerNames: speakerDisplayNames,
+                    ),
+                    automaticProfessorText: TranscriptExporter.plainText(
+                        professorSegments,
+                        speakerNames: speakerDisplayNames,
+                    ),
                     diarizationProposal: activeDiarizationProposal,
                 )
             }

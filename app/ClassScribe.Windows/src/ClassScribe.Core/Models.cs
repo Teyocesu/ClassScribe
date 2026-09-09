@@ -30,6 +30,20 @@ public enum ProcessingState
     Recoverable,
 }
 
+public sealed record TranscriptWordTiming
+{
+    public string Text { get; init; } = string.Empty;
+    public double Start { get; init; }
+    public double End { get; init; }
+
+    public static string RenderedText(IEnumerable<TranscriptWordTiming> words) =>
+        string.Join(' ', words.Select(static word => word.Text))
+            .Replace(" ,", ",", StringComparison.Ordinal)
+            .Replace(" .", ".", StringComparison.Ordinal)
+            .Replace(" ?", "?", StringComparison.Ordinal)
+            .Replace(" !", "!", StringComparison.Ordinal);
+}
+
 public sealed record TranscriptSegment
 {
     public Guid Id { get; init; } = Guid.NewGuid();
@@ -40,6 +54,8 @@ public sealed record TranscriptSegment
     public double Confidence { get; init; }
     public bool Provisional { get; init; }
     public bool OverlappingVoices { get; init; }
+    /// Optional so sessions written before word timings remain readable.
+    public IReadOnlyList<TranscriptWordTiming>? WordTimings { get; init; }
 }
 
 public sealed record DiarizationSpan
