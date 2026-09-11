@@ -60,7 +60,7 @@ jobs:
           set -euo pipefail
           swift package resolve --package-path app/MeetingTranscriber
           swift build --package-path app/MeetingTranscriber -c release --arch arm64 -j 2 -Xswiftc -strict-concurrency=complete
-          swift test --package-path app/MeetingTranscriber -j 2 --enable-swift-testing --enable-xctest -Xswiftc -strict-concurrency=complete
+          swift test --package-path app/MeetingTranscriber -j 2 --no-parallel --enable-swift-testing --enable-xctest -Xswiftc -strict-concurrency=complete
 
       - name: Assemble verified macOS distributable
         run: |
