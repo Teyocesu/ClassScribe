@@ -273,7 +273,7 @@ public static class SpeakerCorrectionProjection
         return map;
     }
 
-    private static bool WouldCreateCycle(string source, string target, IReadOnlyDictionary<string, string> map)
+    private static bool WouldCreateCycle(string source, string target, Dictionary<string, string> map)
     {
         var current = target;
         var visited = new HashSet<string>(StringComparer.Ordinal);
@@ -311,9 +311,10 @@ public static class SpeakerCorrectionProjection
         SpeakerCorrectionOperation operation,
         IReadOnlyList<TranscriptSegment> segments)
     {
-        if (operation.SegmentIDs.FirstOrDefault() is { } segmentID
-            && segmentID != Guid.Empty)
+        if (operation.SegmentIDs.Count > 0
+            && operation.SegmentIDs[0] != Guid.Empty)
         {
+            var segmentID = operation.SegmentIDs[0];
             var exact = segments.Select((segment, index) => (segment, index))
                 .FirstOrDefault(pair => pair.segment.Id == segmentID);
             if (exact.segment is not null)
@@ -382,7 +383,7 @@ public static class SpeakerCorrectionProjection
 
     private static TranscriptSegment? MakeFragment(
         TranscriptSegment segment,
-        IReadOnlyList<TranscriptWordTiming> timings,
+        TranscriptWordTiming[] timings,
         Guid id)
     {
         if (timings.Count == 0)
@@ -438,7 +439,7 @@ public static class SpeakerCorrectionProjection
         return names;
     }
 
-    private static IReadOnlyList<SpeakerRecord> BuildSpeakers(
+    private static SpeakerRecord[] BuildSpeakers(
         IReadOnlyList<TranscriptSegment> segments,
         IReadOnlyList<SpeakerRecord> existing,
         IReadOnlyDictionary<string, string> names,

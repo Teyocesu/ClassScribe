@@ -23,11 +23,15 @@ private func fakeProcessCommand(
 private func makeProcessSupervisor(
     scenario: String,
     configuration: AsrWorkerSupervisorConfiguration = .init(
-        handshakeDeadline: 0.25,
-        absoluteJobDeadline: 0.5,
-        heartbeatInterval: 0.02,
-        heartbeatInactivityBudget: 0.08,
-        cancellationGracePeriod: 0.08,
+        // These tests launch a real Python process. Keep the watchdog
+        // relationships intact while allowing a loaded CI runner to start
+        // and schedule it: heartbeat inactivity < job deadline, and grace is
+        // explicit.
+        handshakeDeadline: 2,
+        absoluteJobDeadline: 5,
+        heartbeatInterval: 0.1,
+        heartbeatInactivityBudget: 1,
+        cancellationGracePeriod: 1,
         automaticMonitoring: true,
     ),
 ) -> (ProcessAsrWorkerTransport, AsrWorkerSupervisor)? {
@@ -42,7 +46,7 @@ private func makeProcessSupervisor(
 }
 
 private func waitForProcessExit(_ worker: ProcessAsrWorkerTransport) async -> Bool {
-    for _ in 0 ..< 200 {
+    for _ in 0 ..< 500 {
         if worker.hasExited { return true }
         try? await Task.sleep(for: .milliseconds(10))
     }
@@ -50,7 +54,7 @@ private func waitForProcessExit(_ worker: ProcessAsrWorkerTransport) async -> Bo
 }
 
 private func waitForRunning(_ supervisor: AsrWorkerSupervisor) async -> Bool {
-    for _ in 0 ..< 200 {
+    for _ in 0 ..< 500 {
         if supervisor.state == .running { return true }
         try? await Task.sleep(for: .milliseconds(10))
     }
@@ -158,11 +162,13 @@ func processHeartbeatTimeout() async {
 @Test("process con heartbeat vence por deadline absoluto")
 func processAbsoluteDeadline() async {
     let configuration = AsrWorkerSupervisorConfiguration(
-        handshakeDeadline: 0.25,
-        absoluteJobDeadline: 0.16,
-        heartbeatInterval: 0.02,
-        heartbeatInactivityBudget: 0.08,
-        cancellationGracePeriod: 0.08,
+        // Hang emits heartbeats, so the absolute deadline is deliberately
+        // shorter than the heartbeat inactivity budget.
+        handshakeDeadline: 2,
+        absoluteJobDeadline: 1,
+        heartbeatInterval: 0.1,
+        heartbeatInactivityBudget: 2,
+        cancellationGracePeriod: 1,
         automaticMonitoring: true,
     )
     guard let (worker, supervisor) = makeProcessSupervisor(scenario: "hang", configuration: configuration) else {
@@ -197,11 +203,13 @@ func processLaunchFailureCompletesSupervisor() async {
 @Test("un proceso A muerto permite iniciar B")
 func processHungAThenB() async {
     let configuration = AsrWorkerSupervisorConfiguration(
-        handshakeDeadline: 0.25,
-        absoluteJobDeadline: 0.14,
-        heartbeatInterval: 0.02,
-        heartbeatInactivityBudget: 0.08,
-        cancellationGracePeriod: 0.08,
+        // Keep the same ordering as the explicit absolute-deadline test so
+        // process A reaches that terminal reason before process B starts.
+        handshakeDeadline: 2,
+        absoluteJobDeadline: 1,
+        heartbeatInterval: 0.1,
+        heartbeatInactivityBudget: 2,
+        cancellationGracePeriod: 1,
         automaticMonitoring: true,
     )
     guard let (workerA, supervisorA) = makeProcessSupervisor(scenario: "hang", configuration: configuration),
