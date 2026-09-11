@@ -386,7 +386,7 @@ public static class SpeakerCorrectionProjection
         TranscriptWordTiming[] timings,
         Guid id)
     {
-        if (timings.Count == 0)
+        if (timings.Length == 0)
         {
             return null;
         }
