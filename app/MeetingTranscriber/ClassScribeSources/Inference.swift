@@ -209,19 +209,6 @@ actor ParakeetService {
         _ = try await loadedManager()
     }
 
-    func prewarm() async throws {
-        do {
-            try await speechPresence.prewarm()
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            // VAD is an acceptance aid. If its model is unavailable, the
-            // existing Parakeet path must still be prepared and remain
-            // available under the common fail-open policy.
-        }
-        try await loadIfNeeded()
-    }
-
     private func loadedManager() async throws -> AsrManager {
         try Task.checkCancellation()
         let manager = try await modelLoad.value { [weak self] in

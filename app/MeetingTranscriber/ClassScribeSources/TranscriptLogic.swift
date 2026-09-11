@@ -9,23 +9,8 @@ enum LiveASRResultGate {
         return clean.isEmpty ? nil : clean
     }
 
-    static func acceptedText(
-        _ result: String,
-        speechEvidence: SpeechPresenceEvidence,
-    ) -> String? {
-        guard speechEvidence.hasVoice else { return nil }
-        return acceptedText(result)
-    }
-
     static func shouldPublishTranscribing(_ result: String) -> Bool {
         acceptedText(result) != nil
-    }
-
-    static func shouldPublishTranscribing(
-        _ result: String,
-        speechEvidence: SpeechPresenceEvidence,
-    ) -> Bool {
-        acceptedText(result, speechEvidence: speechEvidence) != nil
     }
 }
 
@@ -85,21 +70,13 @@ struct LiveTranscriptionRetryPolicy: Equatable, Sendable {
     private static let delays: [TimeInterval] = [2, 4, 8, 15, 30]
     private(set) var consecutiveFailures = 0
     private(set) var retryAfterUptime: TimeInterval?
-    private(set) var isUnavailableForSession = false
 
     func canAttempt(atUptime now: TimeInterval) -> Bool {
-        guard !isUnavailableForSession else { return false }
-        return retryAfterUptime.map { now >= $0 } ?? true
+        retryAfterUptime.map { now >= $0 } ?? true
     }
 
     @discardableResult
     mutating func recordFailure(atUptime now: TimeInterval) -> TimeInterval {
-        guard !isUnavailableForSession else { return 0 }
-        guard consecutiveFailures < Self.delays.count else {
-            isUnavailableForSession = true
-            retryAfterUptime = nil
-            return 0
-        }
         let index = min(consecutiveFailures, Self.delays.count - 1)
         let delay = Self.delays[index]
         consecutiveFailures += 1
@@ -110,7 +87,6 @@ struct LiveTranscriptionRetryPolicy: Equatable, Sendable {
     mutating func recordSuccess() {
         consecutiveFailures = 0
         retryAfterUptime = nil
-        isUnavailableForSession = false
     }
 }
 

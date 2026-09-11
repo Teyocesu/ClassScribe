@@ -36,22 +36,6 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         {
             processingGate.Release();
         }
-
-        // VAD is optional infrastructure. Its failure is deliberately
-        // swallowed here so ASR preparation and the recording lifecycle keep
-        // their existing behavior; transcription retries VAD fail-open too.
-        try
-        {
-            await EnsureVadFactoryAsync(progress, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception error)
-        {
-            CrashLog.Write(error);
-        }
     }
 
     public async Task<IReadOnlyList<TranscriptSegment>> TranscribeFileAsync(

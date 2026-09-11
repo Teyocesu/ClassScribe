@@ -178,7 +178,7 @@ final class ClassScribeModel {
     private var liveEditReconciler = LiveTranscriptEditReconciler()
     private var technicalVocabularyURL: URL?
     private var activeSession: ClassSessionContext?
-    private var liveTranscriptionError: LocalizedMessage?
+    private var liveTranscriptionError: String?
     private var lastPresentedCaptureSignalState: CaptureSignalState?
     private var generationGate = SessionGenerationGate()
     private var asrOriginalReference: ASRTranscriptReference?
@@ -1674,21 +1674,6 @@ final class ClassScribeModel {
             var cursor = LiveTranscriptionCursor() // 5.5-second hops; 1.5-second overlap in a 7-second window
             var retryPolicy = LiveTranscriptionRetryPolicy()
             var resumeAtLatestWindow = false
-            self.state = .loadingModel
-            self.sessionPhase = .recording
-            self.capturePhase = .recording
-            self.asrPhase = .preparingLoad
-            self.setStatus(.key(.statusPreparingVoiceAndTranscription))
-            do {
-                try await self.parakeet.prewarm()
-            } catch is CancellationError {
-                return
-            } catch {
-                // The durable capture remains independent. The first live
-                // window will apply the bounded retry policy below.
-                self.asrPhase = .retryScheduled
-                self.setStatus(.key(.statusPreparingLocalTranscription))
-            }
             while !Task.isCancelled, self.isRecording {
                 do { try await Task.sleep(for: .milliseconds(400)) }
                 catch { break }
@@ -1731,16 +1716,13 @@ final class ClassScribeModel {
                 )
                 let began = Date()
                 do {
-                    // ParakeetService owns the VAD gate. It returns an empty
-                    // result for confirmed no-speech and runs the unchanged
-                    // ASR path when VAD itself fails open.
                     self.state = .loadingModel
                     self.sessionPhase = .recording
                     self.capturePhase = .recording
                     self.asrPhase = .preparingLoad
-                    self.setStatus(skippedExpiredSamples > 0
-                        ? .key(.statusRecentAudioRecovered)
-                        : .key(.statusPreparingLocalTranscription))
+                    self.statusDetail = skippedExpiredSamples > 0
+                        ? "La vista en vivo retomó el audio reciente; la versión final recuperará el tramo anterior."
+                        : "Preparando la transcripción local…"
                     let text = try await self.parakeet.transcribe(
                         samples: window.samples,
                         language: session.language,
@@ -1761,7 +1743,7 @@ final class ClassScribeModel {
                         // forever, then keep the ASR axis waiting for speech.
                         cursor.commit(windowEndingAt: windowEnd)
                         retryPolicy.recordSuccess()
-                        if self.errorPresentation == self.liveTranscriptionError {
+                        if self.errorMessage == self.liveTranscriptionError {
                             self.errorMessage = nil
                         }
                         self.liveTranscriptionError = nil
@@ -1789,7 +1771,7 @@ final class ClassScribeModel {
                     cursor.commit(windowEndingAt: windowEnd)
                     retryPolicy.recordSuccess()
                     self.syncLiveTextFromAccumulator()
-                    if self.errorPresentation == self.liveTranscriptionError {
+                    if self.errorMessage == self.liveTranscriptionError {
                         self.errorMessage = nil
                     }
                     self.liveTranscriptionError = nil
@@ -1798,11 +1780,11 @@ final class ClassScribeModel {
                     self.sessionPhase = .recording
                     self.capturePhase = .recording
                     self.asrPhase = .transcribing
-                    self.setStatus(pause ? .key(.statusTextUpdated) : .key(.statusTextCanBeEdited))
+                    self.statusDetail = pause
+                        ? "Texto actualizado. Puedes corregirlo mientras la grabación continúa."
+                        : "Puedes corregir el texto mientras la grabación continúa."
                     do { try self.checkpointLive("asr-window", session: session) }
-                    catch {
-                        self.setError(.key(.errorLiveUpdateSave, arguments: ["error": error.localizedDescription]))
-                    }
+                    catch { self.errorMessage = "No se pudo actualizar live-transcript.txt: \(error.localizedDescription)" }
                 } catch is CancellationError {
                     break
                 } catch {
@@ -1811,22 +1793,14 @@ final class ClassScribeModel {
                     self.state = .recording
                     self.sessionPhase = .recording
                     self.capturePhase = .recording
+                    self.asrPhase = .retryScheduled
                     let previousLiveError = self.liveTranscriptionError
-                    let message = LocalizedMessage.key(
-                        .errorLiveTranscription,
-                        arguments: ["error": error.localizedDescription],
-                    )
+                    let message = "Transcripción en vivo no disponible: \(error.localizedDescription). La grabación continúa."
                     self.liveTranscriptionError = message
-                    if self.errorPresentation == nil || self.errorPresentation == previousLiveError {
-                        self.setError(message)
+                    if self.errorMessage == nil || self.errorMessage == previousLiveError {
+                        self.errorMessage = message
                     }
-                    if retryPolicy.isUnavailableForSession {
-                        self.asrPhase = .unavailableForSession
-                        self.setStatus(.key(.statusLiveUnavailable))
-                    } else {
-                        self.asrPhase = .retryScheduled
-                        self.setStatus(.key(.statusLiveRetry, arguments: ["seconds": String(Int(delay))]))
-                    }
+                    self.statusDetail = "La grabación continúa; reintento en \(Int(delay)) s y retranscripción final al detener."
                 }
             }
         }

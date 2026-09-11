@@ -82,10 +82,6 @@ actor FluidAudioSpeechPresenceDetector {
 
     private let modelLoad = AsyncSingleFlight<VadManager>()
 
-    func prewarm() async throws {
-        _ = try await loadedManager()
-    }
-
     func analyze(samples: [Float]) async throws -> SpeechPresenceEvidence {
         guard !samples.isEmpty else { return .none }
         let manager = try await loadedManager()

@@ -78,7 +78,6 @@ public sealed class TranscriptLogicTests
         var evidence = SpeechPresenceEvidence.None;
 
         Assert.IsFalse(evidence.HasSpeech);
-        Assert.IsNull(AsrResultAcceptancePolicy.Accept("hipótesis", evidence));
         Assert.IsEmpty(SpeechPresenceAcceptancePolicy.FilterSegments(
             [new TranscriptSegment { Start = 0, End = 1, Text = "hipótesis" }],
             evidence));
@@ -129,35 +128,6 @@ public sealed class TranscriptLogicTests
         CollectionAssert.AreEqual(
             original,
             SpeechPresenceAcceptancePolicy.FilterSegments(original, evidence: null));
-    }
-
-    [TestMethod]
-    public void LiveRetryPolicyEventuallyDisablesAsrForTheSession()
-    {
-        var policy = new LiveTranscriptionRetryPolicy();
-        var now = DateTimeOffset.UnixEpoch;
-        var delays = new[]
-        {
-            TimeSpan.FromSeconds(2),
-            TimeSpan.FromSeconds(4),
-            TimeSpan.FromSeconds(8),
-            TimeSpan.FromSeconds(15),
-            TimeSpan.FromSeconds(30),
-        };
-
-        foreach (var expected in delays)
-        {
-            Assert.AreEqual(expected, policy.RecordFailure(now));
-            now += expected;
-            Assert.IsTrue(policy.CanAttempt(now));
-        }
-
-        Assert.AreEqual(TimeSpan.Zero, policy.RecordFailure(now));
-        Assert.IsTrue(policy.IsUnavailableForSession);
-        Assert.IsFalse(policy.CanAttempt(now));
-        policy.RecordSuccess();
-        Assert.IsFalse(policy.IsUnavailableForSession);
-        Assert.IsTrue(policy.CanAttempt(now));
     }
 
     [TestMethod]

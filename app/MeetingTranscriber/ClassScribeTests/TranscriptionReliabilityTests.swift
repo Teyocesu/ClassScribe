@@ -15,18 +15,6 @@ func acceptedLiveAsrResultPublishesTranscribing() {
 }
 
 @Test
-func speechPresenceIsRequiredBeforeAcceptingLiveText() {
-    let silence = SpeechPresenceEvidence.none
-    let voice = SpeechPresenceEvidence(
-        regions: [SpeechPresenceRegion(start: 1, end: 2)],
-    )
-
-    #expect(LiveASRResultGate.acceptedText("texto inventado", speechEvidence: silence) == nil)
-    #expect(!LiveASRResultGate.shouldPublishTranscribing("texto inventado", speechEvidence: silence))
-    #expect(LiveASRResultGate.acceptedText(" texto válido ", speechEvidence: voice) == "texto válido")
-}
-
-@Test
 func noSpeechRejectsEveryAsrSegment() {
     let segment = TranscriptSegment(
         start: 0,
@@ -37,7 +25,10 @@ func noSpeechRejectsEveryAsrSegment() {
     )
 
     #expect(!SpeechPresenceEvidence.none.hasVoice)
-    #expect(SpeechPresenceAcceptancePolicy.filterSegments([segment], evidence: .none).isEmpty)
+    #expect(SpeechPresenceAcceptancePolicy.filterSegments(
+        [segment],
+        evidence: SpeechPresenceEvidence.none,
+    ).isEmpty)
 }
 
 @Test
@@ -239,19 +230,15 @@ func liveCursorRecoversWhenPendingWindowExpiredFromRing() {
 func liveRetryBackoffIsBoundedAndResetsAfterSuccess() {
     var policy = LiveTranscriptionRetryPolicy()
     var now: TimeInterval = 100
-    for expected in [2.0, 4, 8, 15, 30] {
+    for expected in [2.0, 4, 8, 15, 30, 30] {
         let delay = policy.recordFailure(atUptime: now)
         #expect(delay == expected)
         #expect(!policy.canAttempt(atUptime: now + delay - 0.01))
         now += delay
         #expect(policy.canAttempt(atUptime: now))
     }
-    #expect(policy.recordFailure(atUptime: now) == 0)
-    #expect(policy.isUnavailableForSession)
-    #expect(!policy.canAttempt(atUptime: now))
     policy.recordSuccess()
     #expect(policy.consecutiveFailures == 0)
-    #expect(!policy.isUnavailableForSession)
     #expect(policy.canAttempt(atUptime: now))
 }
 
