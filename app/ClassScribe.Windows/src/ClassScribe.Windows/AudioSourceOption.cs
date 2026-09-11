@@ -15,8 +15,6 @@ internal enum OnlineCaptureSource
     SystemOutput,
 }
 
-internal sealed record OnlineCaptureSourceChoice(OnlineCaptureSource Value, string Name);
-
 internal enum CaptureRecoverySuggestion
 {
     SystemOutput,

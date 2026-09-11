@@ -127,7 +127,7 @@ public sealed class TranscriptLogicTests
 
         CollectionAssert.AreEqual(
             original,
-            SpeechPresenceAcceptancePolicy.FilterSegments(original, evidence: null));
+            SpeechPresenceAcceptancePolicy.FilterSegments(original, evidence: null).ToArray());
     }
 
     [TestMethod]

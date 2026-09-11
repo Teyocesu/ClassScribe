@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Globalization;
 using System.Resources;
 using System.Runtime.CompilerServices;
+using ClassScribe.Core;
 
 namespace ClassScribe.Windows;
 
@@ -248,7 +249,7 @@ public sealed class AppLocalization : INotifyPropertyChanged
         }
     }
 
-    public string Resolve(LocalizedMessage message)
+    internal string Resolve(LocalizedMessage message)
     {
         if (message.RawValue is not null)
         {

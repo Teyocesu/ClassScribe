@@ -1379,7 +1379,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         SelectedProfessor = Speakers.FirstOrDefault(speaker =>
             speaker.Id == result.ProfessorSpeakerID);
         SelectedSpeaker = SelectedProfessor ?? Speakers.FirstOrDefault();
-        SelectedMergeTarget = MergeTargets.FirstOrDefault();
+        SelectedMergeTarget = MergeTargets.Count > 0 ? MergeTargets[0] : null;
         AllText = TranscriptExporter.PlainText(result.Segments, result.Speakers);
         ProfessorText = TranscriptExporter.PlainText(professor, result.Speakers);
         RefreshSplitBoundaries();
@@ -1422,7 +1422,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             localization,
             Speakers.FirstOrDefault(speaker => speaker.Id == item.Segment.SpeakerID)?.Model.DisplayName);
 
-    private IReadOnlyList<SpeakerCorrectionOperation> CreateReviewCorrectionOperations() =>
+    private SpeakerCorrectionOperation[] CreateReviewCorrectionOperations() =>
         ReviewRows.Select(row =>
         {
             var segment = row.Item.Segment;
@@ -2064,7 +2064,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         SelectedProfessor = Speakers.FirstOrDefault(speaker => speaker.Id == professorId);
         SelectedSpeaker = Speakers.FirstOrDefault();
-        SelectedMergeTarget = MergeTargets.FirstOrDefault();
+        SelectedMergeTarget = MergeTargets.Count > 0 ? MergeTargets[0] : null;
         SelectedReviewRow = ReviewRows.FirstOrDefault();
         currentMetadata = currentMetadata with
         {
@@ -2186,7 +2186,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             segments.AddRange(restoredProjection.Segments);
             AllText = loadedOverlay?.EditedAllText ?? TranscriptActions.BestAvailable(
                 loadedAll,
-                restoredProjection.Segments.Length > 0
+                restoredProjection.Segments.Count > 0
                     ? TranscriptExporter.PlainText(restoredProjection.Segments, restoredProjection.Speakers)
                     : null,
                 loadedLive);
@@ -2207,7 +2207,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             SelectedProfessor = Speakers.FirstOrDefault(speaker =>
                 speaker.Id == restoredProjection.ProfessorSpeakerID);
             SelectedSpeaker = Speakers.FirstOrDefault();
-            SelectedMergeTarget = MergeTargets.FirstOrDefault();
+            SelectedMergeTarget = MergeTargets.Count > 0 ? MergeTargets[0] : null;
             SelectedReviewRow = ReviewRows.FirstOrDefault();
             currentMetadata = currentMetadata with
             {

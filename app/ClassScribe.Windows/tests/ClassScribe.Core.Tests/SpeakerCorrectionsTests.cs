@@ -7,6 +7,8 @@ public sealed class SpeakerCorrectionsTests
 {
     private const string SpeakerA = "Persona 1";
     private const string SpeakerB = "Persona 2";
+    private static readonly string[] HolaMundo = ["Hola", "mundo"];
+    private static readonly string[] PersonaTres = ["Persona 3", "Persona 3", "Persona 3"];
 
     private static SpeakerRecord Speaker(string id, string? name = null, float[]? embedding = null) => new()
     {
@@ -72,7 +74,7 @@ public sealed class SpeakerCorrectionsTests
 
         Assert.AreEqual(0, result.UnresolvedOperationIDs.Count);
         CollectionAssert.AreEqual(new[] { first.Id, second.Id }, result.Segments.Select(s => s.Id).ToArray());
-        CollectionAssert.AreEqual(new[] { "Hola", "mundo" }, result.Segments.Select(s => s.Text).ToArray());
+        CollectionAssert.AreEqual(HolaMundo, result.Segments.Select(s => s.Text).ToArray());
         CollectionAssert.AreEqual(new[] { SpeakerA, SpeakerA }, result.Segments.Select(s => s.SpeakerID).ToArray());
         Assert.AreEqual("Juan", result.Speakers.Single().DisplayName);
         CollectionAssert.AreEqual(new float[] { 1, 0 }, result.Speakers.Single().Embedding);
@@ -141,7 +143,7 @@ public sealed class SpeakerCorrectionsTests
         Assert.AreEqual(0, initial.UnresolvedOperationIDs.Count);
         Assert.AreEqual(0, reopened.UnresolvedOperationIDs.Count);
         CollectionAssert.AreEqual(
-            new[] { "Persona 3", "Persona 3", "Persona 3" },
+            PersonaTres,
             reopened.Segments.Select(segment => segment.SpeakerID).ToArray());
     }
 

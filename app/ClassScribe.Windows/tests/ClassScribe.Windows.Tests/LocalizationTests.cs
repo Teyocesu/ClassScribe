@@ -76,7 +76,9 @@ public sealed class LocalizationTests
     [TestMethod]
     public void SpeakerPresentationTranslatesWithoutChangingDurableID()
     {
-        var localization = NewLocalization(new InMemoryInterfaceLanguagePreferenceStore(), "en-US");
+        var localization = Select(
+            NewLocalization(new InMemoryInterfaceLanguagePreferenceStore(), "en-US"),
+            "en");
 
         const string speakerID = "Persona 1";
         Assert.AreEqual(
@@ -88,7 +90,6 @@ public sealed class LocalizationTests
                 "Persona desconocida",
                 "Persona desconocida",
                 Select(localization, "fr")));
-        Assert.AreEqual("Persona 1", speakerID);
     }
 
     [TestMethod]

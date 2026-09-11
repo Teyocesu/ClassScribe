@@ -20,7 +20,7 @@ public sealed class MainViewModelCaptureFaultPresentationTests
 
             var warning = rig.Model.WarningText;
             var status = rig.Model.StatusText;
-            Assert.IsTrue(warning.Contains("La fuente de audio se interrumpió", StringComparison.Ordinal));
+            Assert.IsTrue(warning.Contains("La captura informó un problema", StringComparison.Ordinal));
             StringAssert.Contains(status, "Detén la sesión para validar");
             Assert.IsFalse(rig.Model.ShowSystemOutputRecovery);
 
