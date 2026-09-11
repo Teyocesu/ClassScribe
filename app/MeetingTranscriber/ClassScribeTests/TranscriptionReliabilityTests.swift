@@ -14,6 +14,89 @@ func acceptedLiveAsrResultPublishesTranscribing() {
     #expect(LiveASRResultGate.shouldPublishTranscribing("  método científico  "))
 }
 
+@Test
+func speechPresenceIsRequiredBeforeAcceptingLiveText() {
+    let silence = SpeechPresenceEvidence.none
+    let voice = SpeechPresenceEvidence(
+        regions: [SpeechPresenceRegion(start: 1, end: 2)],
+    )
+
+    #expect(LiveASRResultGate.acceptedText("texto inventado", speechEvidence: silence) == nil)
+    #expect(!LiveASRResultGate.shouldPublishTranscribing("texto inventado", speechEvidence: silence))
+    #expect(LiveASRResultGate.acceptedText(" texto válido ", speechEvidence: voice) == "texto válido")
+}
+
+@Test
+func noSpeechRejectsEveryAsrSegment() {
+    let segment = TranscriptSegment(
+        start: 0,
+        end: 1,
+        text: "texto inventado",
+        speakerID: "Persona desconocida",
+        confidence: 0.5,
+    )
+
+    #expect(!SpeechPresenceEvidence.none.hasVoice)
+    #expect(SpeechPresenceAcceptancePolicy.filterSegments([segment], evidence: .none).isEmpty)
+}
+
+@Test
+func speechOverlapKeepsSegmentsAtTheConservativeBoundary() {
+    let evidence = SpeechPresenceEvidence(
+        regions: [SpeechPresenceRegion(start: 1, end: 2)],
+    )
+
+    #expect(SpeechPresenceAcceptancePolicy.intersects(
+        segmentStart: 1.2,
+        segmentEnd: 1.4,
+        regions: evidence.regions,
+    ))
+    #expect(SpeechPresenceAcceptancePolicy.intersects(
+        segmentStart: 0.7,
+        segmentEnd: 0.8,
+        regions: evidence.regions,
+    ))
+    #expect(SpeechPresenceAcceptancePolicy.intersects(
+        segmentStart: 2.3,
+        segmentEnd: 2.4,
+        regions: evidence.regions,
+    ))
+}
+
+@Test
+func speechFilterRejectsSegmentsOutsideThePaddedRegions() {
+    let segment = TranscriptSegment(
+        start: 2.31,
+        end: 2.6,
+        text: "ruido",
+        speakerID: "Persona desconocida",
+        confidence: 0.5,
+    )
+    let evidence = SpeechPresenceEvidence(
+        regions: [SpeechPresenceRegion(start: 1, end: 2)],
+    )
+
+    #expect(!SpeechPresenceAcceptancePolicy.intersects(
+        segmentStart: segment.start,
+        segmentEnd: segment.end,
+        regions: evidence.regions,
+    ))
+    #expect(SpeechPresenceAcceptancePolicy.filterSegments([segment], evidence: evidence).isEmpty)
+}
+
+@Test
+func vadFailurePreservesTheOriginalAsrSegments() {
+    let original = [TranscriptSegment(
+        start: 4,
+        end: 5,
+        text: "texto ASR",
+        speakerID: "Persona desconocida",
+        confidence: 0.8,
+    )]
+
+    #expect(SpeechPresenceAcceptancePolicy.filterSegments(original, evidence: nil) == original)
+}
+
 private actor SingleFlightProbe {
     private(set) var calls = 0
     private var callWaiters: [CheckedContinuation<Void, Never>] = []
@@ -156,15 +239,19 @@ func liveCursorRecoversWhenPendingWindowExpiredFromRing() {
 func liveRetryBackoffIsBoundedAndResetsAfterSuccess() {
     var policy = LiveTranscriptionRetryPolicy()
     var now: TimeInterval = 100
-    for expected in [2.0, 4, 8, 15, 30, 30] {
+    for expected in [2.0, 4, 8, 15, 30] {
         let delay = policy.recordFailure(atUptime: now)
         #expect(delay == expected)
         #expect(!policy.canAttempt(atUptime: now + delay - 0.01))
         now += delay
         #expect(policy.canAttempt(atUptime: now))
     }
+    #expect(policy.recordFailure(atUptime: now) == 0)
+    #expect(policy.isUnavailableForSession)
+    #expect(!policy.canAttempt(atUptime: now))
     policy.recordSuccess()
     #expect(policy.consecutiveFailures == 0)
+    #expect(!policy.isUnavailableForSession)
     #expect(policy.canAttempt(atUptime: now))
 }
 

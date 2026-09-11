@@ -73,6 +73,94 @@ public sealed class TranscriptLogicTests
     }
 
     [TestMethod]
+    public void SilenceIsRejectedBeforeAsrTextCanBeAccepted()
+    {
+        var evidence = SpeechPresenceEvidence.None;
+
+        Assert.IsFalse(evidence.HasSpeech);
+        Assert.IsNull(AsrResultAcceptancePolicy.Accept("hipótesis", evidence));
+        Assert.IsEmpty(SpeechPresenceAcceptancePolicy.FilterSegments(
+            [new TranscriptSegment { Start = 0, End = 1, Text = "hipótesis" }],
+            evidence));
+    }
+
+    [TestMethod]
+    public void SpeechOverlapKeepsOriginalAsrSegmentAtThePaddedBoundary()
+    {
+        var evidence = new SpeechPresenceEvidence(
+            [new SpeechPresenceRegion(1, 2)]);
+
+        Assert.IsTrue(SpeechPresenceAcceptancePolicy.Intersects(
+            1.2,
+            1.4,
+            evidence.Regions));
+        Assert.IsTrue(SpeechPresenceAcceptancePolicy.Intersects(
+            0.7,
+            0.8,
+            evidence.Regions));
+        Assert.IsTrue(SpeechPresenceAcceptancePolicy.Intersects(
+            2.3,
+            2.4,
+            evidence.Regions));
+    }
+
+    [TestMethod]
+    public void SpeechFilterRejectsSegmentOutsideThePaddedRegions()
+    {
+        var evidence = new SpeechPresenceEvidence(
+            [new SpeechPresenceRegion(1, 2)]);
+        var segment = new TranscriptSegment { Start = 2.31, End = 2.6, Text = "ruido" };
+
+        Assert.IsFalse(SpeechPresenceAcceptancePolicy.Intersects(
+            segment.Start,
+            segment.End,
+            evidence.Regions));
+        Assert.IsEmpty(SpeechPresenceAcceptancePolicy.FilterSegments([segment], evidence));
+    }
+
+    [TestMethod]
+    public void VadFailurePreservesOriginalAsrSegments()
+    {
+        var original = new[]
+        {
+            new TranscriptSegment { Start = 4, End = 5, Text = "texto ASR" },
+        };
+
+        CollectionAssert.AreEqual(
+            original,
+            SpeechPresenceAcceptancePolicy.FilterSegments(original, evidence: null));
+    }
+
+    [TestMethod]
+    public void LiveRetryPolicyEventuallyDisablesAsrForTheSession()
+    {
+        var policy = new LiveTranscriptionRetryPolicy();
+        var now = DateTimeOffset.UnixEpoch;
+        var delays = new[]
+        {
+            TimeSpan.FromSeconds(2),
+            TimeSpan.FromSeconds(4),
+            TimeSpan.FromSeconds(8),
+            TimeSpan.FromSeconds(15),
+            TimeSpan.FromSeconds(30),
+        };
+
+        foreach (var expected in delays)
+        {
+            Assert.AreEqual(expected, policy.RecordFailure(now));
+            now += expected;
+            Assert.IsTrue(policy.CanAttempt(now));
+        }
+
+        Assert.AreEqual(TimeSpan.Zero, policy.RecordFailure(now));
+        Assert.IsTrue(policy.IsUnavailableForSession);
+        Assert.IsFalse(policy.CanAttempt(now));
+        policy.RecordSuccess();
+        Assert.IsFalse(policy.IsUnavailableForSession);
+        Assert.IsTrue(policy.CanAttempt(now));
+    }
+
+    [TestMethod]
     public void MetadataEmitsStableTokensAndReadsLegacySpanishAliases()
     {
         var metadata = new ClassMetadata

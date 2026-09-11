@@ -5,9 +5,15 @@ namespace ClassScribe.Windows;
 
 internal sealed class WhisperTranscriber : IAsyncDisposable
 {
+    private const float VadThreshold = 0.40f;
+    private static readonly TimeSpan VadMinimumSpeech = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan VadMergeSilence = TimeSpan.FromMilliseconds(300);
+
     private readonly LocalModelProvisioner models;
     private readonly SemaphoreSlim processingGate = new(1, 1);
+    private readonly SemaphoreSlim vadGate = new(1, 1);
     private WhisperFactory? factory;
+    private WhisperVadFactory? vadFactory;
     private string? loadedModelPath;
     private bool isWarmedUp;
 
@@ -30,6 +36,22 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         {
             processingGate.Release();
         }
+
+        // VAD is optional infrastructure. Its failure is deliberately
+        // swallowed here so ASR preparation and the recording lifecycle keep
+        // their existing behavior; transcription retries VAD fail-open too.
+        try
+        {
+            await EnsureVadFactoryAsync(progress, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception error)
+        {
+            CrashLog.Write(error);
+        }
     }
 
     public async Task<IReadOnlyList<TranscriptSegment>> TranscribeFileAsync(
@@ -39,6 +61,30 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         IProgress<ModelDownloadProgress>? progress,
         CancellationToken cancellationToken)
     {
+        SpeechPresenceEvidence? speechEvidence;
+        await using (var vadStream = new FileStream(
+                         wavePath,
+                         FileMode.Open,
+                         FileAccess.Read,
+                         FileShare.Read,
+                         128 * 1_024,
+                         FileOptions.Asynchronous | FileOptions.SequentialScan))
+        {
+            speechEvidence = await TryDetectSpeechAsync(
+                    vadStream,
+                    0,
+                    progress,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (speechEvidence is not null && !speechEvidence.HasSpeech)
+        {
+            return [];
+        }
+
+        // Whisper always receives a fresh stream for the original file. VAD
+        // only supplies acceptance evidence and never crops or concatenates it.
         await using var stream = new FileStream(
             wavePath,
             FileMode.Open,
@@ -46,7 +92,14 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
             FileShare.Read,
             128 * 1_024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
-        return await TranscribeAsync(stream, vocabulary, languageCode, 0, progress, cancellationToken)
+        return await TranscribeAsync(
+                stream,
+                vocabulary,
+                languageCode,
+                0,
+                progress,
+                cancellationToken,
+                speechEvidence)
             .ConfigureAwait(false);
     }
 
@@ -56,10 +109,39 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         string languageCode,
         double offsetSeconds,
         IProgress<ModelDownloadProgress>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        SpeechPresenceEvidence? speechEvidence = null)
     {
+        if (pcm.Length == 0)
+        {
+            return [];
+        }
+
+        if (speechEvidence is null)
+        {
+            using var vadStream = PcmWaveFile.CreateWaveStream(pcm.Span);
+            speechEvidence = await TryDetectSpeechAsync(
+                    vadStream,
+                    offsetSeconds,
+                    progress,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (speechEvidence is not null && !speechEvidence.HasSpeech)
+        {
+            return [];
+        }
+
         using var stream = PcmWaveFile.CreateWaveStream(pcm.Span);
-        return await TranscribeAsync(stream, vocabulary, languageCode, offsetSeconds, progress, cancellationToken)
+        return await TranscribeAsync(
+                stream,
+                vocabulary,
+                languageCode,
+                offsetSeconds,
+                progress,
+                cancellationToken,
+                speechEvidence)
             .ConfigureAwait(false);
     }
 
@@ -78,6 +160,18 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
             processingGate.Release();
             processingGate.Dispose();
         }
+
+        await vadGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            vadFactory?.Dispose();
+            vadFactory = null;
+        }
+        finally
+        {
+            vadGate.Release();
+            vadGate.Dispose();
+        }
     }
 
     private async Task<IReadOnlyList<TranscriptSegment>> TranscribeAsync(
@@ -86,7 +180,8 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         string languageCode,
         double offsetSeconds,
         IProgress<ModelDownloadProgress>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        SpeechPresenceEvidence? speechEvidence = null)
     {
         await processingGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -124,11 +219,79 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
                 });
             }
 
-            return result;
+            return SpeechPresenceAcceptancePolicy.FilterSegments(result, speechEvidence);
         }
         finally
         {
             processingGate.Release();
+        }
+    }
+
+    private async Task<SpeechPresenceEvidence?> TryDetectSpeechAsync(
+        Stream wave,
+        double offsetSeconds,
+        IProgress<ModelDownloadProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var activeFactory = await EnsureVadFactoryAsync(progress, cancellationToken).ConfigureAwait(false);
+            await using var processor = activeFactory.CreateBuilder()
+                .WithThreads(Math.Clamp(Environment.ProcessorCount, 1, 16))
+                .WithUseGpu(false)
+                .WithThreshold(VadThreshold)
+                .WithMinSpeechDuration(VadMinimumSpeech)
+                .WithMinSilenceDuration(VadMergeSilence)
+                .WithSpeechPadding(TimeSpan.Zero)
+                .Build();
+            var detected = await processor.DetectSpeechAsync(wave, cancellationToken).ConfigureAwait(false);
+            var timelineOffset = double.IsFinite(offsetSeconds) ? Math.Max(0, offsetSeconds) : 0;
+            var regions = detected
+                .Select(segment => new SpeechPresenceRegion(
+                    timelineOffset + Math.Max(0, segment.Start.TotalSeconds),
+                    timelineOffset + Math.Max(0, segment.End.TotalSeconds)))
+                .ToArray();
+            return new SpeechPresenceEvidence(regions);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception error)
+        {
+            // VAD model download/load/inference is an acceptance aid. Any
+            // failure returns nil so the caller executes the old ASR path.
+            CrashLog.Write(error);
+            return null;
+        }
+    }
+
+    private async Task<WhisperVadFactory> EnsureVadFactoryAsync(
+        IProgress<ModelDownloadProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        await vadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (vadFactory is not null)
+            {
+                return vadFactory;
+            }
+
+            var modelPath = await models.EnsureVadAsync(progress, cancellationToken).ConfigureAwait(false);
+            var preparedFactory = await Task.Run(
+                    () => WhisperVadFactory.FromPath(modelPath, new WhisperFactoryOptions
+                    {
+                        UseGpu = false,
+                    }),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            vadFactory = preparedFactory;
+            return preparedFactory;
+        }
+        finally
+        {
+            vadGate.Release();
         }
     }
 

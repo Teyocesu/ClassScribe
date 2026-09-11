@@ -19,6 +19,15 @@ internal sealed class LocalModelProvisioner : IDisposable
     private const string WhisperSha256 =
         "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb";
 
+    // Official Whisper.net 1.9.1 Silero v6.2.0 artifact (v4 repository).
+    // Size and SHA-256 were verified against the HTTPS artifact before being
+    // pinned here: https://huggingface.co/sandrohanea/whisper.net/resolve/v4/vad/ggml-silero-v6.2.0.bin
+    private const string VadUrl =
+        "https://huggingface.co/sandrohanea/whisper.net/resolve/v4/vad/ggml-silero-v6.2.0.bin";
+    private const long VadSize = 885_098;
+    private const string VadSha256 =
+        "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987";
+
     private const string SegmentationUrl =
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/"
         + "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
@@ -39,6 +48,7 @@ internal sealed class LocalModelProvisioner : IDisposable
 
     private readonly HttpClient httpClient;
     private readonly SemaphoreSlim whisperGate = new(1, 1);
+    private readonly SemaphoreSlim vadGate = new(1, 1);
     private readonly SemaphoreSlim diarizationGate = new(1, 1);
 
     public LocalModelProvisioner(string? root = null)
@@ -56,6 +66,30 @@ internal sealed class LocalModelProvisioner : IDisposable
     }
 
     public string Root { get; }
+
+    public async Task<string> EnsureVadAsync(
+        IProgress<ModelDownloadProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        await vadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            EnsureSafeModelRoot();
+            return await EnsureFileAsync(
+                    new Uri(VadUrl),
+                    Path.Combine(Root, "vad", "ggml-silero-v6.2.0.bin"),
+                    "modelo de detección de voz",
+                    VadSize,
+                    VadSha256,
+                    progress,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            vadGate.Release();
+        }
+    }
 
     public async Task<string> EnsureWhisperAsync(
         IProgress<ModelDownloadProgress>? progress,
@@ -138,6 +172,7 @@ internal sealed class LocalModelProvisioner : IDisposable
     {
         httpClient.Dispose();
         whisperGate.Dispose();
+        vadGate.Dispose();
         diarizationGate.Dispose();
     }
 

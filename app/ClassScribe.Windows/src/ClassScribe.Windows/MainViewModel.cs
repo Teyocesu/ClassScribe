@@ -1668,10 +1668,34 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private async Task RunLiveTranscriptionAsync(CancellationToken cancellationToken)
     {
         var attempt = activeAttempt;
-        await Task.Delay(TimeSpan.FromSeconds(4), cancellationToken).ConfigureAwait(false);
+        var retryPolicy = new LiveTranscriptionRetryPolicy();
+        await Task.Delay(TimeSpan.FromSeconds(6), cancellationToken).ConfigureAwait(false);
         if (!IsCurrent(attempt))
         {
             return;
+        }
+
+        var preparationProgress = new Progress<ModelDownloadProgress>(
+            value => UpdateModelProgress(value, attempt));
+        try
+        {
+            await transcriber.PrepareAsync(preparationProgress, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception error) when (error is not OutOfMemoryException)
+        {
+            CrashLog.Write(error);
+            RunOnUi(() =>
+            {
+                if (IsCurrent(attempt) && !IsTerminalCaptureFaultPresentationActive)
+                {
+                    SetWarning("WarningModelRetry", error.Message);
+                    SetStatus("StatusLiveModelRetry");
+                }
+            });
         }
 
         while (!cancellationToken.IsCancellationRequested)
@@ -1696,7 +1720,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                     duration = audioCapture.DurationSeconds;
                     var pendingDuration = Math.Max(0, duration - liveTranscribedThroughSeconds);
                     var pcm = audioCapture.Snapshot(TimeSpan.FromSeconds(pendingDuration));
-                    if (pcm.Length >= PcmWaveFile.SampleRate * 2)
+                    if (pcm.Length >= PcmWaveFile.SampleRate * 2
+                        && retryPolicy.CanAttempt(DateTimeOffset.UtcNow))
                     {
                         var pcmDuration = pcm.Length / 32_000d;
                         var missingDuration = Math.Max(0, pendingDuration - pcmDuration);
@@ -1706,6 +1731,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                             offset = Math.Max(0, duration - pcmDuration);
                         }
 
+                        var progress = new Progress<ModelDownloadProgress>(
+                            value => UpdateModelProgress(value, attempt));
                         var sessionVocabulary = currentMetadata?.TechnicalVocabulary ?? string.Empty;
                         var sessionLanguage = NormalizeLanguage(currentMetadata?.Language);
                         var provisional = await transcriber.TranscribePcmAsync(
@@ -1713,8 +1740,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                                 sessionVocabulary,
                                 sessionLanguage,
                                 offset,
-                                progress: null,
-                            cancellationToken)
+                                progress,
+                                cancellationToken)
                             .ConfigureAwait(false);
                         if (!IsCurrent(attempt))
                         {
@@ -1723,14 +1750,16 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
                         liveTranscribedThroughSeconds = offset + pcmDuration;
                         var incoming = string.Join(' ', provisional.Select(static segment => segment.Text));
-                        if (incoming.Length > 0)
+                        var accepted = AsrResultAcceptancePolicy.Accept(incoming);
+                        retryPolicy.RecordSuccess();
+                        if (accepted is not null)
                         {
                             var visibleText = string.Empty;
                             await RunOnUiAsync(() =>
                                 {
                                     if (IsCurrent(attempt))
                                     {
-                                        PublishLiveText(incoming);
+                                        PublishLiveText(accepted);
                                         visibleText = LiveText;
                                     }
                                 })
@@ -1767,6 +1796,16 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                                 }
                             }
                         }
+                        else
+                        {
+                            RunOnUi(() =>
+                            {
+                                if (IsCurrent(attempt) && !IsTerminalCaptureFaultPresentationActive)
+                                {
+                                    SetStatus("StatusLiveHypothesisRejected");
+                                }
+                            });
+                        }
                     }
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1776,13 +1815,22 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 catch (Exception error) when (error is not OutOfMemoryException)
                 {
                     CrashLog.Write(error);
+                    var delay = retryPolicy.RecordFailure(DateTimeOffset.UtcNow);
                     RunOnUi(() =>
                     {
                         if (IsCurrent(attempt)
                             && !IsTerminalCaptureFaultPresentationActive)
                         {
-                            WarningText = $"El texto en vivo se reintentará: {error.Message}";
-                            StatusText = "El audio sigue grabándose de forma segura";
+                            if (retryPolicy.IsUnavailableForSession)
+                            {
+                                SetWarning("WarningLiveUnavailable", error.Message);
+                                SetStatus("StatusLiveUnavailable");
+                            }
+                            else
+                            {
+                                SetWarning("WarningLiveRetry", error.Message);
+                                SetStatus("StatusLiveRetry", delay.TotalSeconds);
+                            }
                         }
                     });
                 }

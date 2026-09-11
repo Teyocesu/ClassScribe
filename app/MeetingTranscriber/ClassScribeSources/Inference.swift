@@ -193,6 +193,7 @@ private final class CancellableTaskWaitBox<Value: Sendable>: @unchecked Sendable
 
 actor ParakeetService {
     private let modelLoad = AsyncSingleFlight<AsrManager>()
+    private let speechPresence = FluidAudioSpeechPresenceDetector()
     private let inferenceQueue = AsyncSerialExecutor()
     private(set) var downloadProgress = 0.0
     private struct VocabularyBooster {
@@ -206,6 +207,19 @@ actor ParakeetService {
 
     func loadIfNeeded() async throws {
         _ = try await loadedManager()
+    }
+
+    func prewarm() async throws {
+        do {
+            try await speechPresence.prewarm()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // VAD is an acceptance aid. If its model is unavailable, the
+            // existing Parakeet path must still be prepared and remain
+            // available under the common fail-open policy.
+        }
+        try await loadIfNeeded()
     }
 
     private func loadedManager() async throws -> AsrManager {
@@ -233,8 +247,18 @@ actor ParakeetService {
     func transcribe(
         samples: [Float],
         language: TranscriptionLanguage = .spanish,
+        speechEvidence: SpeechPresenceEvidence? = nil,
     ) async throws -> String {
         try Task.checkCancellation()
+        let evidence: SpeechPresenceEvidence?
+        if let speechEvidence {
+            evidence = speechEvidence
+        } else {
+            evidence = try await failOpenSpeechAnalysis {
+                try await self.speechPresence.analyze(samples: samples)
+            }
+        }
+        if let evidence, !evidence.hasVoice { return "" }
         let manager = try await loadedManager()
         try Task.checkCancellation()
         let result = try await inferenceQueue.run {
@@ -255,6 +279,10 @@ actor ParakeetService {
         language: TranscriptionLanguage = .spanish,
     ) async throws -> [TranscriptSegment] {
         try Task.checkCancellation()
+        let evidence = try await failOpenSpeechAnalysis {
+            try await self.speechPresence.analyze(file: file)
+        }
+        if let evidence, !evidence.hasVoice { return [] }
         let manager = try await loadedManager()
         try Task.checkCancellation()
         let result = try await inferenceQueue.run {
@@ -312,7 +340,21 @@ actor ParakeetService {
                 }
             }
         }
-        return segments
+        return SpeechPresenceAcceptancePolicy.filterSegments(segments, evidence: evidence)
+    }
+
+    private func failOpenSpeechAnalysis(
+        _ operation: @escaping @Sendable () async throws -> SpeechPresenceEvidence,
+    ) async throws -> SpeechPresenceEvidence? {
+        do {
+            return try await operation()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // A failed VAD must not suppress the ASR fallback or alter its
+            // segments. A nil result is the explicit fail-open state.
+            return nil
+        }
     }
 
     func configureVocabulary(file: URL?) async throws {

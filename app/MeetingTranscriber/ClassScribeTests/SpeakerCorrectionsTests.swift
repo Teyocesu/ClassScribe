@@ -332,7 +332,7 @@ func humanCorrectionOverlayRoundTripsThroughSessionStore() throws {
         .appendingPathComponent("ClassScribe.SpeakerCorrections.\(UUID().uuidString)")
     let store = SessionStore(root: root)
     defer { try? FileManager.default.removeItem(at: root) }
-    let folder = try store.createFolder("Correcciones")
+    let folder = try store.createFolder(subject: "Correcciones")
     let segment = correctionSegment("Texto", speakerID: correctionSpeakerA, start: 0, end: 1)
     let speaker = correctionSpeaker(correctionSpeakerA)
     let metadata = ClassMetadata(
