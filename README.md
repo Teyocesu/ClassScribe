@@ -14,7 +14,7 @@ La forma recomendada es abrir [GitHub Releases](https://github.com/Teyocesu/Clas
 - **macOS 14.2+ con Apple Silicon:** `ClassScribe-vX.Y.Z-arm64.dmg`. Ábrelo y arrastra ClassScribe a Aplicaciones.
 - Cada descarga incluye un `.sha256` para comprobar su integridad. Las builds actuales no tienen firma comercial: Windows SmartScreen o macOS Gatekeeper pueden pedir una confirmación adicional.
 
-El repositorio y sus Releases son privados; una persona autorizada puede descargar los instaladores y compartir los archivos sin entregar el código ni los datos de las clases.
+El repositorio y sus Releases son públicos; cualquier persona puede consultar el código y descargar los instaladores publicados.
 
 ## Privacidad
 
@@ -83,7 +83,7 @@ La app aparece como **ClassScribe** en Finder y Launchpad con el icono incluido 
 
 ## Distribución
 
-Las versiones para compartir se publican como assets de GitHub Releases en el repositorio privado. Un tag `vX.Y.Z` que coincida con `VERSION` compila, prueba y publica el DMG de macOS, el instalador de Windows, un ZIP portable y sus checksums. La guía está en [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md).
+Las versiones para compartir se publican como assets de GitHub Releases en el repositorio público. Un tag `vX.Y.Z` que coincida con `VERSION` compila, prueba y publica el DMG de macOS, el instalador de Windows, un ZIP portable y sus checksums. La guía está en [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md).
 
 ### Compilar el paquete de Windows
 
