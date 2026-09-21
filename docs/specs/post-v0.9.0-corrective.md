@@ -29,11 +29,10 @@ por inspección estática.
 
 ## Out of scope
 
-No incluye optimizaciones de Finalizar, cambiar proveedor/modelo ASR, cambiar
-el formato de persistencia, prewarm, circuit breaker general, supervisors no
-conectados, `Sources/` o `Tests/` legacy, cleanup general, release, merge o
-versión nueva. La semántica de full retranscription por gaps y la serialidad
-ASR→diarización de macOS se conservan.
+No incluye cambiar proveedor/modelo ASR, cambiar el formato de
+persistencia, prewarm, circuit breaker general, `Sources/` o `Tests/`
+legacy, cleanup general, release, merge o versión nueva. La semántica de
+full retranscription por gaps se conserva.
 
 ## Arquitectura y critical paths relevantes
 
@@ -49,17 +48,32 @@ ASR→diarización de macOS se conservan.
 - macOS finaliza en `ClassScribeModel.runFinalProcessing`; la instrumentación
   debe conservar timestamps monotónicos que permitan distinguir ASR final,
   VAD, diarización, atribución, post-procesamiento, persistencia y UI-ready.
+- Windows conserva overlap ASR/diarización con semántica
+  checkpoint/tail/full intacta.
+- macOS elimina la dependencia serial ASR→diarización mediante structured
+  concurrency (`async let` para ASR final y diarización con el audio ya
+  cerrado); speaker attribution espera ambos resultados y el transcript ASR
+  se persiste (estado `diarizing`, nunca `complete`) antes de esperar
+  speakers, para conservar la recuperación ante fallo de diarización.
+- La mejora de latencia macOS está inferida por eliminación de la
+  dependencia serial demostrada; no hay benchmarks cold/warm ni medición
+  física de runtime.
 
 ## Invariants
 
 1. Una corrección iniciada para A sólo persiste contra A; nunca publica estado
-   visual en B.
+   visual en B. La selección de profesor y el guardado de ediciones capturan
+   identidad (attempt, carpeta) antes de esperar el gate y son no-op si la
+   sesión visible ya no es la solicitada.
 2. Dos correcciones rápidas de una misma sesión tienen ordering determinista y
    ninguna lectura-modificación-escritura pierde la operación anterior.
 3. El snapshot autoritativo de attempt, sesión, carpeta, target y overlay se
    toma antes del primer `await`; cada `await` relevante revalida autoridad.
-4. Download/load/init/timeout/error de VAD no bloquean indefinidamente ASR ni
-   grabación, no crean loops de retry y preservan la cancelación del caller.
+4. Cada llamada pública de análisis VAD tiene UN presupuesto TOTAL máximo de
+   15 segundos compartido entre sus etapas; el reloj no se reinicia entre
+   resample, load e inferencia. Download/load/init/timeout/error de VAD no
+   bloquean indefinidamente ASR ni grabación, no crean loops de retry y
+   preservan la cancelación del caller.
 5. Los diagnostics son opt-in, monotónicos, locales y no contienen audio,
    transcript, paths ni otros datos sensibles innecesarios.
 6. Audio, transcript ASR original, metadata y correcciones humanas históricas
@@ -75,7 +89,7 @@ ASR→diarización de macOS se conservan.
 - Hay literales visibles hardcodeados en live/retry y caminos equivalentes.
 - Los diagnostics iniciales aún deben registrar explícitamente cobertura,
   motivo de invalidación, tail reutilizado y solapamiento Windows, además de
-  dejar visible la serialidad ASR→diarización de macOS.
+  dejar visible la concurrencia ASR/diarización de macOS.
 
 ## Acceptance criteria
 
@@ -89,8 +103,9 @@ ASR→diarización de macOS se conservan.
   nuevas claves mínimas con traducciones para los locales soportados.
 - Diagnostics off no ejecuta trabajo relevante; diagnostics on registra todos
   los hitos P0 solicitados sin contenido sensible.
-- La semántica de full retranscription por gap y ASR→diarización serial de
-  macOS no cambia.
+- La semántica de full retranscription por gap no cambia; Windows conserva
+  overlap ASR/diarización y macOS conserva atribución posterior a ambos
+  con persistencia temprana ASR sin marcar la sesión como completa.
 
 ## Estrategia de validación
 
