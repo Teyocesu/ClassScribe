@@ -82,6 +82,77 @@ public sealed class MainViewModelSpeakerCorrectionConcurrencyTests
         }
     }
 
+    [TestMethod]
+    public async Task professorSelectionWaitingOnGateDoesNotRetargetToOpenedSession()
+    {
+        var root = NewRoot();
+        var store = new BlockingSessionStore(root);
+        var model = NewModel(store);
+        try
+        {
+            var sessionA = await CreateSessionAsync(store, "Materia A", DateTimeOffset.UtcNow.AddMinutes(-2));
+            var sessionB = await CreateSessionAsync(store, "Materia B", DateTimeOffset.UtcNow.AddMinutes(-1));
+            await OpenSessionAsync(model, sessionA.Summary);
+
+            await model.ApplyProfessorSelectionAsync().ConfigureAwait(false);
+            Assert.IsTrue(File.Exists(Path.Combine(sessionA.Folder, "human-correction-overlay.json")));
+
+            model.SpeakerNameDraft = "Tarde";
+            store.BlockNextFinalSave();
+            var correction = model.RenameSelectedSpeakerAsync();
+            await store.SaveStarted.Task.ConfigureAwait(false);
+
+            var professorSelection = model.ApplyProfessorSelectionAsync();
+            await OpenSessionAsync(model, sessionB.Summary);
+            store.ClearSavedFolders();
+            store.ReleaseBlockedSave();
+            await Task.WhenAll(correction, professorSelection).ConfigureAwait(false);
+
+            Assert.IsFalse(store.SavedFolders.Contains(sessionB.Folder));
+            Assert.IsFalse(File.Exists(Path.Combine(sessionB.Folder, "human-correction-overlay.json")));
+        }
+        finally
+        {
+            await model.DisposeAsync();
+            DeleteFolder(root);
+        }
+    }
+
+    [TestMethod]
+    public async Task saveEditsWaitingOnGateDoesNotRetargetToOpenedSession()
+    {
+        var root = NewRoot();
+        var store = new BlockingSessionStore(root);
+        var model = NewModel(store);
+        try
+        {
+            var sessionA = await CreateSessionAsync(store, "Materia A", DateTimeOffset.UtcNow.AddMinutes(-2));
+            var sessionB = await CreateSessionAsync(store, "Materia B", DateTimeOffset.UtcNow.AddMinutes(-1));
+            await OpenSessionAsync(model, sessionA.Summary);
+
+            await model.SaveEditsAsync().ConfigureAwait(false);
+            Assert.IsTrue(store.SavedFolders.Contains(sessionA.Folder));
+
+            model.SpeakerNameDraft = "Tarde";
+            store.BlockNextFinalSave();
+            var correction = model.RenameSelectedSpeakerAsync();
+            await store.SaveStarted.Task.ConfigureAwait(false);
+
+            var save = model.SaveEditsAsync();
+            await OpenSessionAsync(model, sessionB.Summary);
+            store.ClearSavedFolders();
+            store.ReleaseBlockedSave();
+            await Task.WhenAll(correction, save).ConfigureAwait(false);
+
+            Assert.IsFalse(store.SavedFolders.Contains(sessionB.Folder));
+        }
+        finally
+        {
+            await model.DisposeAsync();
+            DeleteFolder(root);
+        }
+    }
+
     private static MainViewModel NewModel(SessionStore store) => new(
         store,
         new WindowsAudioCapture(),
@@ -169,10 +240,31 @@ public sealed class MainViewModelSpeakerCorrectionConcurrencyTests
 
     private sealed class BlockingSessionStore(string root) : SessionStore(root)
     {
+        private readonly object savedFoldersSync = new();
+        private readonly List<string> savedFolders = [];
         private int blockNextSave;
         private TaskCompletionSource<bool>? releaseSave;
 
         public TaskCompletionSource<bool> SaveStarted { get; private set; } = NewSignal();
+
+        public IReadOnlyList<string> SavedFolders
+        {
+            get
+            {
+                lock (savedFoldersSync)
+                {
+                    return savedFolders.ToArray();
+                }
+            }
+        }
+
+        public void ClearSavedFolders()
+        {
+            lock (savedFoldersSync)
+            {
+                savedFolders.Clear();
+            }
+        }
 
         public void BlockNextFinalSave()
         {
@@ -196,6 +288,11 @@ public sealed class MainViewModelSpeakerCorrectionConcurrencyTests
             DiarizationProposal? diarizationProposal = null,
             CancellationToken cancellationToken = default)
         {
+            lock (savedFoldersSync)
+            {
+                savedFolders.Add(folder);
+            }
+
             if (Interlocked.Exchange(ref blockNextSave, 0) == 1)
             {
                 SaveStarted.TrySetResult(true);

@@ -1163,9 +1163,22 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task ApplyProfessorSelectionAsync()
     {
+        var requestedAttempt = activeAttempt;
+        var requestedFolder = currentFolder;
+        if (requestedAttempt is null || requestedFolder is null)
+        {
+            return;
+        }
+
         await humanCorrectionGate.WaitAsync().ConfigureAwait(true);
         try
         {
+            if (!IsCurrent(requestedAttempt)
+                || !string.Equals(currentFolder, requestedFolder, StringComparison.Ordinal))
+            {
+                return;
+            }
+
             if (currentMetadata is null || currentFolder is null || segments.Count == 0)
             {
                 return;
@@ -1548,9 +1561,22 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task SaveEditsAsync()
     {
+        var requestedAttempt = activeAttempt;
+        var requestedFolder = currentFolder;
+        if (requestedAttempt is null || requestedFolder is null)
+        {
+            return;
+        }
+
         await humanCorrectionGate.WaitAsync().ConfigureAwait(true);
         try
         {
+            if (!IsCurrent(requestedAttempt)
+                || !string.Equals(currentFolder, requestedFolder, StringComparison.Ordinal))
+            {
+                return;
+            }
+
             if (currentMetadata is null || currentFolder is null)
             {
                 return;
