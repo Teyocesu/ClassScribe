@@ -17,6 +17,9 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     };
 
     private readonly SessionStore sessionStore;
+    private readonly SemaphoreSlim humanCorrectionGate = new(1, 1);
+    private readonly object pendingCorrectionSync = new();
+    private readonly List<SpeakerCorrectionSnapshot> pendingSpeakerCorrections = [];
     private readonly AppLocalization localization;
     private readonly LocalModelProvisioner modelProvisioner = new();
     private readonly WindowsAudioCapture audioCapture;
@@ -66,6 +69,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private bool isPaused;
     private bool liveWasEdited;
     private bool qualityCoverageHasGap;
+    private string? qualityCoverageInvalidReason;
     private bool isStopping;
     private bool settingLiveProgrammatically;
     private bool disposed;
@@ -461,8 +465,16 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task InitializeAsync()
     {
-        await RefreshHistoryAsync().ConfigureAwait(true);
-        await RefreshSourcesAsync().ConfigureAwait(true);
+        var startedAt = ProcessingDiagnostics.Mark("startup_view_model_start");
+        try
+        {
+            await RefreshHistoryAsync().ConfigureAwait(true);
+            await RefreshSourcesAsync().ConfigureAwait(true);
+        }
+        finally
+        {
+            ProcessingDiagnostics.Mark("startup_view_model_end", startedAt: startedAt);
+        }
     }
 
     public async Task RefreshSourcesAsync()
@@ -656,6 +668,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         automaticLiveText = string.Empty;
         liveWasEdited = false;
         qualityCoverageHasGap = false;
+        qualityCoverageInvalidReason = null;
         liveTranscribedThroughSeconds = 0;
         qualityTranscribedThroughSeconds = 0;
         SetLiveProgrammatically(string.Empty);
@@ -867,6 +880,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
+        var finalizationStartedAt = ProcessingDiagnostics.Mark("finalize_t0", attempt);
+
         var operation = BeginOperation();
         IsBusy = true;
         IsPaused = false;
@@ -884,7 +899,16 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            var wavePath = await audioCapture.StopAsync(CancellationToken.None).ConfigureAwait(true);
+            var captureStopStartedAt = ProcessingDiagnostics.Mark("capture_stop_start", attempt);
+            string wavePath;
+            try
+            {
+                wavePath = await audioCapture.StopAsync(CancellationToken.None).ConfigureAwait(true);
+            }
+            finally
+            {
+                ProcessingDiagnostics.Mark("capture_stop_end", attempt, captureStopStartedAt);
+            }
             UnregisterCaptureCallbacks(attempt);
             if (!IsCurrent(attempt))
             {
@@ -897,6 +921,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 WarningText = captureWarning;
             }
             var duration = PcmWaveFile.Validate(wavePath);
+            ProcessingDiagnostics.Mark("audio_available", attempt, finalizationStartedAt);
             if (currentMetadata is null || currentFolder is null)
             {
                 throw new InvalidOperationException("La sesión activa perdió sus metadatos.");
@@ -936,7 +961,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                         qualitySegments.ToArray(),
                         qualityTranscribedThroughSeconds,
                         qualityCoverageHasGap,
-                        processingCancellation.Token)
+                        processingCancellation.Token,
+                        finalizationStartedAt)
                     .ConfigureAwait(true);
                 if (!IsCurrent(attempt))
                 {
@@ -1069,6 +1095,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         currentMetadata = currentMetadata with { AttemptID = attempt };
         asrOriginalReference = null;
         activeDiarizationProposal = null;
+        qualityCoverageHasGap = true;
+        qualityCoverageInvalidReason = "missing_checkpoint";
         IsBusy = true;
         WarningText = string.Empty;
         processingCancellation = new CancellationTokenSource();
@@ -1135,73 +1163,94 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task ApplyProfessorSelectionAsync()
     {
-        if (currentMetadata is null || currentFolder is null || segments.Count == 0)
+        var requestedAttempt = activeAttempt;
+        var requestedFolder = currentFolder;
+        if (requestedAttempt is null || requestedFolder is null)
         {
             return;
         }
 
-        var attempt = activeAttempt;
-        if (!IsCurrent(attempt))
+        await humanCorrectionGate.WaitAsync().ConfigureAwait(true);
+        try
         {
-            return;
-        }
+            if (!IsCurrent(requestedAttempt)
+                || !string.Equals(currentFolder, requestedFolder, StringComparison.Ordinal))
+            {
+                return;
+            }
 
-        var metadata = currentMetadata;
-        var folder = currentFolder;
-        var allSegments = segments.ToArray();
-        var review = ReviewRows.Select(static row => row.ToModel()).ToArray();
-        var selectedProfessorID = SelectedProfessor?.Id;
-        var professor = SpeakerAssignment.ProfessorSegments(
-            allSegments,
-            selectedProfessorID,
-            review);
-        ProfessorText = TranscriptExporter.PlainText(professor, Speakers.Select(static speaker => speaker.Model).ToArray());
-        metadata = metadata with
-        {
-            ProfessorSpeakerID = selectedProfessorID,
-            ProfessorSelectionIsAutomatic = false,
-            State = ProcessingState.Complete,
-            SessionPhase = ClassScribe.Core.SessionPhase.Complete,
-            CapturePhase = ClassScribe.Core.CapturePhase.Idle,
-            AsrPhase = ClassScribe.Core.AsrPhase.Idle,
-        };
-        var professorOperation = new SpeakerCorrectionOperation
-        {
-            Id = Guid.NewGuid(),
-            Kind = SpeakerCorrectionKind.ProfessorConfirmation,
-            SpeakerID = selectedProfessorID,
-            SegmentIDs = [],
-            CreatedAt = DateTimeOffset.UtcNow,
-        };
-        var humanCorrection = new HumanCorrectionUpdate
-        {
-            Operations = new[] { professorOperation }
-                .Concat(CreateReviewCorrectionOperations())
-                .ToArray(),
-            ClearProfessorText = true,
-        };
-        var speakers = Speakers.Select(static speaker => speaker.Model).ToArray();
-        var diarizationProposal = activeDiarizationProposal;
-        await sessionStore.SaveFinalAsync(
-                metadata,
+            if (currentMetadata is null || currentFolder is null || segments.Count == 0)
+            {
+                return;
+            }
+
+            var attempt = activeAttempt;
+            if (!IsCurrent(attempt))
+            {
+                return;
+            }
+
+            var metadata = currentMetadata;
+            var folder = currentFolder;
+            var allSegments = segments.ToArray();
+            var review = ReviewRows.Select(static row => row.ToModel()).ToArray();
+            var selectedProfessorID = SelectedProfessor?.Id;
+            var professor = SpeakerAssignment.ProfessorSegments(
                 allSegments,
-                professor,
-                review,
-                speakers,
-                folder,
-                humanCorrection: humanCorrection,
-                diarizationProposal: diarizationProposal)
-            .ConfigureAwait(true);
-        if (!IsCurrent(attempt))
-        {
-            return;
+                selectedProfessorID,
+                review);
+            ProfessorText = TranscriptExporter.PlainText(professor, Speakers.Select(static speaker => speaker.Model).ToArray());
+            metadata = metadata with
+            {
+                ProfessorSpeakerID = selectedProfessorID,
+                ProfessorSelectionIsAutomatic = false,
+                State = ProcessingState.Complete,
+                SessionPhase = ClassScribe.Core.SessionPhase.Complete,
+                CapturePhase = ClassScribe.Core.CapturePhase.Idle,
+                AsrPhase = ClassScribe.Core.AsrPhase.Idle,
+            };
+            var professorOperation = new SpeakerCorrectionOperation
+            {
+                Id = Guid.NewGuid(),
+                Kind = SpeakerCorrectionKind.ProfessorConfirmation,
+                SpeakerID = selectedProfessorID,
+                SegmentIDs = [],
+                CreatedAt = DateTimeOffset.UtcNow,
+            };
+            var humanCorrection = new HumanCorrectionUpdate
+            {
+                Operations = new[] { professorOperation }
+                    .Concat(CreateReviewCorrectionOperations(review))
+                    .ToArray(),
+                ClearProfessorText = true,
+            };
+            var speakers = Speakers.Select(static speaker => speaker.Model).ToArray();
+            var diarizationProposal = activeDiarizationProposal;
+            await sessionStore.SaveFinalAsync(
+                    metadata,
+                    allSegments,
+                    professor,
+                    review,
+                    speakers,
+                    folder,
+                    humanCorrection: humanCorrection,
+                    diarizationProposal: diarizationProposal)
+                .ConfigureAwait(true);
+            if (!IsCurrent(attempt) || !string.Equals(currentFolder, folder, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            currentMetadata = metadata;
+            RememberHumanCorrection(humanCorrection);
+            ApplyActiveHumanCorrectionText();
+
+            SetStatus("StatusProfessorSaved");
         }
-
-        currentMetadata = metadata;
-        RememberHumanCorrection(humanCorrection);
-        ApplyActiveHumanCorrectionText();
-
-        SetStatus("StatusProfessorSaved");
+        finally
+        {
+            humanCorrectionGate.Release();
+        }
     }
 
     public async Task RenameSelectedSpeakerAsync()
@@ -1300,92 +1349,161 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     private async Task ApplySpeakerCorrectionAsync(SpeakerCorrectionOperation operation)
     {
-        if (currentMetadata is null || currentFolder is null || segments.Count == 0)
+        var snapshot = CaptureSpeakerCorrection(operation);
+        if (snapshot is null)
         {
             return;
         }
 
+        await humanCorrectionGate.WaitAsync().ConfigureAwait(true);
+        try
+        {
+            await sessionStore.SaveFinalAsync(
+                    snapshot.Metadata,
+                    snapshot.Result.Segments,
+                    snapshot.Professor,
+                    snapshot.Result.Review,
+                    snapshot.Result.Speakers,
+                    snapshot.Folder,
+                    humanCorrection: snapshot.HumanCorrection,
+                    diarizationProposal: snapshot.DiarizationProposal)
+                .ConfigureAwait(true);
+            if (!IsCurrent(snapshot.Attempt)
+                || !string.Equals(currentFolder, snapshot.Folder, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            currentMetadata = snapshot.Metadata;
+            activeHumanCorrectionOverlay = snapshot.Overlay;
+            segments.Clear();
+            segments.AddRange(snapshot.Result.Segments);
+            Speakers.Clear();
+            foreach (var speaker in snapshot.Result.Speakers)
+            {
+                Speakers.Add(new SpeakerChoice(speaker, localization));
+            }
+
+            ReviewRows.Clear();
+            foreach (var item in snapshot.Result.Review)
+            {
+                ReviewRows.Add(CreateReviewRow(item));
+            }
+
+            SelectedProfessor = Speakers.FirstOrDefault(speaker =>
+                speaker.Id == snapshot.Result.ProfessorSpeakerID);
+            SelectedSpeaker = SelectedProfessor ?? Speakers.FirstOrDefault();
+            SelectedMergeTarget = MergeTargets.Count > 0 ? MergeTargets[0] : null;
+            AllText = TranscriptExporter.PlainText(snapshot.Result.Segments, snapshot.Result.Speakers);
+            ProfessorText = TranscriptExporter.PlainText(snapshot.Professor, snapshot.Result.Speakers);
+            RefreshSplitBoundaries();
+            SetStatus("StatusSpeakerCorrectionsSaved");
+            await RefreshHistoryAsync(snapshot.Attempt).ConfigureAwait(true);
+            if (!IsCurrent(snapshot.Attempt)
+                || !string.Equals(currentFolder, snapshot.Folder, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            NotifyCorrectionAvailability();
+        }
+        finally
+        {
+            lock (pendingCorrectionSync)
+            {
+                pendingSpeakerCorrections.Remove(snapshot);
+            }
+            humanCorrectionGate.Release();
+        }
+    }
+
+    private SpeakerCorrectionSnapshot? CaptureSpeakerCorrection(SpeakerCorrectionOperation operation)
+    {
+        if (currentMetadata is null || currentFolder is null || segments.Count == 0)
+        {
+            return null;
+        }
+
+        var attempt = activeAttempt;
+        if (attempt is not { } activeAttemptID || !IsCurrent(activeAttemptID))
+        {
+            return null;
+        }
+
+        var metadataSnapshot = currentMetadata;
+        var folderSnapshot = currentFolder;
+        var allSegmentsSnapshot = segments.ToArray();
+        var speakersSnapshot = Speakers.Select(static speaker => speaker.Model).ToArray();
+        var reviewSnapshot = ReviewRows.Select(static row => row.ToModel()).ToArray();
+        var selectedProfessorID = SelectedProfessor?.Id ?? metadataSnapshot.ProfessorSpeakerID;
         var existingOverlay = activeHumanCorrectionOverlay ?? new HumanCorrectionOverlay();
+        SpeakerCorrectionOperation[] pendingOperations;
+        lock (pendingCorrectionSync)
+        {
+            pendingOperations = pendingSpeakerCorrections
+                .Where(pending => pending.Attempt == activeAttemptID
+                    && string.Equals(pending.Folder, folderSnapshot, StringComparison.Ordinal))
+                .Select(pending => pending.Operation)
+                .Where(pending => existingOverlay.Operations.All(existing => existing.Id != pending.Id))
+                .ToArray();
+        }
+
         var overlay = existingOverlay with
         {
             Operations = existingOverlay.Operations
+                .Concat(pendingOperations)
                 .Concat([operation])
                 .ToArray(),
         };
         var result = SpeakerCorrectionProjection.Apply(
-            segments,
-            Speakers.Select(static speaker => speaker.Model).ToArray(),
-            ReviewRows.Select(static row => row.ToModel()).ToArray(),
-            SelectedProfessor?.Id ?? currentMetadata.ProfessorSpeakerID,
-            currentMetadata.ProfessorSelectionIsAutomatic,
+            allSegmentsSnapshot,
+            speakersSnapshot,
+            reviewSnapshot,
+            selectedProfessorID,
+            metadataSnapshot.ProfessorSelectionIsAutomatic,
             overlay);
         if (result.UnresolvedOperationIDs.Contains(operation.Id))
         {
             SetWarning("WarningSpeakerCorrectionUnresolved");
-            return;
+            return null;
         }
 
         var professor = SpeakerAssignment.ProfessorSegments(
             result.Segments,
             result.ProfessorSpeakerID,
             result.Review);
-        var metadata = currentMetadata with
+        var metadata = metadataSnapshot with
         {
             SpeakerCount = result.Speakers.Count,
             ProfessorSpeakerID = result.ProfessorSpeakerID,
             ProfessorSelectionIsAutomatic = result.ProfessorSelectionIsAutomatic,
-            HumanCorrectionOverlayReference = currentMetadata.HumanCorrectionOverlayReference
+            HumanCorrectionOverlayReference = metadataSnapshot.HumanCorrectionOverlayReference
                 ?? new HumanCorrectionOverlayReference { RelativePath = "human-correction-overlay.json" },
         };
         var update = new HumanCorrectionUpdate
         {
-            Operations = new[] { operation }
-                .Concat(CreateReviewCorrectionOperations())
+            Operations = overlay.Operations
+                .Concat(CreateReviewCorrectionOperations(reviewSnapshot))
                 .ToArray(),
             ClearAllText = true,
             ClearProfessorText = true,
         };
-        await sessionStore.SaveFinalAsync(
-                metadata,
-                result.Segments,
-                professor,
-                result.Review,
-                result.Speakers,
-                currentFolder,
-                humanCorrection: update,
-                diarizationProposal: activeDiarizationProposal)
-            .ConfigureAwait(true);
-        if (!IsCurrent(activeAttempt))
+        var snapshot = new SpeakerCorrectionSnapshot(
+            activeAttemptID,
+            folderSnapshot,
+            metadata,
+            result,
+            professor,
+            update,
+            activeDiarizationProposal,
+            overlay,
+            operation);
+        lock (pendingCorrectionSync)
         {
-            return;
+            pendingSpeakerCorrections.Add(snapshot);
         }
 
-        currentMetadata = metadata;
-        activeHumanCorrectionOverlay = overlay;
-        segments.Clear();
-        segments.AddRange(result.Segments);
-        Speakers.Clear();
-        foreach (var speaker in result.Speakers)
-        {
-            Speakers.Add(new SpeakerChoice(speaker, localization));
-        }
-
-        ReviewRows.Clear();
-        foreach (var item in result.Review)
-        {
-            ReviewRows.Add(CreateReviewRow(item));
-        }
-
-        SelectedProfessor = Speakers.FirstOrDefault(speaker =>
-            speaker.Id == result.ProfessorSpeakerID);
-        SelectedSpeaker = SelectedProfessor ?? Speakers.FirstOrDefault();
-        SelectedMergeTarget = MergeTargets.Count > 0 ? MergeTargets[0] : null;
-        AllText = TranscriptExporter.PlainText(result.Segments, result.Speakers);
-        ProfessorText = TranscriptExporter.PlainText(professor, result.Speakers);
-        RefreshSplitBoundaries();
-        SetStatus("StatusSpeakerCorrectionsSaved");
-        await RefreshHistoryAsync(activeAttempt).ConfigureAwait(true);
-        NotifyCorrectionAvailability();
+        return snapshot;
     }
 
     private void RefreshSplitBoundaries()
@@ -1422,10 +1540,11 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             localization,
             Speakers.FirstOrDefault(speaker => speaker.Id == item.Segment.SpeakerID)?.Model.DisplayName);
 
-    private SpeakerCorrectionOperation[] CreateReviewCorrectionOperations() =>
-        ReviewRows.Select(row =>
+    private static SpeakerCorrectionOperation[] CreateReviewCorrectionOperations(
+        IReadOnlyList<ReviewItem> review) =>
+        review.Select(item =>
         {
-            var segment = row.Item.Segment;
+            var segment = item.Segment;
             return new SpeakerCorrectionOperation
             {
                 Id = Guid.NewGuid(),
@@ -1435,76 +1554,96 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 AnchorStart = segment.Start,
                 AnchorEnd = segment.End,
                 AnchorText = segment.Text,
-                IsActive = row.IncludeForProfessor,
+                IsActive = item.ManuallyAssignedToProfessor,
                 CreatedAt = DateTimeOffset.UtcNow,
             };
         }).ToArray();
 
     public async Task SaveEditsAsync()
     {
-        if (currentMetadata is null || currentFolder is null)
+        var requestedAttempt = activeAttempt;
+        var requestedFolder = currentFolder;
+        if (requestedAttempt is null || requestedFolder is null)
         {
             return;
         }
 
-        var attempt = activeAttempt;
-        if (!IsCurrent(attempt))
+        await humanCorrectionGate.WaitAsync().ConfigureAwait(true);
+        try
         {
-            return;
-        }
+            if (!IsCurrent(requestedAttempt)
+                || !string.Equals(currentFolder, requestedFolder, StringComparison.Ordinal))
+            {
+                return;
+            }
 
-        var metadata = currentMetadata;
-        var folder = currentFolder;
-        var humanCorrection = new HumanCorrectionUpdate
-        {
-            AllText = AllText,
-            ProfessorText = ProfessorText,
-            Operations = CreateReviewCorrectionOperations(),
-        };
+            if (currentMetadata is null || currentFolder is null)
+            {
+                return;
+            }
 
-        if (segments.Count == 0)
-        {
-            await sessionStore.SaveEditedDocumentsAsync(
-                    metadata,
-                    folder,
-                    humanCorrection.AllText!,
-                    humanCorrection.ProfessorText!)
-                .ConfigureAwait(true);
+            var attempt = activeAttempt;
             if (!IsCurrent(attempt))
             {
                 return;
             }
-        }
-        else
-        {
-            var allSegments = segments.ToArray();
+
+            var metadata = currentMetadata;
+            var folder = currentFolder;
+            var allText = AllText;
+            var professorText = ProfessorText;
             var review = ReviewRows.Select(static row => row.ToModel()).ToArray();
-            var selectedProfessorID = SelectedProfessor?.Id ?? metadata.ProfessorSpeakerID;
-            var professor = SpeakerAssignment.ProfessorSegments(
-                allSegments,
-                selectedProfessorID,
-                review);
-            var speakers = Speakers.Select(static speaker => speaker.Model).ToArray();
-            var diarizationProposal = activeDiarizationProposal;
-            await sessionStore.SaveFinalAsync(
-                    metadata,
+            var humanCorrection = new HumanCorrectionUpdate
+            {
+                AllText = allText,
+                ProfessorText = professorText,
+                Operations = CreateReviewCorrectionOperations(review),
+            };
+
+            if (segments.Count == 0)
+            {
+                await sessionStore.SaveEditedDocumentsAsync(
+                        metadata,
+                        folder,
+                        humanCorrection.AllText!,
+                        humanCorrection.ProfessorText!)
+                    .ConfigureAwait(true);
+            }
+            else
+            {
+                var allSegments = segments.ToArray();
+                var selectedProfessorID = SelectedProfessor?.Id ?? metadata.ProfessorSpeakerID;
+                var professor = SpeakerAssignment.ProfessorSegments(
                     allSegments,
-                    professor,
-                    review,
-                    speakers,
-                    folder,
-                    humanCorrection: humanCorrection,
-                    diarizationProposal: diarizationProposal)
-                .ConfigureAwait(true);
-            if (!IsCurrent(attempt))
+                    selectedProfessorID,
+                    review);
+                var speakers = Speakers.Select(static speaker => speaker.Model).ToArray();
+                var diarizationProposal = activeDiarizationProposal;
+                await sessionStore.SaveFinalAsync(
+                        metadata,
+                        allSegments,
+                        professor,
+                        review,
+                        speakers,
+                        folder,
+                        humanCorrection: humanCorrection,
+                        diarizationProposal: diarizationProposal)
+                    .ConfigureAwait(true);
+            }
+
+            if (!IsCurrent(attempt) || !string.Equals(currentFolder, folder, StringComparison.Ordinal))
             {
                 return;
             }
-        }
 
-        RememberHumanCorrection(humanCorrection);
-        SetStatus("StatusEditsSaved");
-        await RefreshHistoryAsync(attempt).ConfigureAwait(true);
+            RememberHumanCorrection(humanCorrection);
+            SetStatus("StatusEditsSaved");
+            await RefreshHistoryAsync(attempt).ConfigureAwait(true);
+        }
+        finally
+        {
+            humanCorrectionGate.Release();
+        }
     }
 
     public string ChatEnvelope() => currentMetadata is null
@@ -1541,6 +1680,9 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             await operation.ConfigureAwait(false);
         }
         await StopBackgroundLoopsAsync().ConfigureAwait(false);
+        await humanCorrectionGate.WaitAsync().ConfigureAwait(false);
+        humanCorrectionGate.Release();
+        humanCorrectionGate.Dispose();
         UnregisterCaptureCallbacks();
         activeAttempt = null;
         await audioCapture.DisposeAsync().ConfigureAwait(false);
@@ -1708,14 +1850,23 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
                         var sessionVocabulary = currentMetadata?.TechnicalVocabulary ?? string.Empty;
                         var sessionLanguage = NormalizeLanguage(currentMetadata?.Language);
-                        var provisional = await transcriber.TranscribePcmAsync(
-                                pcm,
-                                sessionVocabulary,
-                                sessionLanguage,
-                                offset,
-                                progress: null,
-                            cancellationToken)
-                            .ConfigureAwait(false);
+                        var liveAsrStartedAt = ProcessingDiagnostics.Mark("asr_live_start", attempt);
+                        IReadOnlyList<TranscriptSegment> provisional;
+                        try
+                        {
+                            provisional = await transcriber.TranscribePcmAsync(
+                                    pcm,
+                                    sessionVocabulary,
+                                    sessionLanguage,
+                                    offset,
+                                    progress: null,
+                                cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            ProcessingDiagnostics.Mark("asr_live_end", attempt, liveAsrStartedAt);
+                        }
                         if (!IsCurrent(attempt))
                         {
                             break;
@@ -1781,8 +1932,8 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                         if (IsCurrent(attempt)
                             && !IsTerminalCaptureFaultPresentationActive)
                         {
-                            WarningText = $"El texto en vivo se reintentará: {error.Message}";
-                            StatusText = "El audio sigue grabándose de forma segura";
+                            SetWarning("WarningLiveRetry", error.Message);
+                            SetStatus("StatusLiveModelRetry");
                         }
                     });
                 }
@@ -1798,8 +1949,18 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var pendingDuration = Math.Max(0, duration - qualityTranscribedThroughSeconds);
-        if (qualityCoverageHasGap || pendingDuration < QualityCheckpointSeconds)
+        if (qualityCoverageHasGap)
         {
+            ProcessingDiagnostics.Mark(
+                "checkpoint_coverage_invalid",
+                attempt,
+                detail: qualityCoverageInvalidReason ?? "other");
+            return;
+        }
+
+        if (pendingDuration < QualityCheckpointSeconds)
+        {
+            ProcessingDiagnostics.Mark("checkpoint_coverage_pending", attempt, detail: "interval_not_reached");
             return;
         }
 
@@ -1809,18 +1970,39 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         if (pcm.Length < PcmWaveFile.SampleRate * 2 || missingDuration > 1)
         {
             qualityCoverageHasGap = true;
+            qualityCoverageInvalidReason = missingDuration > 1
+                ? "gap"
+                : pcm.Length == 0
+                    ? "missing_checkpoint"
+                    : "other";
+            ProcessingDiagnostics.Mark(
+                "checkpoint_coverage_invalid",
+                attempt,
+                detail: qualityCoverageInvalidReason);
             return;
         }
 
         var offset = qualityTranscribedThroughSeconds;
-        var checkpoint = await transcriber.TranscribePcmAsync(
-                pcm,
-                currentMetadata?.TechnicalVocabulary ?? string.Empty,
-                NormalizeLanguage(currentMetadata?.Language),
-                offset,
-                progress: null,
-                cancellationToken)
-            .ConfigureAwait(false);
+        var checkpointStartedAt = ProcessingDiagnostics.Mark("asr_quality_checkpoint_start", attempt);
+        IReadOnlyList<TranscriptSegment> checkpoint;
+        try
+        {
+            checkpoint = await transcriber.TranscribePcmAsync(
+                    pcm,
+                    currentMetadata?.TechnicalVocabulary ?? string.Empty,
+                    NormalizeLanguage(currentMetadata?.Language),
+                    offset,
+                    progress: null,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            ProcessingDiagnostics.Mark(
+                "asr_quality_checkpoint_end",
+                attempt,
+                checkpointStartedAt);
+        }
         if (!IsCurrent(attempt))
         {
             return;
@@ -1828,17 +2010,28 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         qualitySegments.AddRange(checkpoint);
         qualityTranscribedThroughSeconds = offset + pcmDuration;
+        ProcessingDiagnostics.Mark("checkpoint_coverage_valid", attempt, detail: "captured_window");
     }
 
-    private Task ProcessWaveAsync(string wavePath, CancellationToken cancellationToken) =>
-        ProcessWaveAsync(wavePath, [], 0, qualityCoverageHasGap: true, cancellationToken);
+    private Task ProcessWaveAsync(
+        string wavePath,
+        CancellationToken cancellationToken,
+        long? finalizationStartedAt = null) =>
+        ProcessWaveAsync(
+            wavePath,
+            [],
+            0,
+            qualityCoverageHasGap: true,
+            cancellationToken,
+            finalizationStartedAt);
 
     private async Task ProcessWaveAsync(
         string wavePath,
         TranscriptSegment[] reusableQualitySegments,
         double transcribedThroughSeconds,
         bool qualityCoverageHasGap,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        long? finalizationStartedAt = null)
     {
         Interlocked.Increment(ref finalProcessingInvocationCountForTest);
         if (currentMetadata is null || currentFolder is null)
@@ -1850,6 +2043,42 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         if (!IsCurrent(attempt))
         {
             return;
+        }
+
+        var diagnosticsStartedAt = finalizationStartedAt
+            ?? ProcessingDiagnostics.Mark("finalize_t0", attempt);
+        ProcessingDiagnostics.Mark("final_processing_start", attempt, diagnosticsStartedAt);
+
+        var audioDuration = PcmWaveFile.Validate(wavePath);
+        var coverageRangeIsValid = double.IsFinite(transcribedThroughSeconds)
+            && transcribedThroughSeconds >= 0
+            && transcribedThroughSeconds <= audioDuration;
+        var canReuseQuality = reusableQualitySegments.Length > 0
+            && !qualityCoverageHasGap
+            && coverageRangeIsValid;
+        if (ProcessingDiagnostics.IsEnabled)
+        {
+            ProcessingDiagnostics.Mark(
+                "audio_duration",
+                attempt,
+                detail: $"seconds={audioDuration:F3}");
+            var coverageReason = !coverageRangeIsValid
+                ? "range_invalid"
+                : qualityCoverageHasGap
+                    ? qualityCoverageInvalidReason ?? "other"
+                    : reusableQualitySegments.Length == 0
+                        ? "missing_checkpoint"
+                        : null;
+            ProcessingDiagnostics.Mark(
+                "checkpoint_coverage_summary",
+                attempt,
+                detail: canReuseQuality
+                    ? $"valid reused_seconds={transcribedThroughSeconds:F3}"
+                    : $"invalid reason={coverageReason ?? "other"}");
+            ProcessingDiagnostics.Mark(
+                "checkpoint_coverage_reused",
+                attempt,
+                detail: $"seconds={(canReuseQuality ? transcribedThroughSeconds : 0):F3}");
         }
 
         currentMetadata = currentMetadata with
@@ -1872,20 +2101,90 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             value => UpdateModelProgress(value, attempt));
         using var diarizationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken);
+        var diarizationStartedAt = ProcessingDiagnostics.Mark("diarization_start", attempt);
         var diarizationTask = PrepareDiarizationAsync(
             wavePath,
             progress,
+            attempt,
             diarizationCancellation.Token);
+        var diarizationEndedAt = 0L;
+        var finalAsrEvent = canReuseQuality
+            ? "asr_final_incremental"
+            : "asr_final_full";
+        var finalAsrStartedAt = ProcessingDiagnostics.Mark($"{finalAsrEvent}_start", attempt);
+        var finalAsrEndedAt = 0L;
+        var overlapLogged = false;
+        var diagnosticsSynchronization = new object();
+
+        void MarkAsrDiarizationOverlapIfReady()
+        {
+            if (!ProcessingDiagnostics.IsEnabled)
+            {
+                return;
+            }
+
+            lock (diagnosticsSynchronization)
+            {
+                if (overlapLogged
+                    || diarizationEndedAt == 0
+                    || finalAsrEndedAt == 0)
+                {
+                    return;
+                }
+
+                var overlapStart = Math.Max(diarizationStartedAt, finalAsrStartedAt);
+                var overlapEnd = Math.Min(diarizationEndedAt, finalAsrEndedAt);
+                var overlapMilliseconds = overlapEnd > overlapStart
+                    ? ProcessingDiagnostics.ElapsedMilliseconds(overlapStart, overlapEnd)
+                    : 0;
+                ProcessingDiagnostics.Mark(
+                    "asr_diarization_overlap",
+                    attempt,
+                    detail: $"milliseconds={overlapMilliseconds:F1}");
+                overlapLogged = true;
+            }
+        }
+
+        void MarkDiarizationEnd()
+        {
+            if (!ProcessingDiagnostics.IsEnabled)
+            {
+                return;
+            }
+
+            lock (diagnosticsSynchronization)
+            {
+                if (diarizationEndedAt != 0)
+                {
+                    return;
+                }
+
+                diarizationEndedAt = ProcessingDiagnostics.Mark(
+                    "diarization_end",
+                    attempt,
+                    diarizationStartedAt);
+            }
+            MarkAsrDiarizationOverlapIfReady();
+        }
+
+        if (ProcessingDiagnostics.IsEnabled)
+        {
+            _ = diarizationTask.ContinueWith(
+                _ => MarkDiarizationEnd(),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
         IReadOnlyList<TranscriptSegment> finalSegments;
         try
         {
-            if (reusableQualitySegments.Length > 0 && !qualityCoverageHasGap)
+            if (canReuseQuality)
             {
                 const double tailOverlapSeconds = 1.5;
-                var duration = PcmWaveFile.Validate(wavePath);
                 var tailStart = Math.Max(
                     0,
-                    Math.Min(duration, transcribedThroughSeconds) - tailOverlapSeconds);
+                    Math.Min(audioDuration, transcribedThroughSeconds) - tailOverlapSeconds);
                 var tailPcm = await PcmWaveFile.ReadPcmTailAsync(
                         wavePath,
                         tailStart,
@@ -1907,6 +2206,14 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
                     .OrderBy(static segment => segment.Start)
                     .Select(static segment => segment with { Provisional = false })
                     .ToArray();
+                if (ProcessingDiagnostics.IsEnabled)
+                {
+                    var tailDuration = tailPcm.Length / (PcmWaveFile.SampleRate * 2d);
+                    ProcessingDiagnostics.Mark(
+                        "asr_final_incremental_tail",
+                        attempt,
+                        detail: $"seconds={tailDuration:F3}");
+                }
             }
             else
             {
@@ -1923,7 +2230,19 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             diarizationCancellation.Cancel();
             await ObserveFailureAsync(diarizationTask).ConfigureAwait(true);
+            MarkDiarizationEnd();
             throw;
+        }
+        finally
+        {
+            lock (diagnosticsSynchronization)
+            {
+                finalAsrEndedAt = ProcessingDiagnostics.Mark(
+                    $"{finalAsrEvent}_end",
+                    attempt,
+                    finalAsrStartedAt);
+            }
+            MarkAsrDiarizationOverlapIfReady();
         }
         if (!IsCurrent(attempt))
         {
@@ -1992,14 +2311,35 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         try
         {
             SetStatus("StatusFinalizingSpeakers");
-            var spans = await diarizationTask.ConfigureAwait(true);
+            IReadOnlyList<DiarizationSpan> spans;
+            try
+            {
+                spans = await diarizationTask.ConfigureAwait(true);
+            }
+            finally
+            {
+                MarkDiarizationEnd();
+            }
             if (!IsCurrent(attempt))
             {
                 return;
             }
 
-            (assigned, review) = SpeakerAssignment.Assign(segments, spans);
-            speakers = SpeakerAssignment.BuildSpeakers(assigned);
+            var speakerAttributionStartedAt = ProcessingDiagnostics.Mark(
+                "speaker_attribution_start",
+                attempt);
+            try
+            {
+                (assigned, review) = SpeakerAssignment.Assign(segments, spans);
+                speakers = SpeakerAssignment.BuildSpeakers(assigned);
+            }
+            finally
+            {
+                ProcessingDiagnostics.Mark(
+                    "speaker_attribution_end",
+                    attempt,
+                    speakerAttributionStartedAt);
+            }
             activeDiarizationProposal = new DiarizationProposal
             {
                 ProposalID = Guid.NewGuid(),
@@ -2011,17 +2351,32 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
+            MarkDiarizationEnd();
             throw;
         }
         catch (Exception error) when (error is not OutOfMemoryException)
         {
+            MarkDiarizationEnd();
             if (!IsCurrent(attempt))
             {
                 return;
             }
 
             diarizationWarning = error.Message;
-            (assigned, review) = SpeakerAssignment.Assign(segments, []);
+            var fallbackAttributionStartedAt = ProcessingDiagnostics.Mark(
+                "speaker_attribution_fallback_start",
+                attempt);
+            try
+            {
+                (assigned, review) = SpeakerAssignment.Assign(segments, []);
+            }
+            finally
+            {
+                ProcessingDiagnostics.Mark(
+                    "speaker_attribution_fallback_end",
+                    attempt,
+                    fallbackAttributionStartedAt);
+            }
         }
 
         if (!IsCurrent(attempt))
@@ -2029,6 +2384,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
+        var postProcessingStartedAt = ProcessingDiagnostics.Mark("post_processing_start", attempt);
         segments.Clear();
         segments.AddRange(assigned);
         var automaticProfessorID = humanProfessorSelection
@@ -2066,6 +2422,7 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
         SelectedSpeaker = Speakers.FirstOrDefault();
         SelectedMergeTarget = MergeTargets.Count > 0 ? MergeTargets[0] : null;
         SelectedReviewRow = ReviewRows.FirstOrDefault();
+        ProcessingDiagnostics.Mark("post_processing_end", attempt, postProcessingStartedAt);
         currentMetadata = currentMetadata with
         {
             State = ProcessingState.Complete,
@@ -2076,18 +2433,29 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             ProfessorSpeakerID = professorId,
             ProfessorSelectionIsAutomatic = correctionProjection.ProfessorSelectionIsAutomatic,
         };
-        await sessionStore.SaveAutomaticProjectionAsync(
-                currentMetadata,
-                segments,
-                professor,
-                review,
-                speakers,
-                currentFolder,
-                automaticAllText: AllText,
-                automaticProfessorText: ProfessorText,
-                cancellationToken: CancellationToken.None,
-                diarizationProposal: activeDiarizationProposal)
-            .ConfigureAwait(true);
+        var finalPersistenceStartedAt = ProcessingDiagnostics.Mark("persistence_final_start", attempt);
+        try
+        {
+            await sessionStore.SaveAutomaticProjectionAsync(
+                    currentMetadata,
+                    segments,
+                    professor,
+                    review,
+                    speakers,
+                    currentFolder,
+                    automaticAllText: AllText,
+                    automaticProfessorText: ProfessorText,
+                    cancellationToken: CancellationToken.None,
+                    diarizationProposal: activeDiarizationProposal)
+                .ConfigureAwait(true);
+        }
+        finally
+        {
+            ProcessingDiagnostics.Mark(
+                "persistence_final_end",
+                attempt,
+                finalPersistenceStartedAt);
+        }
         if (!IsCurrent(attempt))
         {
             return;
@@ -2114,8 +2482,10 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
             SetStatus("StatusFinalReady");
         }
 
+        ProcessingDiagnostics.Mark("first_usable_ui", attempt, diagnosticsStartedAt);
         NotifyCurrentSessionChanged();
         await RefreshHistoryAsync(attempt).ConfigureAwait(true);
+        ProcessingDiagnostics.Mark("finalize_total_end", attempt, diagnosticsStartedAt);
     }
 
     private async Task LoadSessionAsync(SessionSummary summary)
@@ -2716,12 +3086,21 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private async Task<IReadOnlyList<DiarizationSpan>> PrepareDiarizationAsync(
         string wavePath,
         IProgress<ModelDownloadProgress> progress,
+        SessionAttemptID? attempt,
         CancellationToken cancellationToken)
     {
-        var models = await modelProvisioner.EnsureDiarizationAsync(progress, cancellationToken)
-            .ConfigureAwait(false);
-        return await DiarizationWorker.RunIsolatedAsync(wavePath, models, cancellationToken)
-            .ConfigureAwait(false);
+        var startedAt = ProcessingDiagnostics.Mark("diarization_engine_start", attempt);
+        try
+        {
+            var models = await modelProvisioner.EnsureDiarizationAsync(progress, cancellationToken)
+                .ConfigureAwait(false);
+            return await DiarizationWorker.RunIsolatedAsync(wavePath, models, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            ProcessingDiagnostics.Mark("diarization_engine_end", attempt, startedAt);
+        }
     }
 
     private static async Task ObserveFailureAsync(Task task)
@@ -2783,4 +3162,15 @@ internal sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         return dispatcher.InvokeAsync(action).Task;
     }
+
+    private sealed record SpeakerCorrectionSnapshot(
+        SessionAttemptID Attempt,
+        string Folder,
+        ClassMetadata Metadata,
+        SpeakerCorrectionProjectionResult Result,
+        IReadOnlyList<TranscriptSegment> Professor,
+        HumanCorrectionUpdate HumanCorrection,
+        DiarizationProposal? DiarizationProposal,
+        HumanCorrectionOverlay Overlay,
+        SpeakerCorrectionOperation Operation);
 }

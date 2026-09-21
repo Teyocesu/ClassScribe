@@ -208,10 +208,12 @@ final class ClassScribeModel {
         preferredLanguagesProvider = preferredLanguages
         interfaceLanguage = interfaceLanguageStore.load()
         capture = injectedCapture ?? CaptureController()
+        let startupStartedAt = ProcessingDiagnostics.mark("startup_model_init_start")
         capture.refreshSources()
         history = store.history()
         selectedApplicationIdentityID = capture.applications.first?.logicalIdentityID
         selectedMicrophoneID = capture.microphones.first?.id
+        ProcessingDiagnostics.mark("startup_model_init_end", since: startupStartedAt)
     }
 
     var interfaceLanguage: InterfaceLanguage {
@@ -765,7 +767,22 @@ final class ClassScribeModel {
             try store.saveMetadata(metadata(session: session), folder: folder)
 
             asrPreflightFailed = true
-            try await asrPreflight()
+            let preflightStartedAt = ProcessingDiagnostics.mark(
+                "asr_preflight_start",
+                attempt: session.attemptID)
+            do {
+                try await asrPreflight()
+            } catch {
+                ProcessingDiagnostics.mark(
+                    "asr_preflight_end",
+                    attempt: session.attemptID,
+                    since: preflightStartedAt)
+                throw error
+            }
+            ProcessingDiagnostics.mark(
+                "asr_preflight_end",
+                attempt: session.attemptID,
+                since: preflightStartedAt)
             asrPreflightFailed = false
             try Task.checkCancellation()
             guard isCurrent(session) else { throw CancellationError() }
@@ -939,6 +956,9 @@ final class ClassScribeModel {
 
     private func performStop(session: ClassSessionContext) async {
         guard !isStopping else { return }
+        let finalizationStartedAt = ProcessingDiagnostics.mark(
+            "finalize_t0",
+            attempt: session.attemptID)
         isStopping = true
         cancelCalibration()
         errorMessage = nil
@@ -966,12 +986,39 @@ final class ClassScribeModel {
             capturePhase = .stopping
             asrPhase = .idle
             setStatus(.key(.statusClosingAudio))
-            let stopped = try await capture.stop()
+            let captureStopStartedAt = ProcessingDiagnostics.mark(
+                "capture_stop_start",
+                attempt: session.attemptID)
+            let stopped: CaptureStopResult
+            do {
+                stopped = try await capture.stop()
+            } catch {
+                ProcessingDiagnostics.mark(
+                    "capture_stop_end",
+                    attempt: session.attemptID,
+                    since: captureStopStartedAt)
+                throw error
+            }
+            ProcessingDiagnostics.mark(
+                "capture_stop_end",
+                attempt: session.attemptID,
+                since: captureStopStartedAt)
             elapsed = stopped.duration
+            ProcessingDiagnostics.mark(
+                "capture_end",
+                attempt: session.attemptID,
+                since: finalizationStartedAt)
             capturePhase = .idle
             try checkpointLive("audio-stopped", session: session)
+            ProcessingDiagnostics.mark(
+                "audio_available",
+                attempt: session.attemptID,
+                since: finalizationStartedAt)
             isStopping = false
-            runFinalProcessing(audioURL: stopped.url, session: session)
+            runFinalProcessing(
+                audioURL: stopped.url,
+                session: session,
+                diagnosticsStartedAt: finalizationStartedAt)
         } catch {
             isStopping = false
             state = .failed
@@ -1526,6 +1573,9 @@ final class ClassScribeModel {
     private func performRetry(session: ClassSessionContext, jobID: UUID) async {
         let audioURL = session.folder.appendingPathComponent("source.wav")
         let rawURL = session.folder.appendingPathComponent("source.raw")
+        let finalizationStartedAt = ProcessingDiagnostics.mark(
+            "finalize_t0",
+            attempt: session.attemptID)
         do {
             let preparation = try await retryAudioPreparer(audioURL, rawURL)
             try ensureCurrentRetry(jobID: jobID, session: session)
@@ -1533,7 +1583,15 @@ final class ClassScribeModel {
             errorMessage = nil
             setStatus(preparation.recoveredRaw ? .key(.statusRetryAudioRecovered) : .key(.statusRetryAudioReady))
             try store.saveMetadata(metadata(session: session, state: .finalizingAudio), folder: session.folder)
-            runFinalProcessing(audioURL: audioURL, session: session, reusePersistedTranscript: !allSegments.isEmpty)
+            ProcessingDiagnostics.mark(
+                "audio_available",
+                attempt: session.attemptID,
+                since: finalizationStartedAt)
+            runFinalProcessing(
+                audioURL: audioURL,
+                session: session,
+                reusePersistedTranscript: !allSegments.isEmpty,
+                diagnosticsStartedAt: finalizationStartedAt)
         } catch is CancellationError {
             return
         } catch {
@@ -1720,9 +1778,9 @@ final class ClassScribeModel {
                     self.sessionPhase = .recording
                     self.capturePhase = .recording
                     self.asrPhase = .preparingLoad
-                    self.statusDetail = skippedExpiredSamples > 0
-                        ? "La vista en vivo retomó el audio reciente; la versión final recuperará el tramo anterior."
-                        : "Preparando la transcripción local…"
+                    self.setStatus(skippedExpiredSamples > 0
+                        ? .key(.statusRecentAudioRecovered)
+                        : .key(.statusPreparingLocalTranscription))
                     let text = try await self.parakeet.transcribe(
                         samples: window.samples,
                         language: session.language,
@@ -1780,11 +1838,15 @@ final class ClassScribeModel {
                     self.sessionPhase = .recording
                     self.capturePhase = .recording
                     self.asrPhase = .transcribing
-                    self.statusDetail = pause
-                        ? "Texto actualizado. Puedes corregirlo mientras la grabación continúa."
-                        : "Puedes corregir el texto mientras la grabación continúa."
+                    self.setStatus(pause
+                        ? .key(.statusTextUpdated)
+                        : .key(.statusTextCanBeEdited))
                     do { try self.checkpointLive("asr-window", session: session) }
-                    catch { self.errorMessage = "No se pudo actualizar live-transcript.txt: \(error.localizedDescription)" }
+                    catch {
+                        self.setError(.key(.errorLiveUpdateSave, arguments: [
+                            "error": error.localizedDescription,
+                        ]))
+                    }
                 } catch is CancellationError {
                     break
                 } catch {
@@ -1795,12 +1857,17 @@ final class ClassScribeModel {
                     self.capturePhase = .recording
                     self.asrPhase = .retryScheduled
                     let previousLiveError = self.liveTranscriptionError
-                    let message = "Transcripción en vivo no disponible: \(error.localizedDescription). La grabación continúa."
-                    self.liveTranscriptionError = message
+                    let message = LocalizedMessage.key(.errorLiveTranscription, arguments: [
+                        "error": error.localizedDescription,
+                    ])
+                    let resolvedMessage = self.localized(message)
+                    self.liveTranscriptionError = resolvedMessage
                     if self.errorMessage == nil || self.errorMessage == previousLiveError {
-                        self.errorMessage = message
+                        self.setError(message)
                     }
-                    self.statusDetail = "La grabación continúa; reintento en \(Int(delay)) s y retranscripción final al detener."
+                    self.setStatus(.key(.statusLiveRetry, arguments: [
+                        "seconds": String(Int(delay)),
+                    ]))
                 }
             }
         }
@@ -1810,6 +1877,7 @@ final class ClassScribeModel {
         audioURL: URL,
         session: ClassSessionContext,
         reusePersistedTranscript: Bool = false,
+        diagnosticsStartedAt: TimeInterval? = nil,
     ) {
         guard finalTask == nil else {
             setError(.key(.errorFinalProcessingAlreadyRunning))
@@ -1817,20 +1885,31 @@ final class ClassScribeModel {
         }
         let jobID = UUID()
         finalJobID = jobID
+        let finalizationStartedAt = diagnosticsStartedAt
+            ?? ProcessingDiagnostics.mark("finalize_t0", attempt: session.attemptID)
+        ProcessingDiagnostics.mark(
+            "final_processing_start",
+            attempt: session.attemptID,
+            since: finalizationStartedAt)
         finalTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try self.ensureCurrentFinalJob(jobID: jobID, session: session)
                 var vocabularyWarning: LocalizedMessage?
-                let transcript: [TranscriptSegment]
+                let reusedTranscript: [TranscriptSegment]?
                 if reusePersistedTranscript, !self.allSegments.isEmpty {
-                    transcript = self.allSegments
+                    ProcessingDiagnostics.mark(
+                        "asr_final_reused",
+                        attempt: session.attemptID,
+                        since: finalizationStartedAt)
+                    reusedTranscript = self.allSegments
                     self.setStatus(.key(.statusFullTranscriptSaved))
                     try self.store.saveMetadata(
                         self.metadata(session: session, state: .diarizing),
                         folder: session.folder,
                     )
                 } else {
+                    reusedTranscript = nil
                     self.state = .finalTranscription
                     self.sessionPhase = .processing
                     self.capturePhase = .idle
@@ -1853,7 +1932,71 @@ final class ClassScribeModel {
                         self.setStatus(warning)
                     }
                     try self.ensureCurrentFinalJob(jobID: jobID, session: session)
-                    transcript = try await self.finalProcessor.transcribe(audioURL)
+                }
+
+                try self.ensureCurrentFinalJob(jobID: jobID, session: session)
+                let processor = self.finalProcessor
+                let diarizationStartedAt = ProcessingDiagnostics.mark(
+                    "diarization_start",
+                    attempt: session.attemptID,
+                    since: finalizationStartedAt)
+                ProcessingDiagnostics.mark(
+                    "asr_to_diarization",
+                    attempt: session.attemptID,
+                    detail: reusedTranscript == nil ? "parallel" : "reused")
+                // The capture is closed and immutable. Final ASR owns
+                // Parakeet's serial inference queue; diarization owns an
+                // isolated helper process. Await ASR first so a diarization
+                // failure cannot discard the durable full transcript.
+                async let diarizationTask: (
+                    result: (spans: [DiarizationSpan], embeddings: [String: [Float]]),
+                    endedAt: TimeInterval
+                ) = {
+                    do {
+                        let result = try await processor.diarize(audioURL)
+                        let endedAt = ProcessingDiagnostics.mark(
+                            "diarization_end",
+                            attempt: session.attemptID,
+                            since: diarizationStartedAt)
+                        return (result: result, endedAt: endedAt)
+                    } catch {
+                        ProcessingDiagnostics.mark(
+                            "diarization_end",
+                            attempt: session.attemptID,
+                            since: diarizationStartedAt)
+                        throw error
+                    }
+                }()
+
+                let transcript: [TranscriptSegment]
+                let asrInterval: (start: TimeInterval, end: TimeInterval)?
+                if let reusedTranscript {
+                    transcript = reusedTranscript
+                    asrInterval = nil
+                } else {
+                    let startedAt = ProcessingDiagnostics.mark(
+                        "asr_final_start",
+                        attempt: session.attemptID,
+                        since: finalizationStartedAt)
+                    async let asrTask: (segments: [TranscriptSegment], endedAt: TimeInterval) = {
+                        do {
+                            let segments = try await processor.transcribe(audioURL)
+                            let endedAt = ProcessingDiagnostics.mark(
+                                "asr_final_end",
+                                attempt: session.attemptID,
+                                since: startedAt)
+                            return (segments: segments, endedAt: endedAt)
+                        } catch {
+                            ProcessingDiagnostics.mark(
+                                "asr_final_end",
+                                attempt: session.attemptID,
+                                since: startedAt)
+                            throw error
+                        }
+                    }()
+                    let result = try await asrTask
+                    transcript = result.segments
+                    asrInterval = (start: startedAt, end: result.endedAt)
                     try Task.checkCancellation()
                     try self.ensureCurrentFinalJob(jobID: jobID, session: session)
                     guard !transcript.isEmpty else { throw SessionStoreError.emptyTranscript }
@@ -1875,10 +2018,29 @@ final class ClassScribeModel {
                 self.capturePhase = .idle
                 self.asrPhase = .idle
                 self.setStatus(.key(.statusSpeakerIdentification))
-                let diarization = try await self.finalProcessor.diarize(audioURL)
+                let diarizationOutput = try await diarizationTask
+                let diarization = diarizationOutput.result
+                if let asrInterval {
+                    let overlapStart = max(asrInterval.start, diarizationStartedAt)
+                    let overlapEnd = min(asrInterval.end, diarizationOutput.endedAt)
+                    let overlapMilliseconds = overlapEnd > overlapStart
+                        ? Int((overlapEnd - overlapStart) * 1_000)
+                        : 0
+                    ProcessingDiagnostics.mark(
+                        "asr_diarization_overlap",
+                        attempt: session.attemptID,
+                        detail: "milliseconds=\(overlapMilliseconds)")
+                }
                 try Task.checkCancellation()
                 try self.ensureCurrentFinalJob(jobID: jobID, session: session)
+                let speakerAttributionStartedAt = ProcessingDiagnostics.mark(
+                    "speaker_attribution_start",
+                    attempt: session.attemptID)
                 let assignment = SpeakerAssignment.assign(transcript: transcript, diarization: diarization.spans)
+                ProcessingDiagnostics.mark(
+                    "speaker_attribution_end",
+                    attempt: session.attemptID,
+                    since: speakerAttributionStartedAt)
                 self.activeDiarizationProposal = DiarizationProposal(
                     proposalID: UUID(),
                     createdAt: Date(),
@@ -1889,6 +2051,9 @@ final class ClassScribeModel {
                 self.allSegments = assignment.segments
                 self.reviewItems = assignment.review
                 self.speakers = self.makeSpeakers(spans: diarization.spans, embeddings: diarization.embeddings)
+                let postProcessingStartedAt = ProcessingDiagnostics.mark(
+                    "post_processing_start",
+                    attempt: session.attemptID)
                 self.chooseProfessorAutomatically(subject: session.subject, embeddings: diarization.embeddings)
                 let hasUnresolvedCorrections = self.applyActiveHumanCorrections()
                 self.finalReplacedLive = true
@@ -1902,7 +2067,23 @@ final class ClassScribeModel {
                         ?? (self.editedLiveText == nil
                             ? .key(.statusFinalReplacedLive)
                             : .key(.statusFinalReadyWithEdits))))
-                if !self.persistFinalOutputs(session: session) {
+                ProcessingDiagnostics.mark(
+                    "post_processing_end",
+                    attempt: session.attemptID,
+                    since: postProcessingStartedAt)
+                ProcessingDiagnostics.mark(
+                    "first_usable_ui",
+                    attempt: session.attemptID,
+                    since: finalizationStartedAt)
+                let persistenceStartedAt = ProcessingDiagnostics.mark(
+                    "persistence_final_start",
+                    attempt: session.attemptID)
+                let outputsSaved = self.persistFinalOutputs(session: session)
+                ProcessingDiagnostics.mark(
+                    "persistence_final_end",
+                    attempt: session.attemptID,
+                    since: persistenceStartedAt)
+                if !outputsSaved {
                     self.state = .recoverable
                     self.sessionPhase = .recoverable
                     self.capturePhase = .failedRecoverable
@@ -1938,6 +2119,10 @@ final class ClassScribeModel {
             if self.isCurrent(session) {
                 self.refreshHistory()
             }
+            ProcessingDiagnostics.mark(
+                "finalize_total_end",
+                attempt: session.attemptID,
+                since: finalizationStartedAt)
         }
     }
 

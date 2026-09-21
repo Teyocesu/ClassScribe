@@ -5,6 +5,7 @@ struct ClassScribeApp: App {
     @State private var model = ClassScribeModel()
 
     init() {
+        ProcessingDiagnostics.mark("startup_app_init")
         BuildIdentity.recordLaunch()
     }
 

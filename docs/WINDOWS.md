@@ -19,7 +19,7 @@ El instalador actual no tiene firma Authenticode. Si SmartScreen aparece, compru
 4. Agrega nombres propios, siglas o términos técnicos separados por comas.
 5. Pulsa **Iniciar** y comprueba que el medidor se mueva.
 
-La primera transcripción descarga Whisper large-v3-turbo cuantizado, aproximadamente 574 MB. La primera identificación de voces descarga además dos modelos más pequeños. Las descargas usan HTTPS, tamaño esperado y SHA-256 fijo; una descarga incompleta no se instala. Después, la app funciona localmente.
+La primera transcripción descarga Whisper small cuantizado (`ggml-small-q5_1.bin`, aproximadamente 181 MB). La primera identificación de voces descarga además dos modelos más pequeños. Las descargas usan HTTPS, tamaño esperado y SHA-256 fijo; una descarga incompleta no se instala. Después, la app funciona localmente.
 
 ## Privacidad y recuperación
 

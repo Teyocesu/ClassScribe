@@ -6,6 +6,7 @@ namespace ClassScribe.Windows;
 internal sealed class WhisperTranscriber : IAsyncDisposable
 {
     private const float VadThreshold = 0.40f;
+    private static readonly TimeSpan VadBudget = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan VadMinimumSpeech = TimeSpan.FromMilliseconds(150);
     private static readonly TimeSpan VadMergeSilence = TimeSpan.FromMilliseconds(300);
 
@@ -14,8 +15,8 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
     private readonly SemaphoreSlim vadGate = new(1, 1);
     private WhisperFactory? factory;
     private WhisperVadFactory? vadFactory;
-    private string? loadedModelPath;
     private bool isWarmedUp;
+    private int vadUnavailable;
 
     public WhisperTranscriber(LocalModelProvisioner models)
     {
@@ -136,7 +137,6 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         {
             factory?.Dispose();
             factory = null;
-            loadedModelPath = null;
             isWarmedUp = false;
         }
         finally
@@ -217,9 +217,30 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         IProgress<ModelDownloadProgress>? progress,
         CancellationToken cancellationToken)
     {
+        if (Volatile.Read(ref vadUnavailable) != 0)
+        {
+            ProcessingDiagnostics.Mark("vad_skipped", detail: "unavailable_for_process");
+            return null;
+        }
+
+        var startedAt = ProcessingDiagnostics.Mark("vad_start");
+        using var vadCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        vadCancellation.CancelAfter(VadBudget);
         try
         {
-            var activeFactory = await EnsureVadFactoryAsync(progress, cancellationToken).ConfigureAwait(false);
+            var activeFactory = await EnsureVadFactoryAsync(
+                    progress,
+                    vadCancellation.Token,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (activeFactory is null)
+            {
+                Interlocked.Exchange(ref vadUnavailable, 1);
+                ProcessingDiagnostics.Mark("vad_unavailable", detail: "deadline");
+                return null;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
             await using var processor = activeFactory.CreateBuilder()
                 .WithThreads(Math.Clamp(Environment.ProcessorCount, 1, 16))
                 .WithUseGpu(false)
@@ -228,7 +249,8 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
                 .WithMinSilenceDuration(VadMergeSilence)
                 .WithSpeechPadding(TimeSpan.Zero)
                 .Build();
-            var detected = await processor.DetectSpeechAsync(wave, cancellationToken).ConfigureAwait(false);
+            var detected = await processor.DetectSpeechAsync(wave, vadCancellation.Token).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
             var timelineOffset = double.IsFinite(offsetSeconds) ? Math.Max(0, offsetSeconds) : 0;
             var regions = detected
                 .Select(segment => new SpeechPresenceRegion(
@@ -241,41 +263,119 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
         {
             throw;
         }
+        catch (OperationCanceledException)
+        {
+            Interlocked.Exchange(ref vadUnavailable, 1);
+            ProcessingDiagnostics.Mark("vad_unavailable", detail: "deadline");
+            return null;
+        }
         catch (Exception error)
         {
             // VAD model download/load/inference is an acceptance aid. Any
             // failure returns nil so the caller executes the old ASR path.
             CrashLog.Write(error);
+            Interlocked.Exchange(ref vadUnavailable, 1);
+            ProcessingDiagnostics.Mark("vad_unavailable", detail: "failure");
             return null;
+        }
+        finally
+        {
+            ProcessingDiagnostics.Mark("vad_end", startedAt: startedAt);
         }
     }
 
-    private async Task<WhisperVadFactory> EnsureVadFactoryAsync(
+    private async Task<WhisperVadFactory?> EnsureVadFactoryAsync(
         IProgress<ModelDownloadProgress>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CancellationToken callerCancellationToken)
     {
         await vadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (Volatile.Read(ref vadUnavailable) != 0)
+            {
+                return null;
+            }
+
             if (vadFactory is not null)
             {
                 return vadFactory;
             }
 
-            var modelPath = await models.EnsureVadAsync(progress, cancellationToken).ConfigureAwait(false);
-            var preparedFactory = await Task.Run(
-                    () => WhisperVadFactory.FromPath(modelPath, new WhisperFactoryOptions
-                    {
-                        UseGpu = false,
-                    }),
-                    cancellationToken)
-                .ConfigureAwait(false);
-            vadFactory = preparedFactory;
-            return preparedFactory;
+            var startedAt = ProcessingDiagnostics.Mark("vad_model_load_start");
+            try
+            {
+                var modelPath = await models.EnsureVadAsync(progress, cancellationToken).ConfigureAwait(false);
+                var preparedFactory = await LoadVadFactoryAsync(modelPath, cancellationToken)
+                    .ConfigureAwait(false);
+                if (preparedFactory is null)
+                {
+                    Interlocked.Exchange(ref vadUnavailable, 1);
+                    return null;
+                }
+
+                vadFactory = preparedFactory;
+                return preparedFactory;
+            }
+            catch (OperationCanceledException) when (callerCancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                Interlocked.Exchange(ref vadUnavailable, 1);
+                throw;
+            }
+            finally
+            {
+                ProcessingDiagnostics.Mark("vad_model_load_end", startedAt: startedAt);
+            }
         }
         finally
         {
             vadGate.Release();
+        }
+    }
+
+    private static async Task<WhisperVadFactory?> LoadVadFactoryAsync(
+        string modelPath,
+        CancellationToken cancellationToken)
+    {
+        var loadTask = Task.Run(
+            () => WhisperVadFactory.FromPath(modelPath, new WhisperFactoryOptions
+            {
+                UseGpu = false,
+            }));
+        using var waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, waitCancellation.Token);
+        try
+        {
+            var completed = await Task.WhenAny(loadTask, cancellationTask).ConfigureAwait(false);
+            if (completed != loadTask)
+            {
+                _ = ObserveTimedOutVadLoadAsync(loadTask);
+                cancellationToken.ThrowIfCancellationRequested();
+                return null;
+            }
+
+            return await loadTask.ConfigureAwait(false);
+        }
+        finally
+        {
+            waitCancellation.Cancel();
+        }
+    }
+
+    private static async Task ObserveTimedOutVadLoadAsync(Task<WhisperVadFactory> loadTask)
+    {
+        try
+        {
+            var factory = await loadTask.ConfigureAwait(false);
+            factory.Dispose();
+        }
+        catch (Exception)
+        {
+            // The caller already failed open; consume late native-load errors.
         }
     }
 
@@ -288,18 +388,25 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
             return;
         }
 
-        var modelPath = await models.EnsureWhisperAsync(progress, cancellationToken).ConfigureAwait(false);
-        var preparedFactory = await Task.Run(
-                () => WhisperFactory.FromPath(modelPath, new WhisperFactoryOptions
-                {
-                    // Whisper.net's packaged CPU backend is self-contained. Its
-                    // CUDA backends require a separate CUDA runtime installation.
-                    UseGpu = false,
-                }),
-                cancellationToken)
-            .ConfigureAwait(false);
-        factory = preparedFactory;
-        loadedModelPath = modelPath;
+        var startedAt = ProcessingDiagnostics.Mark("asr_model_load_start");
+        try
+        {
+            var modelPath = await models.EnsureWhisperAsync(progress, cancellationToken).ConfigureAwait(false);
+            var preparedFactory = await Task.Run(
+                    () => WhisperFactory.FromPath(modelPath, new WhisperFactoryOptions
+                    {
+                        // Whisper.net's packaged CPU backend is self-contained. Its
+                        // CUDA backends require a separate CUDA runtime installation.
+                        UseGpu = false,
+                    }),
+                    cancellationToken)
+                .ConfigureAwait(false);
+            factory = preparedFactory;
+        }
+        finally
+        {
+            ProcessingDiagnostics.Mark("asr_model_load_end", startedAt: startedAt);
+        }
     }
 
     private async Task WarmUpAsync(CancellationToken cancellationToken)
@@ -311,16 +418,24 @@ internal sealed class WhisperTranscriber : IAsyncDisposable
 
         var activeFactory = factory
             ?? throw new InvalidOperationException("El modelo de transcripción no quedó preparado.");
-        await using var processor = activeFactory.CreateBuilder()
-            .WithLanguage("es")
-            .WithThreads(Math.Clamp(Environment.ProcessorCount, 1, 16))
-            .Build();
-        using var silence = PcmWaveFile.CreateWaveStream(new byte[PcmWaveFile.SampleRate * 2]);
-        await foreach (var _ in processor.ProcessAsync(silence, cancellationToken).ConfigureAwait(false))
+        var startedAt = ProcessingDiagnostics.Mark("asr_warmup_start");
+        try
         {
-            // Discard the result: this moves native first-inference setup before capture.
-        }
+            await using var processor = activeFactory.CreateBuilder()
+                .WithLanguage("es")
+                .WithThreads(Math.Clamp(Environment.ProcessorCount, 1, 16))
+                .Build();
+            using var silence = PcmWaveFile.CreateWaveStream(new byte[PcmWaveFile.SampleRate * 2]);
+            await foreach (var _ in processor.ProcessAsync(silence, cancellationToken).ConfigureAwait(false))
+            {
+                // Discard the result: this moves native first-inference setup before capture.
+            }
 
-        isWarmedUp = true;
+            isWarmedUp = true;
+        }
+        finally
+        {
+            ProcessingDiagnostics.Mark("asr_warmup_end", startedAt: startedAt);
+        }
     }
 }

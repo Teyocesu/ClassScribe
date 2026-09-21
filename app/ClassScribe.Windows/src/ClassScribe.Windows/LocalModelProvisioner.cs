@@ -13,6 +13,7 @@ internal sealed record DiarizationModels(string SegmentationPath, string Embeddi
 
 internal sealed class LocalModelProvisioner : IDisposable
 {
+    private static readonly TimeSpan ModelHttpTimeout = TimeSpan.FromMinutes(5);
     private const string WhisperUrl =
         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin";
     private const long WhisperSize = 190_085_487;
@@ -59,7 +60,7 @@ internal sealed class LocalModelProvisioner : IDisposable
             "Models");
         httpClient = new HttpClient
         {
-            Timeout = Timeout.InfiniteTimeSpan,
+            Timeout = ModelHttpTimeout,
         };
         httpClient.DefaultRequestHeaders.UserAgent.Add(
             new ProductInfoHeaderValue("ClassScribe", "1.0"));

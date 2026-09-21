@@ -61,6 +61,8 @@ public sealed class LocalizationTests
             "CopyForChat",
             "Export",
             "WarningSourceRead",
+            "StatusLiveModelRetry",
+            "WarningLiveRetry",
         };
         var localization = NewLocalization(new InMemoryInterfaceLanguagePreferenceStore(), "en-US");
 

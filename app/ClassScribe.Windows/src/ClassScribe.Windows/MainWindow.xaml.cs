@@ -19,6 +19,7 @@ public partial class MainWindow : Window, IAsyncDisposable
     public MainWindow()
     {
         InitializeComponent();
+        ProcessingDiagnostics.Mark("startup_window_created");
         viewModel = new MainViewModel(
             systemOutputConsentPrompt: () => SystemOutputConsentDialog.Show(this, AppLocalization.Instance));
         DataContext = viewModel;
@@ -26,6 +27,7 @@ public partial class MainWindow : Window, IAsyncDisposable
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
+        var startedAt = ProcessingDiagnostics.Mark("startup_initialize_start");
         try
         {
             await viewModel.InitializeAsync().ConfigureAwait(true);
@@ -34,6 +36,10 @@ public partial class MainWindow : Window, IAsyncDisposable
         catch (Exception error)
         {
             viewModel.ReportUiError(error);
+        }
+        finally
+        {
+            ProcessingDiagnostics.Mark("startup_initialize_end", startedAt: startedAt);
         }
     }
 

@@ -91,17 +91,122 @@ private actor SlowCountingFinalProcessor: FinalProcessingProviding {
     }
 }
 
-private actor CancellableFinalProcessor: FinalProcessingProviding {
+private actor ParallelFinalProcessor: FinalProcessingProviding {
+    private var transcriptionContinuation: CheckedContinuation<[TranscriptSegment], Error>?
+    private var diarizationContinuation: CheckedContinuation<(
+        spans: [DiarizationSpan],
+        embeddings: [String: [Float]]
+    ), Error>?
+    private var bothStartedContinuation: CheckedContinuation<Void, Never>?
+    private var transcriptionStarted = false
+    private var diarizationStarted = false
+
     func configureVocabulary(file _: URL?) async throws {}
 
+    func waitUntilBothStarted() async {
+        guard !(transcriptionStarted && diarizationStarted) else { return }
+        await withCheckedContinuation { continuation in
+            bothStartedContinuation = continuation
+        }
+    }
+
+    func release() {
+        transcriptionContinuation?.resume(returning: [TranscriptSegment(
+            start: 0,
+            end: 1,
+            text: "resultado paralelo",
+            speakerID: "Persona desconocida",
+            confidence: 0.9,
+        )])
+        transcriptionContinuation = nil
+        diarizationContinuation?.resume(returning: (
+            spans: [DiarizationSpan(start: 0, end: 1, speakerID: "Persona 1", quality: 0.95)],
+            embeddings: ["Persona 1": [1, 0]],
+        ))
+        diarizationContinuation = nil
+    }
+
     func transcribe(_: URL) async throws -> [TranscriptSegment] {
-        try await Task.sleep(for: .seconds(30))
-        return []
+        try Task.checkCancellation()
+        transcriptionStarted = true
+        resumeBothStartedIfReady()
+        return try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    transcriptionContinuation = continuation
+                }
+            }
+        }, onCancel: {
+            Task { await self.cancelTranscription() }
+        })
     }
 
     func diarize(_: URL) async throws -> (spans: [DiarizationSpan], embeddings: [String: [Float]]) {
-        Issue.record("La diarización no debe comenzar después de cancelar ASR")
+        try Task.checkCancellation()
+        diarizationStarted = true
+        resumeBothStartedIfReady()
+        return try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    diarizationContinuation = continuation
+                }
+            }
+        }, onCancel: {
+            Task { await self.cancelDiarization() }
+        })
+    }
+
+    private func resumeBothStartedIfReady() {
+        guard transcriptionStarted, diarizationStarted else { return }
+        bothStartedContinuation?.resume()
+        bothStartedContinuation = nil
+    }
+
+    private func cancelTranscription() {
+        transcriptionContinuation?.resume(throwing: CancellationError())
+        transcriptionContinuation = nil
+    }
+
+    private func cancelDiarization() {
+        diarizationContinuation?.resume(throwing: CancellationError())
+        diarizationContinuation = nil
+    }
+}
+
+private actor CancellableFinalProcessor: FinalProcessingProviding {
+    private var transcriptionContinuation: CheckedContinuation<[TranscriptSegment], Error>?
+
+    func configureVocabulary(file _: URL?) async throws {}
+
+    func transcribe(_: URL) async throws -> [TranscriptSegment] {
+        return try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    transcriptionContinuation = continuation
+                }
+            }
+        }, onCancel: {
+            Task { await self.cancelTranscription() }
+        })
+    }
+
+    func diarize(_: URL) async throws -> (spans: [DiarizationSpan], embeddings: [String: [Float]]) {
+        try Task.checkCancellation()
         return ([], [:])
+    }
+
+    private func cancelTranscription() {
+        transcriptionContinuation?.resume(throwing: CancellationError())
+        transcriptionContinuation = nil
     }
 }
 
@@ -205,6 +310,26 @@ func successfulFinalRetryCompletesSession() async throws {
     #expect(model.history.first?.isRecoverable == false)
     #expect(try String(contentsOf: fixture.folder.appendingPathComponent("professor.txt"), encoding: .utf8)
         .contains("transcripción final persistida"))
+}
+
+@MainActor
+@Test
+func finalASRAndDiarizationStartBeforeEitherCompletes() async throws {
+    let fixture = try makeRecoverableProcessingFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let processor = ParallelFinalProcessor()
+    let model = ClassScribeModel(store: fixture.store, finalProcessor: processor)
+    model.openHistory(try #require(model.history.first))
+
+    let retry = Task { @MainActor in await model.retryProcessing() }
+    await processor.waitUntilBothStarted()
+    await processor.release()
+    await retry.value
+    await model.waitForFinalProcessingForTesting()
+
+    #expect(model.state == .complete)
+    #expect(model.allSegments.map(\.text) == ["resultado paralelo"])
+    #expect(model.speakers.map(\.id) == ["Persona 1"])
 }
 
 @MainActor
