@@ -12,16 +12,21 @@ investigación de performance; no redefine la frontera de release.
 Cerrar dos fallos de correctness que pueden perder o publicar estado sobre la
 sesión equivocada, acotar el fallback opcional de VAD para que nunca bloquee
 indefinidamente el pipeline principal, corregir literales visibles en caminos
-activos y dejar diagnostics opt-in suficientes para medir P0 sin optimizarlo
-por inspección estática.
+activos, dejar diagnostics opt-in suficientes para medir P0 y aplicar una
+optimización focalizada en macOS: eliminar la dependencia serial final
+ASR → diarización mediante structured concurrency, con speaker attribution
+posterior a ambas ramas. La mejora está inferida por la eliminación de esa
+dependencia; no hay benchmarks físicos.
 
 ## Scope
 
 - Windows: `ApplySpeakerCorrectionAsync`, serialización del scope de
   correcciones, fallback VAD con presupuesto finito y diagnostics de
   finalización.
-- macOS: fallback VAD con presupuesto finito, literales activos y diagnostics
-  de finalización.
+- macOS: fallback VAD con presupuesto finito, literales activos, diagnostics
+  de finalización, concurrencia estructurada de ASR final + diarización con
+  audio cerrado, speaker attribution posterior a ambos resultados y
+  persistencia temprana del transcript ASR en estado `diarizing`.
 - Tests focales para aislamiento A→B, ordering de correcciones y fallos
   materiales del fallback que puedan probarse sin hardware.
 - Instrucciones reproducibles para ejecutar las aplicaciones reales con
@@ -134,5 +139,7 @@ Se conservan `Sources/`/`Tests/` upstream, `site/`, `Casks/`,
 `FINALIZATION_PLAN.md`, licencias y `ProcessingIPC` (diarización en
 uso) como follow-ups o requisitos legales; `downloadProgress`
 write-only de `Inference.swift` queda diferido por firma externa sin
-compilador disponible. La matriz P3 ya investigada permanece en el
-anexo de [`PLAN.md`](../../PLAN.md).
+compilador disponible. Los elementos diferidos están resumidos en la
+sección "Follow-ups diferidos" de [`PLAN.md`](../../PLAN.md); la historia
+detallada vive en `docs/specs/v0.8.0.md`, `docs/characterization/` y el
+historial Git cuando corresponda.
