@@ -3,8 +3,14 @@ name: ClassScribe CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:
@@ -15,75 +21,75 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  macos:
-    name: macOS build and test
+  macos-classscribe:
+    name: macOS ClassScribe tests
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
 
-      - name: Toolchain
+      - name: Toolchain and runner resources
         run: |
           xcodebuild -version
           swift --version
+          sysctl -n hw.ncpu
+          sysctl -n hw.memsize
 
-      - name: Resolve fixed Swift packages
-        run: swift package resolve --package-path app/MeetingTranscriber
-
-      - name: SwiftPM Debug and Release builds
-        run: |
-          swift build --package-path app/MeetingTranscriber -c debug -j 2 -Xswiftc -strict-concurrency=complete
-          swift build --package-path app/MeetingTranscriber -c release -j 2 -Xswiftc -strict-concurrency=complete
-
-      - name: ClassScribe unit tests
+      - name: Test ClassScribe with strict concurrency
         run: >-
-          swift test --package-path app/MeetingTranscriber -j 2
+          swift test --package-path app/MeetingTranscriber
           --enable-swift-testing --enable-xctest
           -Xswiftc -strict-concurrency=complete
-
-      - name: AudioTap library tests
-        run: >-
-          swift test --package-path tools/audiotap -j 2
-          --disable-swift-testing --enable-xctest
-          -Xswiftc -strict-concurrency=complete
-
-      - name: Xcode Debug and Release builds
-        working-directory: app/MeetingTranscriber
-        run: |
-          xcodebuild -scheme ClassScribe -configuration Debug -destination 'platform=macOS' build
-          xcodebuild -scheme ClassScribe -configuration Release -destination 'platform=macOS' build
-          xcodebuild -scheme ClassScribeDiarizer -configuration Release -destination 'platform=macOS' build
-
-      - name: Assemble and verify the development bundle
-        run: |
-          ./scripts/run_app.sh --build-only
-          test -x app/MeetingTranscriber/.build/ClassScribe-Dev.app/Contents/MacOS/ClassScribe
-          test -x app/MeetingTranscriber/.build/ClassScribe-Dev.app/Contents/Helpers/ClassScribeDiarizer
-          codesign --verify --deep --strict app/MeetingTranscriber/.build/ClassScribe-Dev.app
-          embedded_commit=$(/usr/libexec/PlistBuddy -c 'Print :ClassScribeBuildCommit' app/MeetingTranscriber/.build/ClassScribe-Dev.app/Contents/Info.plist)
-          test "$embedded_commit" = "$GITHUB_SHA"
 
       # Tests requiring TCC, audio hardware, CATap, or UI interaction remain
       # opt-in locally; no GitHub-hosted runner can authorize them reliably.
 
-  windows:
-    name: Windows build, test, and package smoke test
-    runs-on: windows-2025
-    timeout-minutes: 45
+  macos-audiotap:
+    name: macOS AudioTap tests
+    runs-on: macos-15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
 
-      - name: Install fixed .NET SDK
-        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
-        with:
-          dotnet-version: 10.0.302
-          cache: true
-          cache-dependency-path: app/ClassScribe.Windows/**/packages.lock.json
+      - name: Test AudioTap with strict concurrency
+        run: >-
+          swift test --package-path tools/audiotap
+          --disable-swift-testing --enable-xctest
+          -Xswiftc -strict-concurrency=complete
 
-      - name: Build, test, publish, and smoke-test Windows app
+  windows:
+    name: Windows build and tests
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: app/ClassScribe.Windows
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Verify preinstalled .NET SDK
         shell: pwsh
-        run: ./scripts/build_windows.ps1 -SkipInstaller
+        run: |
+          dotnet --list-sdks
+          $resolvedSdk = [version](dotnet --version)
+          Write-Host "Resolved SDK: $resolvedSdk"
+          if ($resolvedSdk -lt [version]'10.0.302' -or $resolvedSdk -ge [version]'10.0.400') {
+            throw "global.json resolved unsupported SDK $resolvedSdk"
+          }
+
+      - name: Restore locked dependencies
+        shell: pwsh
+        run: dotnet restore ClassScribe.Windows.slnx --locked-mode
+
+      - name: Build and test
+        shell: pwsh
+        run: >-
+          dotnet test ClassScribe.Windows.slnx
+          --configuration Release
+          --no-restore

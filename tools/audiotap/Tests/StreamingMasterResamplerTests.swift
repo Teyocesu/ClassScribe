@@ -33,12 +33,16 @@ final class StreamingMasterResamplerTests: XCTestCase {
             inputRate: 44_100,
             outputRate: 48_000,
         )
-        let firstPhase = try XCTUnwrap(firstPhase)
-        let secondPhase = try XCTUnwrap(secondPhase)
+        let unwrappedFirstPhase = try XCTUnwrap(firstPhase)
+        let unwrappedSecondPhase = try XCTUnwrap(secondPhase)
         XCTAssertEqual(outputFrames, converter.totalOutputFrames)
         XCTAssertLessThanOrEqual(abs(outputFrames - expected), 1)
-        XCTAssertNotEqual(firstPhase, 0, accuracy: 0.000000000001)
-        XCTAssertNotEqual(firstPhase, secondPhase, accuracy: 0.000000000001)
+        XCTAssertNotEqual(unwrappedFirstPhase, 0, accuracy: 0.000000000001)
+        XCTAssertNotEqual(
+            unwrappedFirstPhase,
+            unwrappedSecondPhase,
+            accuracy: 0.000000000001,
+        )
     }
 
     func test48000To44100TracksRationalCountAcrossTenThousandCallbacks() throws {
