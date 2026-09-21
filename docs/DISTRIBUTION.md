@@ -1,6 +1,6 @@
 # Distribución de ClassScribe
 
-ClassScribe se distribuye desde los assets de una GitHub Release del repositorio privado. Quien tenga acceso puede descargar un instalador y compartir ese archivo sin entregar el repositorio ni los datos locales de las clases.
+ClassScribe se distribuye desde los assets de una GitHub Release del repositorio público. Cualquier persona puede descargar un instalador y compartir ese archivo sin entregar los datos locales de las clases.
 
 ## Assets oficiales
 

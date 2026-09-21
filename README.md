@@ -97,7 +97,7 @@ El script restaura dependencias bloqueadas, compila con analizadores, ejecuta pr
 
 ## Modelos
 
-En macOS, Parakeet TDT v3 multilingüe y los modelos de diarización se descargan mediante FluidAudio. En Windows se usa Whisper large-v3-turbo cuantizado, con idioma explícito y vocabulario técnico, más modelos sherpa-onnx para voces. Español, inglés y francés se seleccionan antes de grabar y el idioma queda persistido con la sesión. Las descargas de Windows validan tamaño y SHA-256 antes de cargar código nativo. Si la preparación falla, la grabación se conserva y la interfaz permite reintentar. Los modelos no se guardan en Git.
+En macOS, Parakeet TDT v3 multilingüe y los modelos de diarización se descargan mediante FluidAudio. En Windows se usa Whisper small cuantizado (`ggml-small-q5_1.bin`, aproximadamente 181 MB), con idioma explícito y vocabulario técnico, más modelos sherpa-onnx para voces. Español, inglés y francés se seleccionan antes de grabar y el idioma queda persistido con la sesión. Las descargas de Windows validan tamaño y SHA-256 antes de cargar código nativo. Si la preparación falla, la grabación se conserva y la interfaz permite reintentar. Los modelos no se guardan en Git.
 
 ## Permisos
 
@@ -242,7 +242,7 @@ La suite cubre además compatibilidad de metadatos multilingües y sesiones here
 
 - La diarización y las tarjetas de varios hablantes se actualizan al detener la clase; durante la grabación se conserva y muestra el texto vivo, pero no se promete diarización verdaderamente streaming.
 - La separación de voces, superposiciones y reconocimiento son de mejor esfuerzo. Los casos inseguros se conservan en Revisar.
-- La primera carga de modelos puede tardar varios minutos y consumir memoria significativa; en Windows la descarga de Whisper es de aproximadamente 574 MB.
+- La primera carga de modelos puede tardar varios minutos y consumir memoria significativa; en Windows la descarga de Whisper es de aproximadamente 181 MB.
 - Editar texto no cambia el audio ni los segmentos JSON. TXT/Markdown sí reflejan la edición; SRT conserva tiempos/segmentos finales y lo advierte.
 - En esta máquina no hay Xcode completo. SwiftPM valida localmente y GitHub Actions ejecuta XCTest y builds Xcode Debug/Release.
 - La suite XCTest heredada de `tools/audiotap` tampoco está disponible con estos Command Line Tools (`no such module XCTest`), aunque la biblioteca sí compila y enlaza dentro del target ClassScribe.
