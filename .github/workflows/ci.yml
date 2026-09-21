@@ -73,12 +73,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Restore NuGet package cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.nuget/packages
-          key: nuget-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('app/ClassScribe.Windows/**/packages.lock.json') }}
-
       - name: Verify preinstalled .NET SDK
         shell: pwsh
         run: |
