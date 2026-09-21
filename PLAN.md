@@ -6,7 +6,7 @@ Baseline canónico del release checkpoint #1: `9d80826f598b77dfd0646853501e6e5ea
 
 Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente**; Fase 1C **ARCHITECTURE APPROVED**; Fase 2A **FIXED / PARTIAL**; Fase 2B.1 **COMPLETE / PARTIAL**; Fase 2B.2 **PASS en Windows**; Fase 2C.1 y Fase 2C.2 **PASS en Windows**; Fase 2D **PASS en Windows para el contrato validado**. Windows W0/W1A/W1B tienen evidencia de runtime y física **PASS**. Permanecen pendientes los gates físicos de macOS, TCC, hardware/device-change y los acceptance gates compartidos indicados abajo. Fase 2E queda **DIFERIDA / NOT STARTED**.
 SPEC canónica: [`docs/specs/v0.8.0.md`](docs/specs/v0.8.0.md)
-SPEC activa del correctivo: [`docs/specs/post-v0.8.0-corrective.md`](docs/specs/post-v0.8.0-corrective.md)
+SPEC activa del correctivo: [`docs/specs/post-v0.9.0-corrective.md`](docs/specs/post-v0.9.0-corrective.md)
 
 Este documento es mutable: ordena trabajo pequeño y verificable. No redefine requisitos. Cada fase se valida localmente con el patrón `focused → subsystem`; los gates con TCC, hardware, llamada real o Windows físico están definidos en la SPEC. La frontera estable y la política de release están fijadas por el bloque `RELEASE CHECKPOINT v0.8.0`.
 
@@ -331,7 +331,7 @@ marcarse con ejecución reproducible en el dispositivo correspondiente.
 
 ### Estado del correctivo — 2026-09-21
 
-La SPEC activa es [`docs/specs/post-v0.8.0-corrective.md`](docs/specs/post-v0.8.0-corrective.md).
+La SPEC activa es [`docs/specs/post-v0.9.0-corrective.md`](docs/specs/post-v0.9.0-corrective.md).
 P1 quedó implementada: snapshots/autoridad y cola FIFO en correcciones Windows,
 RMW del overlay serializado por carpeta, VAD fail-open con deadline finito en
 ambas plataformas, claves existentes para los literales activos e

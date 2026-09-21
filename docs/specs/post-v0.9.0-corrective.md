@@ -1,9 +1,10 @@
-# Correctivo post-v0.8.0 — concurrencia, VAD fail-open y diagnostics
+# Correctivo post-v0.9.0 — concurrencia, VAD fail-open y diagnostics
 
 Estado: **ACTIVA / CORRECTIVO FOCALIZADO**
 
 Esta SPEC no asigna una versión de release. Complementa a
-[`v0.8.0.md`](v0.8.0.md) para cerrar problemas confirmados después de la
+[`v0.8.0.md`](v0.8.0.md) (contrato base escrito; la release actual es
+v0.9.0) para cerrar problemas confirmados después de la
 investigación de performance; no redefine la frontera de release.
 
 ## Objetivo
