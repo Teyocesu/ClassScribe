@@ -23,7 +23,7 @@ final class MasterAudioWriterTests: XCTestCase {
         ))
         XCTAssertEqual(writer.format?.sampleRate, 44_100)
         XCTAssertEqual(writer.format?.channels, 2)
-        XCTAssertEqual(writer.framesWritten, 1)
+        XCTAssertEqual(writer.framesWritten, 2)
         try writer.finish()
         XCTAssertEqual(writer.framesWritten, 2)
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.manifestURL.path))
@@ -228,7 +228,7 @@ final class MasterAudioWriterTests: XCTestCase {
 
         XCTAssertEqual(fixture.writer.format?.channels, 2)
         XCTAssertEqual(fixture.writer.manifest?.conversions.first?.inputChannels, 4)
-        XCTAssertEqual(fixture.writer.framesWritten, 1)
+        XCTAssertEqual(fixture.writer.framesWritten, 2)
     }
 
     private struct Fixture {

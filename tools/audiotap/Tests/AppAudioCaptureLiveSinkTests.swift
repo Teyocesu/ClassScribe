@@ -66,10 +66,11 @@ final class AppAudioCaptureLiveSinkTests: XCTestCase {
         // contract.
     }
 
-    func test_forwardToLiveSink_zeroBytes_skipsSink() {
+    func test_forwardToLiveSink_zeroBytes_forwardsEmptyHeartbeat() {
         let recorder = SinkRecorder()
         let capture = makeCapture { recorder.sink($0) }
-        // byteCount=0 → sampleCount=0 → guard fires, sink not called.
+        // Empty callbacks distinguish a live-but-priming transport from a
+        // stalled callback path without inventing audio samples.
         var dummy: Float = 0
         withUnsafeMutablePointer(to: &dummy) { ptr in
             capture.forwardToLiveSink(
@@ -77,7 +78,11 @@ final class AppAudioCaptureLiveSinkTests: XCTestCase {
                 byteCount: 0,
             )
         }
-        XCTAssertTrue(recorder.buffers.isEmpty)
+        XCTAssertEqual(recorder.buffers.count, 1)
+        XCTAssertTrue(recorder.buffers[0].samples.isEmpty)
+        XCTAssertEqual(recorder.buffers[0].channelCount, 1)
+        XCTAssertEqual(recorder.buffers[0].sampleRate, 48000)
+        XCTAssertGreaterThan(recorder.buffers[0].hostTime, 0)
     }
 
     // MARK: - Happy path
