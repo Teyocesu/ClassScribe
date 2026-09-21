@@ -7,6 +7,9 @@ namespace ClassScribe.Windows.Tests;
 [TestClass]
 public sealed class MainViewModelSpeakerCorrectionConcurrencyTests
 {
+    private static readonly JsonSerializerOptions OverlayJsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly string[] ExpectedRapidCorrectionNames = ["Primero", "Segundo"];
+
     [TestMethod]
     public async Task lateCorrectionFromSessionAIsPersistedOnlyToA()
     {
@@ -69,7 +72,7 @@ public sealed class MainViewModelSpeakerCorrectionConcurrencyTests
                 .Where(operation => operation.Kind == SpeakerCorrectionKind.Rename)
                 .Select(operation => operation.DisplayName)
                 .ToArray();
-            CollectionAssert.AreEqual(new[] { "Primero", "Segundo" }, names);
+            CollectionAssert.AreEqual(ExpectedRapidCorrectionNames, names);
             Assert.AreEqual("Segundo", model.Speakers.Single().Model.DisplayName);
         }
         finally
@@ -146,7 +149,7 @@ public sealed class MainViewModelSpeakerCorrectionConcurrencyTests
     private static HumanCorrectionOverlay ReadOverlay(string folder) =>
         JsonSerializer.Deserialize<HumanCorrectionOverlay>(
             File.ReadAllText(Path.Combine(folder, "human-correction-overlay.json")),
-            new JsonSerializerOptions(JsonSerializerDefaults.Web))
+            OverlayJsonOptions)
         ?? throw new InvalidDataException("No se pudo leer el overlay de prueba.");
 
     private static string NewRoot() => Path.Combine(
