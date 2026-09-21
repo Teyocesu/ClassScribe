@@ -72,7 +72,7 @@ enum SpeechPresenceAcceptancePolicy {
 /// Loading is single-flight. Callers decide whether an error should fail-open;
 /// a VAD outage must never prevent the existing ASR path from running.
 actor FluidAudioSpeechPresenceDetector {
-    private static let analysisBudgetNanoseconds: UInt64 = 15_000_000_000
+    private static let defaultBudgetNanoseconds: UInt64 = 15_000_000_000
     private static let vadConfig = VadConfig(defaultThreshold: 0.40)
     private static let segmentationConfig = VadSegmentationConfig(
         minSpeechDuration: 0.15,
@@ -82,7 +82,24 @@ actor FluidAudioSpeechPresenceDetector {
     )
 
     private let modelLoad = AsyncSingleFlight<VadManager>()
+    private let analysisBudgetNanoseconds: UInt64
     private var unavailable = false
+
+    init(analysisBudgetNanoseconds: UInt64 = defaultBudgetNanoseconds) {
+        self.analysisBudgetNanoseconds = analysisBudgetNanoseconds
+    }
+
+    /// Runs a whole stage pipeline under ONE shared deadline. Stages must not
+    /// wrap themselves in further waits: the budget covers the entire public
+    /// call (resample + load + inference) as a single logical operation.
+    func runUnderSharedBudget<Value: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> Value,
+    ) async throws -> Value {
+        try await BoundedTaskWait.value(
+            operation: operation,
+            timeoutNanoseconds: analysisBudgetNanoseconds,
+        )
+    }
 
     func analyze(samples: [Float]) async throws -> SpeechPresenceEvidence {
         guard !samples.isEmpty else { return .none }
@@ -93,18 +110,9 @@ actor FluidAudioSpeechPresenceDetector {
         let startedAt = ProcessingDiagnostics.mark("vad_samples_start")
         defer { ProcessingDiagnostics.mark("vad_samples_end", since: startedAt) }
         do {
-            let manager = try await BoundedTaskWait.value(
-                operation: { try await self.loadedManager() },
-                timeoutNanoseconds: Self.analysisBudgetNanoseconds,
-            )
-            let segments = try await BoundedTaskWait.value(
-                operation: {
-                    try await manager.segmentSpeech(samples, config: Self.segmentationConfig)
-                },
-                timeoutNanoseconds: Self.analysisBudgetNanoseconds,
-            )
-            try Task.checkCancellation()
-            return Self.evidence(from: segments)
+            return try await runUnderSharedBudget {
+                try await self.analyzeCore(samples: samples)
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -122,13 +130,10 @@ actor FluidAudioSpeechPresenceDetector {
         let startedAt = ProcessingDiagnostics.mark("vad_file_start")
         defer { ProcessingDiagnostics.mark("vad_file_end", since: startedAt) }
         do {
-            let samples = try await BoundedTaskWait.value(
-                operation: {
-                    try AudioConverter().resampleAudioFile(file)
-                },
-                timeoutNanoseconds: Self.analysisBudgetNanoseconds,
-            )
-            return try await analyze(samples: samples)
+            return try await runUnderSharedBudget {
+                let samples = try await AudioConverter().resampleAudioFile(file)
+                return try await self.analyzeCore(samples: samples)
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -136,6 +141,18 @@ actor FluidAudioSpeechPresenceDetector {
             ProcessingDiagnostics.mark("vad_unavailable", detail: "failure_or_deadline")
             throw error
         }
+    }
+
+    /// Unbounded stage pipeline: load/inference without their own waits. The
+    /// caller wraps this in the single shared deadline, so the clock never
+    /// restarts between stages.
+    private func analyzeCore(samples: [Float]) async throws -> SpeechPresenceEvidence {
+        guard !samples.isEmpty else { return .none }
+        let manager = try await loadedManager()
+        try Task.checkCancellation()
+        let segments = try await manager.segmentSpeech(samples, config: Self.segmentationConfig)
+        try Task.checkCancellation()
+        return Self.evidence(from: segments)
     }
 
     private func loadedManager() async throws -> VadManager {

@@ -106,6 +106,26 @@ func boundedVADWaitFailsOpenAtItsDeadline() async {
     }
 }
 
+@Test
+func sharedVADBudgetIsNotRenewedPerStage() async {
+    // Each stage fits in the budget on its own, but their sum does not. A
+    // shared deadline must fire; per-stage budgets would let both complete.
+    // No wall-time assertion: the parallel runner can suspend both racers.
+    let detector = FluidAudioSpeechPresenceDetector(analysisBudgetNanoseconds: 150_000_000)
+    do {
+        _ = try await detector.runUnderSharedBudget {
+            try await Task.sleep(for: .milliseconds(100))
+            try await Task.sleep(for: .milliseconds(100))
+            return 1
+        }
+        Issue.record("Dos etapas secuenciales no deberían recibir cada una un budget nuevo completo")
+    } catch is BoundedTaskWaitError {
+        // Expected: the single shared deadline fires once for the whole pipeline.
+    } catch {
+        Issue.record("Se esperaba BoundedTaskWaitError, se obtuvo \(error)")
+    }
+}
+
 private actor SingleFlightProbe {
     private(set) var calls = 0
     private var callWaiters: [CheckedContinuation<Void, Never>] = []
