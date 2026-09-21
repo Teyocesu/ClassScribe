@@ -142,7 +142,7 @@ struct MicrophoneOption: Identifiable, Hashable {
 
 /// Word-level timing already produced by Parakeet. It is optional on the
 /// persisted segment so sessions written before this field remain readable.
-struct TranscriptWordTiming: Codable, Equatable {
+struct TranscriptWordTiming: Codable, Equatable, Sendable {
     var text: String
     var start: TimeInterval
     var end: TimeInterval
@@ -156,7 +156,7 @@ struct TranscriptWordTiming: Codable, Equatable {
     }
 }
 
-struct TranscriptSegment: Identifiable, Codable, Equatable {
+struct TranscriptSegment: Identifiable, Codable, Equatable, Sendable {
     var id = UUID()
     var start: TimeInterval
     var end: TimeInterval
@@ -170,7 +170,7 @@ struct TranscriptSegment: Identifiable, Codable, Equatable {
     var formattedTimestamp: String { Timecode.display(start) }
 }
 
-struct DiarizationSpan: Codable, Equatable {
+struct DiarizationSpan: Codable, Equatable, Sendable {
     var start: TimeInterval
     var end: TimeInterval
     var speakerID: String

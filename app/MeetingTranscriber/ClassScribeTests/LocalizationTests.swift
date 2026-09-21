@@ -78,9 +78,16 @@ func mainLocalizationKeysAreComplete() {
         .speakerSplitAfterWord,
         .statusSpeakerCorrectionsSaved,
         .statusSpeakerCorrectionsUnresolved,
+        .statusRecentAudioRecovered,
+        .statusPreparingLocalTranscription,
+        .statusTextUpdated,
+        .statusTextCanBeEdited,
+        .statusLiveRetry,
         .copyForChatGPT,
         .exportAction,
         .errorStorage,
+        .errorLiveTranscription,
+        .errorLiveUpdateSave,
     ]
 
     for language in ResolvedInterfaceLanguage.allCases {

@@ -88,6 +88,24 @@ func vadFailurePreservesTheOriginalAsrSegments() {
     #expect(SpeechPresenceAcceptancePolicy.filterSegments(original, evidence: nil) == original)
 }
 
+@Test
+func boundedVADWaitFailsOpenAtItsDeadline() async {
+    do {
+        _ = try await BoundedTaskWait.value(
+            operation: {
+                try await Task.sleep(for: .seconds(30))
+                return 1
+            },
+            timeoutNanoseconds: 0,
+        )
+        Issue.record("El VAD acotado no debería completar una operación que excedió su deadline")
+    } catch is BoundedTaskWaitError {
+        // Expected: the caller can continue through the ASR fail-open path.
+    } catch {
+        Issue.record("Se esperaba BoundedTaskWaitError, se obtuvo \(error)")
+    }
+}
+
 private actor SingleFlightProbe {
     private(set) var calls = 0
     private var callWaiters: [CheckedContinuation<Void, Never>] = []

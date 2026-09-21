@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using System.Globalization;
@@ -15,12 +16,16 @@ public sealed record SessionSummary(
     string? PreferredTextPath,
     string? RecoveryReason);
 
-public sealed class SessionStore
+public class SessionStore
 {
     private const long MaximumMetadataBytes = 1 * 1_024 * 1_024;
     private const long MaximumStructuredBytes = 64 * 1_024 * 1_024;
     private const long MaximumTextBytes = 64 * 1_024 * 1_024;
     private const long MaximumJournalBytes = 16 * 1_024 * 1_024;
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> ProjectionGates =
+        new(OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
@@ -126,7 +131,7 @@ public sealed class SessionStore
             cancellationToken).ConfigureAwait(false);
     }
 
-    public Task SaveFinalAsync(
+    public virtual Task SaveFinalAsync(
         ClassMetadata metadata,
         IReadOnlyList<TranscriptSegment> all,
         IReadOnlyList<TranscriptSegment> professor,
@@ -187,107 +192,116 @@ public sealed class SessionStore
         CancellationToken cancellationToken)
     {
         folder = EnsureSessionFolder(folder);
-        var overlayPath = Path.Combine(folder, "human-correction-overlay.json");
-        var overlay = await ReadJsonAsync<HumanCorrectionOverlay>(
-                overlayPath)
-            .ConfigureAwait(false);
-        if (humanCorrection is not null)
+        var projectionGate = ProjectionGates.GetOrAdd(folder, static _ => new SemaphoreSlim(1, 1));
+        await projectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            var existingOverlay = overlay ?? new HumanCorrectionOverlay();
-            overlay = existingOverlay with
+            var overlayPath = Path.Combine(folder, "human-correction-overlay.json");
+            var overlay = await ReadJsonAsync<HumanCorrectionOverlay>(
+                    overlayPath)
+                .ConfigureAwait(false);
+            if (humanCorrection is not null)
             {
-                Operations = existingOverlay.Operations
-                    .Concat(humanCorrection.Operations.Where(operation =>
-                        existingOverlay.Operations.All(existing => existing.Id != operation.Id)))
-                    .ToArray(),
-                EditedAllText = humanCorrection.ClearAllText
-                    ? null
-                    : humanCorrection.AllText ?? existingOverlay.EditedAllText,
-                EditedProfessorText = humanCorrection.ClearProfessorText
-                    ? null
-                    : humanCorrection.ProfessorText ?? existingOverlay.EditedProfessorText,
-            };
+                var existingOverlay = overlay ?? new HumanCorrectionOverlay();
+                overlay = existingOverlay with
+                {
+                    Operations = existingOverlay.Operations
+                        .Concat(humanCorrection.Operations.Where(operation =>
+                            existingOverlay.Operations.All(existing => existing.Id != operation.Id)))
+                        .ToArray(),
+                    EditedAllText = humanCorrection.ClearAllText
+                        ? null
+                        : humanCorrection.AllText ?? existingOverlay.EditedAllText,
+                    EditedProfessorText = humanCorrection.ClearProfessorText
+                        ? null
+                        : humanCorrection.ProfessorText ?? existingOverlay.EditedProfessorText,
+                };
+                await AtomicFile.WriteJsonAsync(
+                        overlayPath,
+                        overlay,
+                        JsonOptions,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            if (overlay is not null)
+            {
+                metadata = metadata with
+                {
+                    HumanCorrectionOverlayReference = metadata.HumanCorrectionOverlayReference
+                        ?? new HumanCorrectionOverlayReference { RelativePath = "human-correction-overlay.json" },
+                };
+            }
+
+            var proposalPath = Path.Combine(folder, "diarization-proposals.json");
+            var proposalDocument = await ReadJsonAsync<DiarizationProposalDocument>(proposalPath)
+                .ConfigureAwait(false)
+                ?? new DiarizationProposalDocument();
+            if (diarizationProposal is not null
+                && proposalDocument.Proposals.All(existing => existing.ProposalID != diarizationProposal.ProposalID))
+            {
+                proposalDocument = proposalDocument with
+                {
+                    Proposals = proposalDocument.Proposals.Append(diarizationProposal).ToArray(),
+                };
+            }
+            if (diarizationProposal is not null
+                && metadata.DiarizationProposalReferences.All(existing => existing.ProposalID != diarizationProposal.ProposalID))
+            {
+                metadata = metadata with
+                {
+                    DiarizationProposalReferences = metadata.DiarizationProposalReferences
+                        .Append(new DiarizationProposalReference
+                        {
+                            ProposalID = diarizationProposal.ProposalID,
+                            RelativePath = "diarization-proposals.json",
+                        })
+                        .ToArray(),
+                };
+            }
+            var proposalReferences = metadata.DiarizationProposalReferences.ToList();
+            foreach (var proposal in proposalDocument.Proposals)
+            {
+                if (proposalReferences.All(existing => existing.ProposalID != proposal.ProposalID))
+                {
+                    proposalReferences.Add(new DiarizationProposalReference
+                    {
+                        ProposalID = proposal.ProposalID,
+                        RelativePath = "diarization-proposals.json",
+                    });
+                }
+            }
+            metadata = metadata with { DiarizationProposalReferences = proposalReferences };
+
             await AtomicFile.WriteJsonAsync(
-                    overlayPath,
-                    overlay,
+                    proposalPath,
+                    proposalDocument,
                     JsonOptions,
                     cancellationToken)
                 .ConfigureAwait(false);
-        }
+            await AtomicFile.WriteJsonAsync(
+                Path.Combine(folder, "all-speakers.json"), all, JsonOptions, cancellationToken).ConfigureAwait(false);
+            await AtomicFile.WriteJsonAsync(
+                Path.Combine(folder, "review.json"), review, JsonOptions, cancellationToken).ConfigureAwait(false);
+            await AtomicFile.WriteJsonAsync(
+                Path.Combine(folder, "speakers.json"), speakers, JsonOptions, cancellationToken).ConfigureAwait(false);
 
-        if (overlay is not null)
+            var allText = overlay?.EditedAllText ?? automaticAllText ?? TranscriptExporter.PlainText(all, speakers);
+            var professorText = overlay?.EditedProfessorText ?? automaticProfessorText ?? TranscriptExporter.PlainText(professor, speakers);
+            await SaveTextPairAsync("all-speakers", allText, metadata, folder, cancellationToken).ConfigureAwait(false);
+            await SaveTextPairAsync("professor", professorText, metadata, folder, cancellationToken).ConfigureAwait(false);
+            await AtomicFile.WriteTextAsync(
+                Path.Combine(folder, "professor.srt"),
+                TranscriptExporter.Srt(professor),
+                cancellationToken).ConfigureAwait(false);
+
+            // A complete metadata state is the commit marker and is written last.
+            await SaveMetadataAsync(metadata, folder, cancellationToken).ConfigureAwait(false);
+        }
+        finally
         {
-            metadata = metadata with
-            {
-                HumanCorrectionOverlayReference = metadata.HumanCorrectionOverlayReference
-                    ?? new HumanCorrectionOverlayReference { RelativePath = "human-correction-overlay.json" },
-            };
+            projectionGate.Release();
         }
-
-        var proposalPath = Path.Combine(folder, "diarization-proposals.json");
-        var proposalDocument = await ReadJsonAsync<DiarizationProposalDocument>(proposalPath)
-            .ConfigureAwait(false)
-            ?? new DiarizationProposalDocument();
-        if (diarizationProposal is not null
-            && proposalDocument.Proposals.All(existing => existing.ProposalID != diarizationProposal.ProposalID))
-        {
-            proposalDocument = proposalDocument with
-            {
-                Proposals = proposalDocument.Proposals.Append(diarizationProposal).ToArray(),
-            };
-        }
-        if (diarizationProposal is not null
-            && metadata.DiarizationProposalReferences.All(existing => existing.ProposalID != diarizationProposal.ProposalID))
-        {
-            metadata = metadata with
-            {
-                DiarizationProposalReferences = metadata.DiarizationProposalReferences
-                    .Append(new DiarizationProposalReference
-                    {
-                        ProposalID = diarizationProposal.ProposalID,
-                        RelativePath = "diarization-proposals.json",
-                    })
-                    .ToArray(),
-            };
-        }
-        var proposalReferences = metadata.DiarizationProposalReferences.ToList();
-        foreach (var proposal in proposalDocument.Proposals)
-        {
-            if (proposalReferences.All(existing => existing.ProposalID != proposal.ProposalID))
-            {
-                proposalReferences.Add(new DiarizationProposalReference
-                {
-                    ProposalID = proposal.ProposalID,
-                    RelativePath = "diarization-proposals.json",
-                });
-            }
-        }
-        metadata = metadata with { DiarizationProposalReferences = proposalReferences };
-
-        await AtomicFile.WriteJsonAsync(
-                proposalPath,
-                proposalDocument,
-                JsonOptions,
-                cancellationToken)
-            .ConfigureAwait(false);
-        await AtomicFile.WriteJsonAsync(
-            Path.Combine(folder, "all-speakers.json"), all, JsonOptions, cancellationToken).ConfigureAwait(false);
-        await AtomicFile.WriteJsonAsync(
-            Path.Combine(folder, "review.json"), review, JsonOptions, cancellationToken).ConfigureAwait(false);
-        await AtomicFile.WriteJsonAsync(
-            Path.Combine(folder, "speakers.json"), speakers, JsonOptions, cancellationToken).ConfigureAwait(false);
-
-        var allText = overlay?.EditedAllText ?? automaticAllText ?? TranscriptExporter.PlainText(all, speakers);
-        var professorText = overlay?.EditedProfessorText ?? automaticProfessorText ?? TranscriptExporter.PlainText(professor, speakers);
-        await SaveTextPairAsync("all-speakers", allText, metadata, folder, cancellationToken).ConfigureAwait(false);
-        await SaveTextPairAsync("professor", professorText, metadata, folder, cancellationToken).ConfigureAwait(false);
-        await AtomicFile.WriteTextAsync(
-            Path.Combine(folder, "professor.srt"),
-            TranscriptExporter.Srt(professor),
-            cancellationToken).ConfigureAwait(false);
-
-        // A complete metadata state is the commit marker and is written last.
-        await SaveMetadataAsync(metadata, folder, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task SaveEditedDocumentsAsync(
@@ -298,31 +312,40 @@ public sealed class SessionStore
         CancellationToken cancellationToken = default)
     {
         folder = EnsureSessionFolder(folder);
-        var overlay = await ReadJsonAsync<HumanCorrectionOverlay>(
-                Path.Combine(folder, "human-correction-overlay.json"))
-            .ConfigureAwait(false)
-            ?? new HumanCorrectionOverlay();
-        overlay = overlay with
+        var projectionGate = ProjectionGates.GetOrAdd(folder, static _ => new SemaphoreSlim(1, 1));
+        await projectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            EditedAllText = allText,
-            EditedProfessorText = professorText,
-        };
-        await AtomicFile.WriteJsonAsync(
-                Path.Combine(folder, "human-correction-overlay.json"),
-                overlay,
-                JsonOptions,
-                cancellationToken)
-            .ConfigureAwait(false);
-        metadata = metadata with
+            var overlay = await ReadJsonAsync<HumanCorrectionOverlay>(
+                    Path.Combine(folder, "human-correction-overlay.json"))
+                .ConfigureAwait(false)
+                ?? new HumanCorrectionOverlay();
+            overlay = overlay with
+            {
+                EditedAllText = allText,
+                EditedProfessorText = professorText,
+            };
+            await AtomicFile.WriteJsonAsync(
+                    Path.Combine(folder, "human-correction-overlay.json"),
+                    overlay,
+                    JsonOptions,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            metadata = metadata with
+            {
+                HumanCorrectionOverlayReference = metadata.HumanCorrectionOverlayReference
+                    ?? new HumanCorrectionOverlayReference { RelativePath = "human-correction-overlay.json" },
+            };
+            await SaveTextPairAsync("all-speakers", allText, metadata, folder, cancellationToken)
+                .ConfigureAwait(false);
+            await SaveTextPairAsync("professor", professorText, metadata, folder, cancellationToken)
+                .ConfigureAwait(false);
+            await SaveMetadataAsync(metadata, folder, cancellationToken).ConfigureAwait(false);
+        }
+        finally
         {
-            HumanCorrectionOverlayReference = metadata.HumanCorrectionOverlayReference
-                ?? new HumanCorrectionOverlayReference { RelativePath = "human-correction-overlay.json" },
-        };
-        await SaveTextPairAsync("all-speakers", allText, metadata, folder, cancellationToken)
-            .ConfigureAwait(false);
-        await SaveTextPairAsync("professor", professorText, metadata, folder, cancellationToken)
-            .ConfigureAwait(false);
-        await SaveMetadataAsync(metadata, folder, cancellationToken).ConfigureAwait(false);
+            projectionGate.Release();
+        }
     }
 
     public async Task<ASRTranscriptReference> SaveAsrOriginalAsync(

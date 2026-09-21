@@ -121,7 +121,7 @@ private enum CancellableTaskWait {
     }
 }
 
-private final class CancellableTaskWaitBox<Value: Sendable>: @unchecked Sendable {
+final class CancellableTaskWaitBox<Value: Sendable>: @unchecked Sendable {
     private enum State {
         case pending
         case waiting(CheckedContinuation<Value, Error>)
@@ -191,6 +191,50 @@ private final class CancellableTaskWaitBox<Value: Sendable>: @unchecked Sendable
     }
 }
 
+enum BoundedTaskWaitError: Error {
+    case deadlineExceeded
+}
+
+enum BoundedTaskWait {
+    static func value<Value: Sendable>(
+        operation: @escaping @Sendable () async throws -> Value,
+        timeoutNanoseconds: UInt64,
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        let box = CancellableTaskWaitBox<Value>()
+        let operationTask = Task.detached(priority: .userInitiated) {
+            try await operation()
+        }
+        let operationObserver = Task.detached(priority: .utility) {
+            box.resolve(await operationTask.result)
+        }
+        let timeoutObserver = Task.detached(priority: .utility) {
+            do {
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                box.resolve(.failure(BoundedTaskWaitError.deadlineExceeded))
+            } catch is CancellationError {
+                // The operation completed first.
+            } catch {
+                box.resolve(.failure(error))
+            }
+        }
+        defer {
+            operationTask.cancel()
+            operationObserver.cancel()
+            timeoutObserver.cancel()
+        }
+
+        return try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                box.install(continuation)
+            }
+        }, onCancel: {
+            box.cancel()
+        })
+    }
+}
+
 actor ParakeetService {
     private let modelLoad = AsyncSingleFlight<AsrManager>()
     private let speechPresence = FluidAudioSpeechPresenceDetector()
@@ -211,6 +255,8 @@ actor ParakeetService {
 
     private func loadedManager() async throws -> AsrManager {
         try Task.checkCancellation()
+        let startedAt = ProcessingDiagnostics.mark("asr_model_load_start")
+        defer { ProcessingDiagnostics.mark("asr_model_load_end", since: startedAt) }
         let manager = try await modelLoad.value { [weak self] in
             await self?.setDownloadProgress(0)
             let models = try await AsrModels.downloadAndLoad(version: .v3) { [weak self] progress in
@@ -236,6 +282,8 @@ actor ParakeetService {
         language: TranscriptionLanguage = .spanish,
         speechEvidence: SpeechPresenceEvidence? = nil,
     ) async throws -> String {
+        let startedAt = ProcessingDiagnostics.mark("asr_live_engine_start")
+        defer { ProcessingDiagnostics.mark("asr_live_engine_end", since: startedAt) }
         try Task.checkCancellation()
         let evidence: SpeechPresenceEvidence?
         if let speechEvidence {
@@ -265,6 +313,8 @@ actor ParakeetService {
         file: URL,
         language: TranscriptionLanguage = .spanish,
     ) async throws -> [TranscriptSegment] {
+        let startedAt = ProcessingDiagnostics.mark("asr_final_engine_start")
+        defer { ProcessingDiagnostics.mark("asr_final_engine_end", since: startedAt) }
         try Task.checkCancellation()
         let evidence = try await failOpenSpeechAnalysis {
             try await self.speechPresence.analyze(file: file)
@@ -466,6 +516,8 @@ actor FinalProcessor {
     }
 
     func diarize(_ audioURL: URL) async throws -> (spans: [DiarizationSpan], embeddings: [String: [Float]]) {
+        let startedAt = ProcessingDiagnostics.mark("diarization_engine_start")
+        defer { ProcessingDiagnostics.mark("diarization_engine_end", since: startedAt) }
         try Task.checkCancellation()
         let response = try await diarizationRunner.run(audioURL: audioURL)
         let spans = response.spans.map {

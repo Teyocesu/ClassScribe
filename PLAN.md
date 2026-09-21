@@ -6,6 +6,7 @@ Baseline canónico del release checkpoint #1: `9d80826f598b77dfd0646853501e6e5ea
 
 Estado canónico: Fase 1A **APPROVED**; Fase 1B **APPROVED arquitectónicamente**; Fase 1C **ARCHITECTURE APPROVED**; Fase 2A **FIXED / PARTIAL**; Fase 2B.1 **COMPLETE / PARTIAL**; Fase 2B.2 **PASS en Windows**; Fase 2C.1 y Fase 2C.2 **PASS en Windows**; Fase 2D **PASS en Windows para el contrato validado**. Windows W0/W1A/W1B tienen evidencia de runtime y física **PASS**. Permanecen pendientes los gates físicos de macOS, TCC, hardware/device-change y los acceptance gates compartidos indicados abajo. Fase 2E queda **DIFERIDA / NOT STARTED**.
 SPEC canónica: [`docs/specs/v0.8.0.md`](docs/specs/v0.8.0.md)
+SPEC activa del correctivo: [`docs/specs/post-v0.8.0-corrective.md`](docs/specs/post-v0.8.0-corrective.md)
 
 Este documento es mutable: ordena trabajo pequeño y verificable. No redefine requisitos. Cada fase se valida localmente con el patrón `focused → subsystem`; los gates con TCC, hardware, llamada real o Windows físico están definidos en la SPEC. La frontera estable y la política de release están fijadas por el bloque `RELEASE CHECKPOINT v0.8.0`.
 
@@ -246,3 +247,110 @@ Windows.
 
 No se asignan números de versión futuros aquí. Un hallazgo de release vuelve a
 su correctivo focalizado; no reabre automáticamente el roadmap.
+
+## Anexo — investigación correctiva P0–P3 (posterior a v0.8.0)
+
+Estado: **INSTRUMENTADO; MEDICIÓN DE RUNTIME PENDIENTE**. Este anexo ordena la
+investigación solicitada y no cambia la SPEC ni convierte las fases diferidas
+en requisitos de v0.8.0. Antes de implementar correcciones se debe actualizar
+la SPEC canónica con las decisiones que resulten de las mediciones.
+
+### P0 — Finalize → sesión utilizable
+
+- [x] Reconstruir el flujo real por plataforma y marcar ASR, VAD, diarización,
+      atribución, post-procesamiento, persistencia y primera UI utilizable.
+- [x] Añadir instrumentación opt-in, monotónica y sin texto/audio/rutas:
+      `CLASSSCRIBE_PERF_DIAGNOSTICS=1`.
+- [ ] Medir primera sesión en arranque frío y segunda sesión en el mismo
+      proceso, por separado en macOS y Windows.
+- [ ] Comparar reutilización de checkpoints, ASR incremental y ASR de archivo;
+      medir si la superposición Windows ASR/diarización reduce el total o
+      sólo desplaza la espera al punto de atribución.
+- [ ] Medir costo de lecturas duplicadas: VAD sobre archivo/ventana, ASR y
+      vocabulario; no aceptar una optimización que cambie precisión.
+- [ ] Fijar el presupuesto de cada etapa sólo después de observar p50/p95 y
+      fallos: no agregar sleeps, polling, reintentos o warm-up permanente por
+      intuición.
+
+### P1 — Correctitud, VAD fail-open y localización
+
+- [x] Corregir `ApplySpeakerCorrectionAsync` con snapshot de attempt, sesión,
+      carpeta, overlay y objetivo antes del primer `await`; aceptar/publicar
+      sólo si la identidad sigue vigente.
+- [x] Hacer explícito el orden de dos correcciones rápidas: serialización por
+      sesión o versión/cola monotónica, y preservar A al abrir B.
+- [x] Agregar las dos pruebas mínimas: A guardada, abrir B, completar A no
+      modifica B; dos correcciones rápidas conservan el orden solicitado.
+- [x] Definir deadline finito de VAD/model provisioning por plataforma.
+      Timeout, cancelación, excepción o descarga incompleta deben marcar VAD
+      como no disponible y continuar por ASR normal; no cambiar provider,
+      modelo ni precisión.
+- [x] Extraer los literales visibles activos de live/retry usando la
+      infraestructura actual y cubrir las claves nuevas con pruebas de keysets;
+      el detector general de literals queda pendiente en la fase de
+      localización completa.
+
+### P2 — Startup
+
+- [ ] Separar en las mediciones startup de ventana/UI, historia/fuentes,
+      descarga/carga, warm-up y primera captura; distinguir primera sesión y
+      posteriores.
+- [ ] Sólo promover prewarm o cache adicional si el gate demuestra beneficio
+      sin bloquear captura, cancelación ni la primera sesión.
+
+### P3 — Cleanup con evidencia
+
+- [x] Retirar o reconciliar `loadedModelPath` (Windows, sólo escrituras;
+      eliminado 2026-09-21). `downloadProgress` write-only de macOS queda
+      diferido por firma externa sin compilador disponible.
+- [ ] Consolidar el documento canónico: `FINALIZATION_PLAN.md` y los planes
+      bajo `docs/plans/` son material histórico o de referencia; no crear otro
+      plan paralelo. `CLAUDE.md`/`CONTRIBUTING.md` y docs RPC/arquitectura
+      upstream ya eliminados 2026-09-21 (detalle en la SPEC activa).
+- [ ] Separar en la auditoría los restos de `app/MeetingTranscriber/Sources`
+      (upstream) del producto activo en `ClassScribeSources`; no borrar sin
+      evidencia de consumidores. Infra ASR sin consumidores ya eliminada
+      2026-09-21; `Sources/`/`Tests/`/`site/`/`Casks/`/`tools/mt-cli`/
+      `meeting-simulator`/E2E legacy se conservan como follow-up.
+
+### Protocolo de medición y gate
+
+Cada ejecución debe conservar sólo el log de timing y metadatos no sensibles.
+En macOS los eventos `processing` se agregan al log local existente de
+`ClassScribe`; en Windows se escribe el log diario local de timing. Ejecutar
+como mínimo: una sesión fría, una sesión caliente, una sesión con silencio y
+una con dos hablantes; repetir cada escenario tres veces y reportar mediana y
+p95 por etapa. El informe debe clasificar cada dato como medido, inspeccionado,
+inferido o no ejecutado.
+
+El gate P0 no pasa hasta que exista una traza completa T0 → audio disponible →
+ASR/VAD → diarización → speakers → post-procesamiento → persistencia → UI
+utilizable en ambas plataformas. El gate P1 no pasa sin las dos pruebas de
+aislamiento y orden. El gate físico de TCC/audio/hardware/Windows sólo puede
+marcarse con ejecución reproducible en el dispositivo correspondiente.
+
+### Estado del correctivo — 2026-09-21
+
+La SPEC activa es [`docs/specs/post-v0.8.0-corrective.md`](docs/specs/post-v0.8.0-corrective.md).
+P1 quedó implementada: snapshots/autoridad y cola FIFO en correcciones Windows,
+RMW del overlay serializado por carpeta, VAD fail-open con deadline finito en
+ambas plataformas, claves existentes para los literales activos e
+instrumentación P0 ampliada. Se agregaron dos regresiones Windows y una prueba
+focal del deadline VAD macOS; el detector general de literals no forma parte de
+este correctivo. La validación de ejecución queda pendiente por
+la ausencia de `dotnet`, el parser SwiftPM local incompatible con
+`swiftLanguageModes: [.v6]` y la falta de gates físicos en este entorno; no se
+modificaron manifests. No existe `HANDOFF.md` canónico en el repositorio.
+
+### Estado del pase de latencia — 2026-09-21
+
+La inspección del camino `Finalizar → sesión utilizable` confirmó que Windows
+ya inicia ASR final y diarización sin una espera accidental adicional; no se
+modificó esa superposición ni la política de checkpoints/full fallback. En
+macOS, con el audio cerrado, ASR final y diarización ahora se inician como
+child tasks estructuradas después de configurar lenguaje/vocabulario; el ASR
+se persiste antes de esperar el resultado de speakers para conservar la
+recuperación ante fallo de diarización. La prueba focal verifica el arranque
+concurrente sin sleeps. El impacto de runtime, cold/warm y memoria sigue sin
+medirse por los bloqueos de SwiftPM, modelos/gates físicos y ausencia de
+`dotnet`; no se presentan números ni PASS de runtime.
